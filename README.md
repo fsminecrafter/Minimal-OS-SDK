@@ -3,7 +3,24 @@
 Minimal-OS SDK is a Software Development Kit for Minimal-OS, Linked here: [Minimal-OS](https://github.com/fsminecrafter/Minimal-OS).
 
 
-Build a program, package it as a `.run`:
+Install the native compiler and linker tools on Debian or Ubuntu:
+
+    ./install-toolchain.sh
+
+Build a C or C++ program and package it as a `.run`:
+
+    ./build.sh examples/hello.c
+
+This creates `hello.run`. For C++, use the same command with a `.cpp` file:
+
+    ./build.sh examples/hello.cpp
+
+The build script compiles `crt0.c`, compiles the selected source, links
+`main.elf` with `link.ld`, and runs `mkrun.sh`. It uses `gcc`, `g++`, and
+`ld` by default. Set `CC`, `CXX`, or `LD` to use a cross-toolchain, for
+example `CC=x86_64-elf-gcc CXX=x86_64-elf-g++ LD=x86_64-elf-ld`.
+
+The equivalent manual steps are:
 
     x86_64-elf-gcc -std=gnu11 -ffreestanding -fno-builtin -fno-stack-protector \
         -fno-asynchronous-unwind-tables -fno-unwind-tables -fPIE \
