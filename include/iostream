@@ -1,0 +1,52 @@
+#ifndef MINIMALOS_IOSTREAM_H
+#define MINIMALOS_IOSTREAM_H
+
+#include <stddef.h>
+#include "stdio.h"
+
+namespace std {
+
+class ostream {
+public:
+    ostream& operator<<(const char* value) {
+        if (value) mos_puts(value);
+        else mos_puts("(null)");
+        return *this;
+    }
+
+    ostream& operator<<(char value) {
+        mos_write(1, &value, 1);
+        return *this;
+    }
+
+    ostream& operator<<(int value) {
+        printf("%d", value);
+        return *this;
+    }
+
+    ostream& operator<<(unsigned int value) {
+        printf("%u", value);
+        return *this;
+    }
+
+    ostream& operator<<(long value) {
+        printf("%ld", value);
+        return *this;
+    }
+
+    ostream& operator<<(unsigned long value) {
+        printf("%lu", value);
+        return *this;
+    }
+
+    ostream& operator<<(bool value) {
+        mos_puts(value ? "true" : "false");
+        return *this;
+    }
+};
+
+static ostream cout;
+
+} // namespace std
+
+#endif
