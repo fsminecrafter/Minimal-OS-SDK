@@ -37,3 +37,9 @@ wanted next).
 - `mos_write(fd, buf, len)` - fd 1/2 only, goes to the terminal + serial.
 - `mos_exit(code)`
 - `mos_getpid()`
+
+## If you didnt know
+
+This SDK is designed for fsminecrafter/Minimal-OS.
+
+(:
