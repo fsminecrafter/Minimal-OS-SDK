@@ -1,4 +1,7 @@
-# MinimalOS SDK (v1)
+# Minimal-OS SDK (v1)
+
+Minimal-OS SDK is a Software Development Kit for Minimal-OS, Linked here: [Minimal-OS](https://github.com/fsminecrafter/Minimal-OS).
+
 
 Build a program, package it as a `.run`:
 
@@ -15,7 +18,7 @@ Build a program, package it as a `.run`:
 
     ./mkrun.sh main.elf hello.run
 
-Then inside MinimalOS: `run 0:/programs/hello.run`
+Then inside Minimal-OS: `run 0:/programs/hello.run`
 
 ## Requirements on the ELF
 - x86_64, ELF64, PIE (`ET_DYN`), linked at base address 0 (link.ld does this).
