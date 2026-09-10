@@ -11,13 +11,14 @@ Build a C or C++ program and package it as a `.run`:
 
     ./build.sh examples/hello.c
 
-This creates `hello.run`. For C++, use the same command with a `.cpp` file:
+This creates `hello.run` as a single file containing the program bundle. For
+C++, use the same command with a `.cpp` file:
 
     ./build.sh examples/hello.cpp
 
 The build script compiles `crt0.c`, compiles the selected source, links
-`main.elf` with `link.ld`, and runs `mkrun.sh`. It uses `gcc`, `g++`, and
-`ld` by default. Set `CC`, `CXX`, or `LD` to use a cross-toolchain, for
+`main.elf` with `link.ld`, and packages it with `mkrun.sh`. It uses `gcc`,
+`g++`, and `ld` by default. Set `CC`, `CXX`, or `LD` to use a cross-toolchain, for
 example `CC=x86_64-elf-gcc CXX=x86_64-elf-g++ LD=x86_64-elf-ld`.
 
 The equivalent manual steps are:
@@ -35,7 +36,14 @@ The equivalent manual steps are:
 
     ./mkrun.sh main.elf hello.run
 
-Then inside Minimal-OS: `run 0:/programs/hello.run`
+Import the `hello.run` file itself into MinimaFS. Then inside Minimal-OS run:
+
+    run 0:/programs/hello.run
+
+The `.run` file uses the `MINIRUN1` format. Its manifest contains `main.elf`
+and every file below a `Resources` directory when those files exist. The
+manifest and payload are stored in the same regular file, so copying or
+importing the bundle does not require creating a directory tree.
 
 For the C++ example, compile with the same freestanding flags plus the C++
 runtime restrictions:
