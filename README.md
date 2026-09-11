@@ -80,6 +80,33 @@ wanted next).
 - `mos_exists(path)`, `mos_is_dir(path)`, and `mos_mkdir(path)`
 - `mos_gettime()`, `mos_seek(fd, offset)`, and `mos_size(fd)`
 
+The current x86_64 user syscall API is also available through the subsystem
+headers under `include/x86_64/`:
+
+- `x86_64/user_syscalls.h` - uint64_t syscall wrappers, graphics dispatch,
+    manager dispatch, and USB dispatch.
+- `x86_64/user_graphics.h` - primitive drawing, text, and resolution wrappers.
+- `x86_64/user_managers.h` - GPU, audio, storage, and USB manager operations.
+- `x86_64/user_usb.h` - USB initialization, polling, keyboard translation, and
+    copied keyboard metadata.
+
+For a shorter graphics API, include `graphics.h` and use the corresponding
+`graphics_*` names. It is usable from both C and C++ without libc or the C++
+standard library:
+
+        #include "graphics.h"
+
+        void main(void) {
+                graphics_clear(0, 0, 0);
+                graphics_fill_rectangle(10, 10, 100, 60, 40, 160, 240);
+                graphics_text("hello", 20, 20, 255, 255, 255);
+                mos_exit();
+        }
+
+The new raw syscall numbers are `SYS_GRAPHICS` (15), `SYS_MANAGER` (16), and
+`SYS_USB` (17). The request structures and operation constants are available
+from `x86_64/syscall.h`.
+
 The syscall constants, error values, and kernel-side register frame are also
 available from `include/syscall.h`. `SYS_O_RDONLY` is the only open flag
 currently defined.
