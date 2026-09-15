@@ -21,6 +21,15 @@
 #define SYS_MANAGER  16
 #define SYS_USB      17
 
+#define SYS_FWRITE        18
+#define SYS_LISTDIR       19
+#define SYS_DELETE        20
+#define SYS_RMDIR         21
+#define SYS_GET_METADATA  22
+#define SYS_TELL          23
+#define SYS_EOF           24
+#define SYS_PKG           25
+
 #define SYS_O_RDONLY 0
 
 #define SYS_SUCCESS       0
@@ -94,6 +103,46 @@ typedef struct {
     uint8_t class_code;
     uint8_t is_keyboard;
 } syscall_usb_keyboard_info_t;
+
+#define SYSCALL_DIRENT_NAME_SIZE 64
+
+#define SYSCALL_DIRENT_TYPE_FILE       0
+#define SYSCALL_DIRENT_TYPE_DIR        1
+#define SYSCALL_DIRENT_TYPE_EXECUTABLE 2
+#define SYSCALL_DIRENT_TYPE_SYMLINK    3
+
+typedef struct {
+    char name[SYSCALL_DIRENT_NAME_SIZE];
+    uint8_t type;
+    uint8_t hidden;
+} syscall_dirent_t;
+
+typedef struct {
+    char filetype[64];
+    char fileformat[16];
+    uint32_t data_length;
+    uint8_t runnable;
+    uint8_t hidden;
+    uint64_t entrypoint;
+    char created_date[32];
+    char last_changed[32];
+} syscall_file_metadata_t;
+
+typedef enum {
+    SYS_PKG_UNZIP = 1,
+    SYS_PKG_ZIP,
+    SYS_PKG_INFO,
+} syscall_pkg_op_t;
+
+typedef struct {
+    uint64_t op;
+    const char* path;
+    const char* extra;
+    char* out_path;
+    uint32_t out_path_size;
+    uint32_t* out_count;
+    uint32_t* out_failed;
+} syscall_pkg_request_t;
 
 typedef struct __attribute__((packed)) {
     uint64_t rax;
