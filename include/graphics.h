@@ -17,5 +17,6 @@
 #define graphics_ellipse         mos_graphics_ellipse
 #define graphics_text            mos_graphics_text
 #define graphics_set_resolution  mos_graphics_set_resolution
+#define graphics_measure_text    mos_graphics_measure_text
 
 #endif
