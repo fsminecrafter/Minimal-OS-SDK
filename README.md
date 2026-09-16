@@ -16,6 +16,27 @@ C++, use the same command with a `.cpp` file:
 
     ./build.sh examples/hello.cpp
 
+You can also pass a project folder. It uses `main.cpp` or `main.c` as the
+program entry source, or select another source explicitly:
+
+    ./build.sh programs
+    ./build.sh programs --main programs/main.cpp
+
+Build a shared library with `--slib`:
+
+    ./build.sh --slib libraries/math
+
+Example library:
+
+    ./build.sh --slib examples/example-slib
+
+The `.slib` bundle contains the linked ELF, an export manifest of global
+symbols, and all `.h`/`.hpp` files found below the library folder. Headers are
+kept as public interface metadata for the runtime loader; `static` symbols are
+not exported. The bundle format is `MINISLIB1`; kernel-side loading and
+per-process shared/private mapping are provided by the operating system, not
+by this packaging script.
+
 The build script compiles `crt0.c`, compiles the selected source, links
 `main.elf` with `link.ld`, and packages it with `mkrun.sh`. It uses `gcc`,
 `g++`, and `ld` by default. Set `CC`, `CXX`, or `LD` to use a cross-toolchain, for
@@ -74,11 +95,21 @@ wanted next).
 ## Syscalls available
 - `mos_write(fd, buf, len)` - fd 1/2 only, goes to the terminal + serial.
 - `mos_exit(code)`
+- `mos_register_cleanup(callback)`
 - `mos_getpid()`
 - `mos_uptime()` and `mos_sleep(ticks)`
 - `mos_open(path, flags)`, `mos_read(fd, buf, len)`, `mos_close(fd)`
 - `mos_exists(path)`, `mos_is_dir(path)`, and `mos_mkdir(path)`
 - `mos_gettime()`, `mos_seek(fd, offset)`, and `mos_size(fd)`
+
+When the terminal receives Ctrl+C once for a running user program, its
+registered cleanup callback is requested. The callback should save any needed
+state and call `mos_exit()`. If it does not exit within one second, the kernel
+force-terminates the program. A second Ctrl+C within 800 ms force-terminates
+it immediately. Programs without a callback are terminated immediately.
+
+Process kill and force-termination controls remain kernel/terminal operations;
+the SDK does not expose a syscall for killing arbitrary processes.
 
 The current x86_64 user syscall API is also available through the subsystem
 headers under `include/x86_64/`:

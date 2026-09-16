@@ -142,6 +142,10 @@ static inline void mos_exit(int code) {
     for (;;) { } // never reached - SYS_EXIT never returns
 }
 
+static inline long mos_register_cleanup(void (*cleanup)(void)) {
+    return mos_syscall(SYS_REGISTER_CLEANUP, (long)(uintptr_t)cleanup, 0, 0);
+}
+
 // --- Process management ---
 
 // Lists up to `max_entries` currently known processes into `entries`.

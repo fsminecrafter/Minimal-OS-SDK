@@ -27,6 +27,10 @@ static inline void mos_exit(void) {
     for (;;) { }
 }
 
+static inline uint64_t mos_register_cleanup(void (*cleanup)(void)) {
+    return mos_syscall1(SYS_REGISTER_CLEANUP, (uint64_t)(uintptr_t)cleanup);
+}
+
 static inline uint64_t mos_getpid(void) { return mos_syscall1(SYS_GETPID, 0); }
 static inline uint64_t mos_uptime(void) { return mos_syscall1(SYS_UPTIME, 0); }
 
