@@ -142,6 +142,20 @@ static inline void mos_exit(int code) {
     for (;;) { } // never reached - SYS_EXIT never returns
 }
 
+// --- Process management ---
+
+// Lists up to `max_entries` currently known processes into `entries`.
+// Returns the number of entries written, or a negative SYS_ERR_* value.
+static inline long mos_pslist(syscall_process_info_t* entries,
+                              size_t max_entries) {
+    return mos_syscall(
+        SYS_PSLIST,
+        (long)(uintptr_t)entries,
+        (long)max_entries,
+        0
+    );
+}
+
 // Convenience: write a NUL-terminated string to stdout.
 static inline long mos_puts(const char* str) {
     size_t len = 0;

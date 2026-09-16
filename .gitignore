@@ -5,3 +5,5 @@ build
 # Stuff to ignore
 hello.run
 *.run
+*.elf
+*.o
