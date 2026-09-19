@@ -27,6 +27,10 @@ static inline void mos_exit(void) {
     for (;;) { }
 }
 
+static inline uint64_t mos_register_cleanup(void (*cleanup)(void)) {
+    return mos_syscall1(SYS_REGISTER_CLEANUP, (uint64_t)(uintptr_t)cleanup);
+}
+
 static inline uint64_t mos_getpid(void) { return mos_syscall1(SYS_GETPID, 0); }
 static inline uint64_t mos_uptime(void) { return mos_syscall1(SYS_UPTIME, 0); }
 
@@ -46,6 +50,11 @@ static inline uint64_t mos_manager(uint64_t manager, uint64_t operation,
 static inline uint64_t mos_usb(uint64_t operation, uint64_t arg1,
                                uint64_t arg2) {
     return mos_syscall3(SYS_USB, operation, arg1, arg2);
+}
+
+static inline uint64_t mos_mouse(uint64_t operation, uint64_t arg1,
+                                 uint64_t arg2) {
+    return mos_syscall3(SYS_MOUSE, operation, arg1, arg2);
 }
 
 static inline uint64_t mos_sysinfo(uint64_t op) {

@@ -182,6 +182,28 @@ typedef struct {
 } syscall_mouse_state_t;
 
 // ===========================================
+// MOUSE (SYS_MOUSE)
+// ===========================================
+
+typedef enum {
+    SYS_MOUSE_INIT = 1,
+    SYS_MOUSE_POLL,
+    SYS_MOUSE_HAS_MOUSE,
+    SYS_MOUSE_GET_STATE,   // consumes accumulated delta since last call
+} syscall_mouse_op_t;
+
+#define SYSCALL_MOUSE_BTN_LEFT   (1 << 0)
+#define SYSCALL_MOUSE_BTN_RIGHT  (1 << 1)
+#define SYSCALL_MOUSE_BTN_MIDDLE (1 << 2)
+
+typedef struct {
+    int32_t dx;      // relative movement since last GET_STATE call
+    int32_t dy;
+    int32_t wheel;   // relative scroll since last GET_STATE call
+    uint8_t buttons; // SYSCALL_MOUSE_BTN_* bitmask, current state
+} syscall_mouse_state_t;
+
+// ===========================================
 // MinimaFS extension structures
 // ===========================================
 //
