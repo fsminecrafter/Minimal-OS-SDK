@@ -16,6 +16,27 @@ C++, use the same command with a `.cpp` file:
 
     ./build.sh examples/hello.cpp
 
+You can also pass a project folder. It uses `main.cpp` or `main.c` as the
+program entry source, or select another source explicitly:
+
+    ./build.sh programs
+    ./build.sh programs --main programs/main.cpp
+
+Build a shared library with `--slib`:
+
+    ./build.sh --slib libraries/math
+
+Example library:
+
+    ./build.sh --slib examples/example-slib
+
+The `.slib` bundle contains the linked ELF, an export manifest of global
+symbols, and all `.h`/`.hpp` files found below the library folder. Headers are
+kept as public interface metadata for the runtime loader; `static` symbols are
+not exported. The bundle format is `MINISLIB1`; kernel-side loading and
+per-process shared/private mapping are provided by the operating system, not
+by this packaging script.
+
 The build script compiles `crt0.c`, compiles the selected source, links
 `main.elf` with `link.ld`, and packages it with `mkrun.sh`. It uses `gcc`,
 `g++`, and `ld` by default. Set `CC`, `CXX`, or `LD` to use a cross-toolchain, for
@@ -65,20 +86,31 @@ formats are `%s`, `%c`, `%d`, `%i`, `%u`, `%x`, `%X`, `%ld`, `%lu`, and `%%`.
   relocations are processed at load time.
 
 ## C++
-`-fno-exceptions -fno-rtti -fno-threadsafe-statics` and skip global
-objects with non-trivial constructors for now - `crt0.c` doesn't walk
-`.init_array` yet (it could, using the same ctor-section-walk pattern
-`commandhandler.c` already uses for `REGISTER_COMMAND`, if that's
-wanted next).
+`-fno-exceptions -fno-rtti -fno-threadsafe-statics`. Global objects with
+non-trivial constructors now work: `crt0.c` walks `.init_array` before
+calling `main()`, using the same ctor-section-walk pattern
+`commandhandler.c` uses for `REGISTER_COMMAND`. Destructors
+(`.fini_array`) are still not run - a program ends via `mos_exit()`,
+which does not return.
 
 ## Syscalls available
 - `mos_write(fd, buf, len)` - fd 1/2 only, goes to the terminal + serial.
 - `mos_exit(code)`
+- `mos_register_cleanup(callback)`
 - `mos_getpid()`
 - `mos_uptime()` and `mos_sleep(ticks)`
 - `mos_open(path, flags)`, `mos_read(fd, buf, len)`, `mos_close(fd)`
 - `mos_exists(path)`, `mos_is_dir(path)`, and `mos_mkdir(path)`
 - `mos_gettime()`, `mos_seek(fd, offset)`, and `mos_size(fd)`
+
+When the terminal receives Ctrl+C once for a running user program, its
+registered cleanup callback is requested. The callback should save any needed
+state and call `mos_exit()`. If it does not exit within one second, the kernel
+force-terminates the program. A second Ctrl+C within 800 ms force-terminates
+it immediately. Programs without a callback are terminated immediately.
+
+Process kill and force-termination controls remain kernel/terminal operations;
+the SDK does not expose a syscall for killing arbitrary processes.
 
 The current x86_64 user syscall API is also available through the subsystem
 headers under `include/x86_64/`:
@@ -110,6 +142,50 @@ from `x86_64/syscall.h`.
 The syscall constants, error values, and kernel-side register frame are also
 available from `include/syscall.h`. `SYS_O_RDONLY` is the only open flag
 currently defined.
+
+## Networking, heap, and randomness (SDK v1.1)
+
+Three syscalls were added so userland can do more than draw and read
+files. Include `net.h` for networking, `stdlib.h` for memory, and
+`string.h` for the usual string/memory helpers.
+
+- `SYS_NET` (30) - `net.h`. TCP connect/send/recv/close, UDP
+  bind/recv/send (broadcast included), DNS resolution, interface
+  status, and an explicit poll. Addresses are host-order `uint32_t`
+  throughout; `mos_ip_parse()` and `mos_ip_to_string()` convert.
+  Connections are integer handles, not kernel pointers.
+- `SYS_HEAP` (31) - `stdlib.h`. `malloc`, `calloc`, `realloc`, `free`.
+  Backed by the kernel allocator, since every process still shares the
+  kernel PML4. Before this there was no heap at all.
+- `SYS_RANDOM` (32) - `stdlib.h`. `mos_random_bytes()`. RDRAND where the
+  CPU has it, TSC/RTC-derived otherwise.
+
+The interface must already have an address: run `dhcp` in the terminal
+first. A `.run` program calling `mos_net_dhcp()` gets `SYS_ERR_PERM` on
+purpose - acquiring a lease rewrites the address for every process on
+the machine, so it stays an operator action.
+
+`SYS_ERR_BUSY` is new and is not a failure. The network stack builds its
+frames in file-static buffers, so only one caller can be inside it at a
+time; a caller that gets `BUSY` should retry rather than give up.
+
+`examples/nettest.c` exercises all of it:
+
+    ./build.sh examples/nettest.c
+    # then, inside Minimal-OS:
+    dhcp
+    run 0:/programs/nettest.run                 # DNS + HTTP HEAD
+    run 0:/programs/nettest.run --discover      # UDP broadcast discovery
+
+Note for QEMU: under `-netdev user` the guest is NATed and LAN
+broadcasts never reach it, so `--discover` will find nothing however
+correct your code is. Use a tap or bridge netdev to test discovery.
+
+`crt0.c` now also defines out-of-line `memcpy`/`memmove`/`memset`/
+`memcmp` (GCC emits calls to these on its own, even under
+`-fno-builtin`) and walks `.init_array`, so C++ globals with non-trivial
+constructors work - the restriction the C++ section above describes no
+longer applies. Destructors still do not run.
 
 ## If you didnt know
 

@@ -142,6 +142,25 @@ static inline void mos_exit(int code) {
     for (;;) { } // never reached - SYS_EXIT never returns
 }
 
+// Creates an empty file. Open it afterwards with SYS_O_RDWR to write.
+// filetype/fileformat may be NULL for "binary"/"bin".
+static inline long mos_create(const char* path, const char* filetype,
+                              const char* fileformat) {
+    return mos_syscall(SYS_CREATE, (long)(uintptr_t)path,
+                       (long)(uintptr_t)filetype, (long)(uintptr_t)fileformat);
+}
+
+// Launches another .run bundle as a new process and returns its pid.
+// `argv`/`argc` are the extra arguments the program sees as argv[1..]
+// (argv[0] is always the path itself). Pass NULL/0 for none.
+static inline long mos_exec(const char* path, const char** argv, long argc) {
+    return mos_syscall(SYS_EXEC, (long)(uintptr_t)path, (long)(uintptr_t)argv, argc);
+}
+
+static inline long mos_register_cleanup(void (*cleanup)(void)) {
+    return mos_syscall(SYS_REGISTER_CLEANUP, (long)(uintptr_t)cleanup, 0, 0);
+}
+
 // --- Process management ---
 
 // Lists up to `max_entries` currently known processes into `entries`.
