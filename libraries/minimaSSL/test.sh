@@ -1,0 +1,1 @@
+gcc -Wall -Wextra -I include -I src src/*.c tests/selftest.c -o t_mine && ./t_mine

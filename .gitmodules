@@ -1,3 +1,3 @@
 [submodule "minimaSSL"]
-	path = minimaSSL
+	path = libraries/minimaSSL
 	url = https://github.com/fsminecrafter/minimaSSL
