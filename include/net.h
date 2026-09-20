@@ -117,6 +117,62 @@ static inline long mos_tcp_close(long handle) {
     return mos_net_call(&r);
 }
 
+// --- Server side --------------------------------------------------------
+
+// Starts listening on `port`. Returns a LISTENER handle > 0 (valid only
+// for mos_tcp_accept/mos_tcp_unlisten), or a negative SYS_ERR_*.
+// `backlog` is clamped by the kernel (0 = a small default). A port can
+// only be listened on once machine-wide.
+static inline long mos_tcp_listen(uint16_t port, uint32_t backlog) {
+    uint64_t handle = 0;
+    syscall_net_request_t r = {0};
+    r.op = SYS_NET_TCP_LISTEN;
+    r.local_port = port;
+    r.len = backlog;
+    r.out_handle = &handle;
+    long rc = mos_net_call(&r);
+    if (rc != (long)SYS_SUCCESS) return rc;
+    return (long)handle;
+}
+
+// NON-BLOCKING. Returns a connection handle > 0 for the oldest waiting
+// client, 0 if nobody is waiting yet, or a negative SYS_ERR_* (notably
+// SYS_ERR_BUSY - retry). The kernel only sees new clients when someone
+// pumps the NIC, and this call does that once, so call it in a loop
+// with a short mos_sleep() between attempts.
+static inline long mos_tcp_accept(long listener, uint32_t* out_ip, uint16_t* out_port) {
+    uint64_t handle = 0;
+    syscall_net_request_t r = {0};
+    r.op = SYS_NET_TCP_ACCEPT;
+    r.handle = (uint64_t)listener;
+    r.out_handle = &handle;
+    r.out_from_ip = out_ip;
+    r.out_from_port = out_port;
+    long rc = mos_net_call(&r);
+    if (rc == (long)SYS_ERR_AGAIN) return 0;
+    if (rc != (long)SYS_SUCCESS) return rc;
+    return (long)handle;
+}
+
+static inline long mos_tcp_unlisten(long listener) {
+    syscall_net_request_t r = {0};
+    r.op = SYS_NET_TCP_UNLISTEN;
+    r.handle = (uint64_t)listener;
+    return mos_net_call(&r);
+}
+
+// Gives a connection you own to another process (typically the child
+// you just started to serve it). After this the kernel closes the
+// connection if that process dies, instead of if YOU do. Fails with
+// SYS_ERR_PERM if you do not currently own the handle.
+static inline long mos_tcp_handoff(long handle, uint32_t pid) {
+    syscall_net_request_t r = {0};
+    r.op = SYS_NET_TCP_HANDOFF;
+    r.handle = (uint64_t)handle;
+    r.len = pid;
+    return mos_net_call(&r);
+}
+
 static inline long mos_udp_bind(uint16_t local_port) {
     uint64_t handle = 0;
     syscall_net_request_t r = {0};

@@ -43,6 +43,17 @@ typedef struct {
     uint8_t* plain;                   /* DLR_MAX_FRAME scratch, heap */
 } dlr_session;
 
+/*
+ * Raw framing, exposed so the server (dlr_server.c) uses the very same
+ * code as the client instead of a second copy that could drift. A frame
+ * is a 4-byte big-endian length then that many bytes.
+ *
+ * dlr_frame_recv returns the frame length or -1; it refuses a length
+ * over `cap` before reading a byte of the body.
+ */
+int  dlr_frame_send(long sock, const uint8_t* payload, uint32_t len);
+long dlr_frame_recv(long sock, uint8_t* buf, uint32_t cap, uint32_t timeout_ms);
+
 // Allocates the two scratch buffers. Returns 0 on success.
 int  dlr_session_alloc(dlr_session* s);
 void dlr_session_free(dlr_session* s);
@@ -74,12 +85,15 @@ long dlr_ping(dlr_session* s);
  *    1  success
  *    0  transport/protocol failure
  *   -1  server replied INSTALL_ERROR (message in `err`, if non-NULL)
+ * *out_format (if non-NULL) is DLR_FORMAT_TAR or DLR_FORMAT_MPKG, taken
+ * from the size header; it is only meaningful when 1 is returned.
  * Progress is reported through `on_progress` (may be NULL); received
  * may exceed nothing useful until the SIZE header arrives, at which
  * point total becomes non-zero.
  */
 int dlr_download(dlr_session* s, const char* pkg_name, const char* stage_path,
                  void (*on_progress)(uint64_t received, uint64_t total),
+                 int* out_format,
                  char* err, size_t err_size);
 
 #endif // DLR_PROTO_H

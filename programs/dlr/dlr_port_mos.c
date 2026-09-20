@@ -164,29 +164,38 @@ uint32_t dlr_resolve(const char* host) {
 
 struct dlr_file {
     int fd;
+    int used;
 };
 
-// One static handle: the client never has two files open at once, and
-// a heap allocation per open would be pure ceremony.
-static struct dlr_file g_file_slot;
-static int g_file_slot_used = 0;
+// A small fixed pool rather than a heap allocation per open. The client
+// only ever has one file open; the server needs a source and a
+// destination at once while copying a package into its store.
+#define DLR_MAX_OPEN_FILES 4
+static struct dlr_file g_files[DLR_MAX_OPEN_FILES];
+
+static struct dlr_file* file_slot_take(void) {
+    for (int i = 0; i < DLR_MAX_OPEN_FILES; i++) {
+        if (!g_files[i].used) { g_files[i].used = 1; return &g_files[i]; }
+    }
+    return NULL;
+}
 
 dlr_file* dlr_file_create(const char* path) {
-    if (g_file_slot_used) return NULL;
+    struct dlr_file* slot = file_slot_take();
+    if (!slot) return NULL;
 
     // MinimaFS has no O_TRUNC and no create-on-open: SYS_OPEN only
     // ever opens what already exists, so the sequence is delete (if
     // present) -> SYS_CREATE -> open writable.
     if (mos_exists(path)) mos_delete(path);
 
-    if (mos_create(path, "binary", "bin") != (long)SYS_SUCCESS) return NULL;
+    if (mos_create(path, "binary", "bin") != (long)SYS_SUCCESS) { slot->used = 0; return NULL; }
 
     int fd = (int)mos_open(path, SYS_O_RDWR);
-    if (fd <= 0) return NULL;
+    if (fd <= 0) { slot->used = 0; return NULL; }
 
-    g_file_slot.fd = fd;
-    g_file_slot_used = 1;
-    return &g_file_slot;
+    slot->fd = fd;
+    return slot;
 }
 
 int dlr_file_write(dlr_file* f, const void* buf, uint32_t len) {
@@ -198,7 +207,61 @@ int dlr_file_write(dlr_file* f, const void* buf, uint32_t len) {
 void dlr_file_close(dlr_file* f) {
     if (!f) return;
     mos_close(f->fd);
-    g_file_slot_used = 0;
+    f->used = 0;
+}
+
+dlr_file* dlr_file_open_read(const char* path) {
+    struct dlr_file* slot = file_slot_take();
+    if (!slot) return NULL;
+
+    int fd = (int)mos_open(path, SYS_O_RDONLY);
+    if (fd <= 0) { slot->used = 0; return NULL; }
+
+    slot->fd = fd;
+    return slot;
+}
+
+long dlr_file_read(dlr_file* f, void* buf, uint32_t len) {
+    if (!f) return -1;
+    long n = mos_read(f->fd, buf, len);
+    return n < 0 ? -1 : n;
+}
+
+int dlr_is_dir(const char* path) {
+    return mos_is_dir(path) == 1;
+}
+
+#define DLR_DIR_MAX_ENTRIES 128
+
+int dlr_dir_each(const char* path, dlr_dir_cb cb, void* user) {
+    // Heap, not static: the caller's callback may recurse into another
+    // directory, which would overwrite a shared buffer mid-iteration.
+    syscall_dirent_t* entries = (syscall_dirent_t*)malloc(sizeof(syscall_dirent_t) * DLR_DIR_MAX_ENTRIES);
+    if (!entries) return -1;
+
+    long n = mos_listdir(path, entries, DLR_DIR_MAX_ENTRIES);
+    if (n < 0) { free(entries); return -1; }
+
+    int visited = 0;
+    for (long i = 0; i < n; i++) {
+        const char* name = entries[i].name;
+        if (name[0] == '.' && (name[1] == '\0' || (name[1] == '.' && name[2] == '\0'))) continue;
+        visited++;
+        if (!cb(user, name, entries[i].type == SYSCALL_DIRENT_TYPE_DIR)) break;
+    }
+    free(entries);
+    return visited;
+}
+
+int dlr_remove_dir(const char* path) {
+    return mos_rmdir(path) == (long)SYS_SUCCESS;
+}
+
+int dlr_pack_dir(const char* dir, char* out_path, size_t out_cap) {
+    // NULL algorithm = the kernel's default (LZSS, falling back to STORE
+    // per file when it does not help).
+    long rc = mos_pkg_zip(dir, NULL, out_path, (uint32_t)out_cap);
+    return rc == (long)SYS_SUCCESS;
 }
 
 long dlr_file_size(const char* path) {
@@ -258,6 +321,111 @@ int dlr_exists(const char* path) {
 
 int dlr_remove(const char* path) {
     return mos_delete(path) == (long)SYS_SUCCESS;
+}
+
+/* --- server ------------------------------------------------------------ */
+
+long dlr_tcp_listen(uint16_t port) {
+    for (int attempt = 0; attempt < 20; attempt++) {
+        long h = mos_tcp_listen(port, 3);
+        if (is_busy(h)) { mos_sleep(DLR_RETRY_SLEEP_TICKS); continue; }
+        return (h > 0) ? h : DLR_INVALID;
+    }
+    return DLR_INVALID;
+}
+
+int dlr_tcp_accept(long listener, long* out_conn, uint32_t* out_ip) {
+    uint16_t port = 0;
+    long h = mos_tcp_accept(listener, out_ip, &port);
+    if (is_busy(h)) return 0;       // someone else is in the stack; next pass
+    if (h < 0) return -1;
+    if (h == 0) return 0;
+    *out_conn = h;
+    return 1;
+}
+
+void dlr_tcp_unlisten(long listener) {
+    for (int attempt = 0; attempt < 20; attempt++) {
+        long rc = mos_tcp_unlisten(listener);
+        if (!is_busy(rc)) return;
+        mos_sleep(DLR_RETRY_SLEEP_TICKS);
+    }
+}
+
+static char g_self_path[256];
+
+void dlr_set_self(const char* argv0) {
+    size_t n = strlen(argv0);
+    if (n >= sizeof(g_self_path)) n = sizeof(g_self_path) - 1;
+    memcpy(g_self_path, argv0, n);
+    g_self_path[n] = '\0';
+}
+
+// Decimal into a caller buffer; returns the length.
+static size_t fmt_uint(char* out, uint32_t v) {
+    char tmp[12];
+    size_t n = 0, len = 0;
+    if (v == 0) tmp[n++] = '0';
+    while (v) { tmp[n++] = (char)('0' + v % 10); v /= 10; }
+    while (n) out[len++] = tmp[--n];
+    out[len] = '\0';
+    return len;
+}
+
+long dlr_spawn_conn(long conn, uint32_t peer_ip, const char* const* extra, int extra_count) {
+    if (!g_self_path[0]) return DLR_INVALID;
+
+    // argv[1..]: --conn <handle> <a.b.c.d> <extra...>. The strings must
+    // outlive the mos_exec call, hence static; the kernel copies them
+    // into the child before returning.
+    static char handle_str[16];
+    static char ip_str[20];
+    fmt_uint(handle_str, (uint32_t)conn);
+    {
+        size_t p = 0;
+        for (int i = 0; i < 4; i++) {
+            p += fmt_uint(ip_str + p, (peer_ip >> (24 - 8 * i)) & 0xFFu);
+            if (i < 3) ip_str[p++] = '.';
+        }
+        ip_str[p] = '\0';
+    }
+
+    const char* argv[16];
+    int argc = 0;
+    argv[argc++] = "--conn";
+    argv[argc++] = handle_str;
+    argv[argc++] = ip_str;
+    for (int i = 0; i < extra_count && argc < 16; i++) argv[argc++] = extra[i];
+
+    long pid = mos_exec(g_self_path, argv, argc);
+    if (pid <= 0) return DLR_INVALID;
+
+    // From here the kernel closes the connection if the child dies. If
+    // the handoff itself fails the child is still serving it; the only
+    // cost is that the connection stays ours (and is reclaimed when we
+    // exit) instead of following the child.
+    for (int attempt = 0; attempt < 20; attempt++) {
+        long rc = mos_tcp_handoff(conn, (uint32_t)pid);
+        if (!is_busy(rc)) break;
+        mos_sleep(DLR_RETRY_SLEEP_TICKS);
+    }
+    return pid;
+}
+
+int dlr_proc_alive(long pid) {
+    static syscall_process_info_t procs[64];
+    long count = mos_pslist(procs, 64);
+    for (long i = 0; i < count; i++) {
+        if ((long)procs[i].pid == pid) {
+            return procs[i].state != SYSCALL_PROC_STATE_ZOMBIE &&
+                   procs[i].state != SYSCALL_PROC_STATE_TERMINATED;
+        }
+    }
+    return 0;
+}
+
+void dlr_on_interrupt(void (*cb)(void)) {
+    mos_register_cleanup(cb);
 }
 
 /* --- misc -------------------------------------------------------------- */

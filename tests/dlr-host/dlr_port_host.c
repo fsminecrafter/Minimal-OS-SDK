@@ -31,6 +31,8 @@
 #include <netdb.h>
 #include <poll.h>
 #include <sys/wait.h>
+#include <dirent.h>
+#include <signal.h>
 
 static char g_root[512];
 
@@ -38,6 +40,13 @@ static char g_root[512];
 
 // "0:/etc/dlr/x" -> "<root>/etc/dlr/x"
 static const char* mapped(const char* path, char* out, size_t cap) {
+    // Store management (`present`, `packages`, ...) runs before
+    // dlr_port_init() - on Minimal-OS it is pure disk access and needs
+    // no network - so the root cannot depend on init having happened.
+    if (!g_root[0]) {
+        const char* root = getenv("DLR_ROOT");
+        snprintf(g_root, sizeof(g_root), "%s", root ? root : "./sandbox");
+    }
     const char* rel = path;
     if (rel[0] && rel[1] == ':') rel += 2;
     while (*rel == '/') rel++;
@@ -190,12 +199,20 @@ uint32_t dlr_resolve(const char* host) {
 
 /* --- files -------------------------------------------------------------- */
 
-struct dlr_file { FILE* fp; };
-static struct dlr_file g_slot;
-static int g_slot_used = 0;
+struct dlr_file { FILE* fp; int used; };
+#define HOST_MAX_OPEN 4
+static struct dlr_file g_files[HOST_MAX_OPEN];
+
+static struct dlr_file* slot_take(void) {
+    for (int i = 0; i < HOST_MAX_OPEN; i++) {
+        if (!g_files[i].used) { g_files[i].used = 1; return &g_files[i]; }
+    }
+    return NULL;
+}
 
 dlr_file* dlr_file_create(const char* path) {
-    if (g_slot_used) return NULL;
+    struct dlr_file* slot = slot_take();
+    if (!slot) return NULL;
     char real[1024];
     mapped(path, real, sizeof(real));
 
@@ -204,10 +221,9 @@ dlr_file* dlr_file_create(const char* path) {
     char* slash = strrchr(dir, '/');
     if (slash) { *slash = '\0'; mkdir_p(dir); }
 
-    g_slot.fp = fopen(real, "wb");
-    if (!g_slot.fp) return NULL;
-    g_slot_used = 1;
-    return &g_slot;
+    slot->fp = fopen(real, "wb");
+    if (!slot->fp) { slot->used = 0; return NULL; }
+    return slot;
 }
 
 int dlr_file_write(dlr_file* f, const void* buf, uint32_t len) {
@@ -217,7 +233,85 @@ int dlr_file_write(dlr_file* f, const void* buf, uint32_t len) {
 void dlr_file_close(dlr_file* f) {
     if (!f) return;
     fclose(f->fp);
-    g_slot_used = 0;
+    f->used = 0;
+}
+
+dlr_file* dlr_file_open_read(const char* path) {
+    struct dlr_file* slot = slot_take();
+    if (!slot) return NULL;
+    char real[1024];
+    slot->fp = fopen(mapped(path, real, sizeof(real)), "rb");
+    if (!slot->fp) { slot->used = 0; return NULL; }
+    return slot;
+}
+
+long dlr_file_read(dlr_file* f, void* buf, uint32_t len) {
+    if (!f) return -1;
+    size_t n = fread(buf, 1, len, f->fp);
+    if (n == 0 && ferror(f->fp)) return -1;
+    return (long)n;
+}
+
+int dlr_is_dir(const char* path) {
+    char real[1024];
+    struct stat st;
+    return stat(mapped(path, real, sizeof(real)), &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+int dlr_dir_each(const char* path, dlr_dir_cb cb, void* user) {
+    char real[1024];
+    DIR* d = opendir(mapped(path, real, sizeof(real)));
+    if (!d) return -1;
+
+    // Collect first, call back after: the callback may itself list or
+    // modify directories, and readdir() state is per-DIR* anyway, but
+    // matching the Minimal-OS backend (a snapshot) keeps the two
+    // behaving the same, including for a callback that deletes entries.
+    char names[256][256];
+    int is_dir[256];
+    int n = 0;
+    struct dirent* e;
+    while ((e = readdir(d)) != NULL && n < 256) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        snprintf(names[n], sizeof(names[n]), "%s", e->d_name);
+        char full[1300];
+        struct stat st;
+        snprintf(full, sizeof(full), "%s/%s", real, e->d_name);
+        is_dir[n] = (stat(full, &st) == 0 && S_ISDIR(st.st_mode));
+        n++;
+    }
+    closedir(d);
+
+    int visited = 0;
+    for (int i = 0; i < n; i++) {
+        visited++;
+        if (!cb(user, names[i], is_dir[i])) break;
+    }
+    return visited;
+}
+
+int dlr_remove_dir(const char* path) {
+    char real[1024];
+    return rmdir(mapped(path, real, sizeof(real))) == 0;
+}
+
+// Minimal-OS archives with a syscall; here the reference host tool does
+// it (tools/mkpkg/mkpkg.py in the Minimal-OS repo), pointed to by
+// $DLR_MKPKG. Same output name and same entry naming as the kernel.
+int dlr_pack_dir(const char* dir, char* out_path, size_t out_cap) {
+    const char* tool = getenv("DLR_MKPKG");
+    if (!tool) { fprintf(stderr, "dlr(host): set DLR_MKPKG to mkpkg.py to pack directories\n"); return 0; }
+
+    char real[1024], out_logical[512], out_real[1100], cmd[2600];
+    mapped(dir, real, sizeof(real));
+    snprintf(out_logical, sizeof(out_logical), "%s.mpkg", dir);
+    mapped(out_logical, out_real, sizeof(out_real));
+
+    snprintf(cmd, sizeof(cmd), "python3 '%s' '%s' '%s' >/dev/null 2>&1", tool, real, out_real);
+    if (system(cmd) != 0) return 0;
+
+    if (out_path) snprintf(out_path, out_cap, "%s", out_logical);
+    return 1;
 }
 
 long dlr_file_size(const char* path) {
@@ -258,6 +352,93 @@ int dlr_exists(const char* path) {
 int dlr_remove(const char* path) {
     char real[1024];
     return unlink(mapped(path, real, sizeof(real))) == 0;
+}
+
+/* --- server ------------------------------------------------------------- */
+
+long dlr_tcp_listen(uint16_t port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return DLR_INVALID;
+    int on = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0 || listen(fd, 4) != 0) {
+        close(fd);
+        return DLR_INVALID;
+    }
+    return fd;
+}
+
+int dlr_tcp_accept(long listener, long* out_conn, uint32_t* out_ip) {
+    struct pollfd pfd = { (int)listener, POLLIN, 0 };
+    int r = poll(&pfd, 1, 0);
+    if (r < 0) return -1;
+    if (r == 0) return 0;
+
+    struct sockaddr_in from;
+    socklen_t len = sizeof(from);
+    int fd = accept((int)listener, (struct sockaddr*)&from, &len);
+    if (fd < 0) return (errno == EAGAIN || errno == EINTR) ? 0 : -1;
+    *out_conn = fd;
+    if (out_ip) *out_ip = ntohl(from.sin_addr.s_addr);
+    return 1;
+}
+
+void dlr_tcp_unlisten(long listener) {
+    if (listener >= 0) close((int)listener);
+}
+
+void dlr_set_self(const char* argv0) { (void)argv0; }
+
+long dlr_spawn_conn(long conn, uint32_t peer_ip, const char* const* extra, int extra_count) {
+    char handle_str[16], ip_str[20];
+    snprintf(handle_str, sizeof(handle_str), "%ld", conn);
+    snprintf(ip_str, sizeof(ip_str), "%u.%u.%u.%u", (peer_ip >> 24) & 255, (peer_ip >> 16) & 255,
+             (peer_ip >> 8) & 255, peer_ip & 255);
+
+    const char* argv[24];
+    int argc = 0;
+    argv[argc++] = "dlr-host";
+    argv[argc++] = "--conn";
+    argv[argc++] = handle_str;
+    argv[argc++] = ip_str;
+    for (int i = 0; i < extra_count && argc < 22; i++) argv[argc++] = extra[i];
+    argv[argc] = NULL;
+
+    pid_t pid = fork();
+    if (pid < 0) return DLR_INVALID;
+    if (pid == 0) {
+        // Child: the connection fd is inherited across exec.
+        execv("/proc/self/exe", (char* const*)argv);
+        _exit(127);
+    }
+
+    // The kernel-side equivalent is a handoff: the parent stops being
+    // the owner. On a host the equivalent is closing our copy of the
+    // fd, otherwise the peer would not see EOF when the child closes.
+    close((int)conn);
+    return (long)pid;
+}
+
+int dlr_proc_alive(long pid) {
+    int status;
+    pid_t r = waitpid((pid_t)pid, &status, WNOHANG);
+    return r == 0;      // 0 = still running; >0 reaped it; -1 no such child
+}
+
+static void (*g_interrupt_cb)(void);
+static void on_signal(int sig) { (void)sig; if (g_interrupt_cb) g_interrupt_cb(); }
+
+void dlr_on_interrupt(void (*cb)(void)) {
+    g_interrupt_cb = cb;
+    signal(SIGINT, on_signal);
+    signal(SIGTERM, on_signal);
 }
 
 /* --- misc --------------------------------------------------------------- */

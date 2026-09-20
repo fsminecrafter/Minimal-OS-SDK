@@ -7,11 +7,14 @@
 /*
  * Read-only ustar (POSIX.1-1988) extractor.
  *
- * The Deliver server builds its bundles by shelling out to
- * /usr/bin/tar, and it has to keep doing that - switching the server
- * to .mpkg would break every existing Linux and Windows client. So the
- * Minimal-OS side learns to read tar rather than the server learning
- * to write something else.
+ * The Linux/Windows Deliver server builds its bundles by shelling out
+ * to /usr/bin/tar, and it has to keep doing that - switching it to
+ * .mpkg would break every existing client on those platforms. So the
+ * Minimal-OS side learns to read tar rather than that server learning
+ * to write something else. (A Minimal-OS server is the other way
+ * round: it sends .mpkg, its native archive - see dlr_mpkg.h and the
+ * FORMAT field described in dlr.h. dlr_tar_sink is shared by both
+ * extractors so the install path does not care which it got.)
  *
  * Only what a package actually contains is handled: regular files
  * (type '0' and the legacy '\0'), directories ('5'), and GNU long

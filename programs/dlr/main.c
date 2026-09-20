@@ -12,6 +12,11 @@
  * Usage:  dhcp                       (terminal, once per boot)
  *         run 0:/programs/dlr.run scan
  *         run 0:/programs/dlr.run install hello-deliver
+ *
+ * The same program is also the SERVER (`serve`, `present`, ...): see
+ * dlr_server.h. It is one binary because the server starts a copy of
+ * itself for every client, and because build.sh links every .c in this
+ * folder into a single .run anyway.
  */
 
 #include "dlr.h"
@@ -20,7 +25,10 @@
 #include "dlr_pkg.h"
 #include "dlr_db.h"
 #include "dlr_tar.h"
+#include "dlr_mpkg.h"
 #include "dlr_crypto.h"
+#include "dlr_registry.h"
+#include "dlr_server.h"
 
 #include "minimalos.h"
 #include "stdio.h"
@@ -546,7 +554,8 @@ static int cmd_install(const char* pkg_name, const char* server_name,
 
     char err[128];
     err[0] = '\0';
-    int rc = dlr_download(&s, pkg_name, DLR_STAGE_FILE, progress, err, sizeof(err));
+    int format = DLR_FORMAT_TAR;
+    int rc = dlr_download(&s, pkg_name, DLR_STAGE_FILE, progress, &format, err, sizeof(err));
     close_session(&s);
 
     if (rc == -1) {
@@ -576,12 +585,21 @@ static int cmd_install(const char* pkg_name, const char* server_name,
         return 1;
     }
 
+    // A Minimal-OS server says "FORMAT=mpkg"; every other server sends
+    // a tar without saying so. Trust the magic bytes over the header
+    // if they disagree - an .mpkg is unmistakable and a tar never
+    // starts with them, so the file itself is the better witness.
+    if (dlr_mpkg_is_archive(archive, (size_t)size)) format = DLR_FORMAT_MPKG;
+    long (*extract)(const uint8_t*, size_t, const dlr_tar_sink*) =
+        (format == DLR_FORMAT_MPKG) ? dlr_mpkg_extract_mem : dlr_tar_extract_mem;
+    const char* format_name = (format == DLR_FORMAT_MPKG) ? ".mpkg" : "tar";
+
     // Pass 1: manifest.
     dlr_pkg pkg;
     manifest_ctx mctx = { &pkg, 0 };
     dlr_tar_sink msink = { manifest_on_file, manifest_on_dir, &mctx };
-    if (dlr_tar_extract_mem(archive, (size_t)size, &msink) < 0) {
-        printf("dlr: the package is not a readable tar archive\n");
+    if (extract(archive, (size_t)size, &msink) < 0) {
+        printf("dlr: the package is not a readable %s archive\n", format_name);
         free(archive);
         return 1;
     }
@@ -633,7 +651,7 @@ static int cmd_install(const char* pkg_name, const char* server_name,
 
     printf("Installing into %s ...\n", ctx.target_dir);
     dlr_tar_sink isink = { install_on_file, install_on_dir, &ctx };
-    long entries = dlr_tar_extract_mem(archive, (size_t)size, &isink);
+    long entries = extract(archive, (size_t)size, &isink);
     free(archive);
 
     if (entries < 0) {
@@ -682,6 +700,63 @@ static int cmd_install(const char* pkg_name, const char* server_name,
     return 0;
 }
 
+/* --- server commands ---------------------------------------------------- */
+
+static int print_entry_cb(void* user, const dlr_reg_entry* e) {
+    (*(int*)user)++;
+    printf("  %-24s %-10s %s\n", e->name, e->version[0] ? e->version : "-", e->description);
+    return 1;
+}
+
+static int cmd_packages(void) {
+    printf("Packages presented from %s:\n", dlr_reg_root());
+    int n = 0;
+    dlr_reg_each(print_entry_cb, &n);
+    if (n == 0) printf("  (none - use 'dlr present <dir>')\n");
+    return 0;
+}
+
+static int cmd_present(const char* dir, const char* name) {
+    char err[128];
+    err[0] = '\0';
+    printf("Presenting %s ...\n", dir);
+    if (!dlr_reg_present(dir, name, err, sizeof(err))) {
+        printf("dlr: cannot present: %s\n", err[0] ? err : "unknown error");
+        return 1;
+    }
+    printf("Presented. Clients can now install it; 'dlr serve' to start serving.\n");
+    return 0;
+}
+
+static int cmd_unpresent(const char* name) {
+    if (!dlr_reg_remove(name)) { printf("dlr: no package '%s' in the store\n", name); return 1; }
+    printf("Removed '%s'.\n", name);
+    return 0;
+}
+
+static int cmd_rebuild(const char* name) {
+    char err[128];
+    err[0] = '\0';
+    if (!dlr_reg_rebuild(name, err, sizeof(err))) {
+        printf("dlr: cannot rebuild: %s\n", err[0] ? err : "unknown error");
+        return 1;
+    }
+    printf("Rebuilt the archive for '%s'.\n", name);
+    return 0;
+}
+
+static int cmd_serve(int argc, char** argv) {
+    dlr_server_cfg cfg;
+    dlr_server_cfg_default(&cfg);
+    const char* bad = 0;
+    if (!dlr_server_parse_args(argc, argv, 2, &cfg, &bad)) {
+        printf("dlr: bad or incomplete option '%s'\n", bad ? bad : "?");
+        printf("usage: dlr serve [--name <n>] [--port <p>] [--password <pw>]\n");
+        return 1;
+    }
+    return dlr_server_run(&cfg);
+}
+
 /* --- entry point -------------------------------------------------------- */
 
 static void usage(void) {
@@ -693,6 +768,12 @@ static void usage(void) {
     printf("  dlr search <query> [server]    search packages\n");
     printf("  dlr ping [server]              measure round-trip time\n");
     printf("  dlr install <pkg> [server]     download, verify and install\n\n");
+    printf("Serving packages to other machines:\n");
+    printf("  dlr present <dir> [name]       add a package directory to this server's store\n");
+    printf("  dlr packages                   list what this server offers\n");
+    printf("  dlr unpresent <name>           remove one\n");
+    printf("  dlr rebuild <name>             rebuild its archive after editing its files\n");
+    printf("  dlr serve [--name n] [--port p] [--password pw]\n\n");
     printf("Options: --password <pw>   --force\n");
     printf("Run 'dhcp' in the terminal once per boot before using dlr.\n");
 }
@@ -700,6 +781,22 @@ static void usage(void) {
 int main(int argc, char** argv) {
     // argv[0] is the .run path, so the command is argv[1].
     if (argc < 2) { usage(); return 0; }
+
+    // The server starts a copy of this program per client; that copy
+    // needs the network but none of the client's option parsing.
+    dlr_set_self(argv[0]);
+    if (strcmp(argv[1], "--conn") == 0) {
+        if (dlr_port_init() != 0) return 1;
+        return dlr_server_child(argc, argv);
+    }
+
+    // `serve` has its own options (--name/--port/--password), so it is
+    // dispatched before the generic loop below can misfile them as
+    // positionals.
+    if (strcmp(argv[1], "serve") == 0) {
+        if (dlr_port_init() != 0) return 1;
+        return cmd_serve(argc, argv);
+    }
 
     const char* password = 0;
     int force = 0;
@@ -722,6 +819,21 @@ int main(int argc, char** argv) {
 
     if (pos_count == 0) { usage(); return 0; }
     const char* cmd = positional[0];
+
+    // Managing the local store is disk-only; it must work before 'dhcp'.
+    if (strcmp(cmd, "packages") == 0) return cmd_packages();
+    if (strcmp(cmd, "present") == 0) {
+        if (pos_count < 2) { printf("usage: dlr present <dir> [name]\n"); return 1; }
+        return cmd_present(positional[1], positional[2]);
+    }
+    if (strcmp(cmd, "unpresent") == 0) {
+        if (pos_count < 2) { printf("usage: dlr unpresent <name>\n"); return 1; }
+        return cmd_unpresent(positional[1]);
+    }
+    if (strcmp(cmd, "rebuild") == 0) {
+        if (pos_count < 2) { printf("usage: dlr rebuild <name>\n"); return 1; }
+        return cmd_rebuild(positional[1]);
+    }
 
     if (dlr_port_init() != 0) return 1;
 

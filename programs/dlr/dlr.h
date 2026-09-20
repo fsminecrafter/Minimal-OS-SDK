@@ -35,11 +35,45 @@
  */
 #define DLR_MAX_FRAME  (72u * 1024u)
 
+/*
+ * Archive format of a download.
+ *
+ * A Linux/Windows dlr_server tars the package and sends the tar. A
+ * Minimal-OS server sends its native .mpkg instead (it already has an
+ * archiver in the kernel and no tar writer). The server says which in
+ * the size header that opens every transfer:
+ *
+ *     "SIZE:<bytes>"                                    a tar (legacy, unchanged)
+ *     "SIZE:<bytes>|FORMAT=mpkg|OS=minimalos"           an .mpkg
+ *
+ * This is deliberately an extension of the existing header rather than
+ * a new message: every shipped client reads the number after "SIZE:"
+ * and stops at the first non-digit, so an old client keeps working as
+ * far as the download goes. What an old client cannot do is extract the
+ * result - it will fail at the tar step - which is why newer clients on
+ * other platforms check the FORMAT field and say so up front.
+ */
+#define DLR_FORMAT_TAR   0
+#define DLR_FORMAT_MPKG  1
+
+/* Server-side layout (Minimal-OS only). */
+#define DLR_SERVER_DIR        "0:/var/dlrd"
+#define DLR_PKG_STORE         "0:/var/dlrd/packages"
+#define DLR_HELLO_SRC_PORT    4244    /* source port of the UDP hello */
+#define DLR_HELLO_INTERVAL_MS 5000
+#define DLR_MAX_CLIENTS       3       /* concurrent per-connection processes */
+#define DLR_SERVE_CHUNK       16384   /* plaintext bytes per INSTALL_DATA frame */
+#define DLR_CLIENT_IDLE_MS    120000  /* drop a client that says nothing this long */
+
 /* MinimaFS layout the client owns. */
 #define DLR_CONFIG_DIR   "0:/etc/dlr"
 #define DLR_SERVERS_FILE "0:/etc/dlr/servers.txt"
 #define DLR_CACHE_DIR    "0:/var/dlr"
-#define DLR_STAGE_FILE   "0:/var/dlr/download.tar"
+/* Named for what it is on the wire, not what it might be: the archive
+ * is a tar when it came from a Linux/Windows server and an .mpkg when it
+ * came from a Minimal-OS one, and the client only finds out from the
+ * SIZE header. */
+#define DLR_STAGE_FILE   "0:/var/dlr/download.bin"
 #define DLR_INSTALL_DIR  "0:/programs"
 
 #define DLR_MAX_SERVERS   16

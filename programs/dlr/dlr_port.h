@@ -81,6 +81,53 @@ int dlr_mkdirs(const char* path);
 int dlr_exists(const char* path);
 int dlr_remove(const char* path);
 
+/* --- reading files, directories --------------------------------------- */
+
+// Opens an existing file for reading. NULL on failure. Independent of the
+// write handle above: a copy needs one of each open at the same time.
+dlr_file* dlr_file_open_read(const char* path);
+
+// Up to `len` bytes; returns the count (0 at end of file) or -1.
+long      dlr_file_read(dlr_file* f, void* buf, uint32_t len);
+
+int  dlr_is_dir(const char* path);
+
+// Calls cb once per entry of a directory ("." and ".." are never
+// reported). Stops early if cb returns 0. Returns the number of
+// entries visited, or -1 if the directory cannot be read.
+typedef int (*dlr_dir_cb)(void* user, const char* name, int is_dir);
+int  dlr_dir_each(const char* path, dlr_dir_cb cb, void* user);
+
+int  dlr_remove_dir(const char* path);     // empty directories only
+
+// Archives a directory into "<dir>.mpkg" beside it (Minimal-OS's native
+// package format) and writes that path to `out_path`. 1 on success.
+int  dlr_pack_dir(const char* dir, char* out_path, size_t out_cap);
+
+/* --- server ------------------------------------------------------------ */
+
+// Starts listening. Returns a listener handle >= 0, or DLR_INVALID.
+long dlr_tcp_listen(uint16_t port);
+
+// Non-blocking. 1 = accepted (*out_conn and *out_ip set), 0 = nobody
+// waiting, -1 = error.
+int  dlr_tcp_accept(long listener, long* out_conn, uint32_t* out_ip);
+void dlr_tcp_unlisten(long listener);
+
+// Starts a new process running this same program in per-connection mode
+// (`<self> --conn <handle> <ip> <extra...>`) and passes it ownership of
+// the connection. Returns the child's pid, or DLR_INVALID; on failure
+// the caller still owns the connection and must close it.
+long dlr_spawn_conn(long conn, uint32_t peer_ip, const char* const* extra, int extra_count);
+int  dlr_proc_alive(long pid);
+
+// Must be called once with argv[0] before dlr_spawn_conn.
+void dlr_set_self(const char* argv0);
+
+// Asks for `cb` to be called when the user interrupts the program
+// (Ctrl+C in the terminal). It must only set a flag.
+void dlr_on_interrupt(void (*cb)(void));
+
 /* --- misc -------------------------------------------------------------- */
 
 void dlr_random_bytes(void* buf, size_t len);

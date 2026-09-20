@@ -19,7 +19,7 @@ static uint32_t get_be32(const uint8_t* p) {
            ((uint32_t)p[2] << 8) | (uint32_t)p[3];
 }
 
-static int send_frame(long sock, const uint8_t* payload, uint32_t len) {
+int dlr_frame_send(long sock, const uint8_t* payload, uint32_t len) {
     uint8_t header[4];
     put_be32(header, len);
     if (!dlr_tcp_write(sock, header, 4)) return 0;
@@ -28,7 +28,7 @@ static int send_frame(long sock, const uint8_t* payload, uint32_t len) {
 }
 
 // Reads one frame into `buf`. Returns the length, or -1.
-static long recv_frame(long sock, uint8_t* buf, uint32_t cap, uint32_t timeout_ms) {
+long dlr_frame_recv(long sock, uint8_t* buf, uint32_t cap, uint32_t timeout_ms) {
     uint8_t header[4];
     if (!dlr_tcp_read_exact(sock, header, 4, timeout_ms)) return -1;
 
@@ -96,7 +96,7 @@ int dlr_connect(dlr_session* s, uint32_t ip, uint16_t port, const char* password
     if (s->sock == DLR_INVALID) return 0;
 
     // 1. Server speaks first, unencrypted.
-    long n = recv_frame(s->sock, s->frame, DLR_MAX_FRAME, 5000);
+    long n = dlr_frame_recv(s->sock, s->frame, DLR_MAX_FRAME, 5000);
     if (n < 0) { dlr_disconnect(s); return 0; }
     if (n < 11 || memcmp(s->frame, "DLR_SERVER|", 11) != 0) { dlr_disconnect(s); return 0; }
     parse_hello(s, (const char*)s->frame, (uint32_t)n);
@@ -111,7 +111,7 @@ int dlr_connect(dlr_session* s, uint32_t ip, uint16_t port, const char* password
         dlr_disconnect(s);
         return 0;
     }
-    if (!send_frame(s->sock, (const uint8_t*)key_msg, (uint32_t)strlen(key_msg))) {
+    if (!dlr_frame_send(s->sock, (const uint8_t*)key_msg, (uint32_t)strlen(key_msg))) {
         dlr_disconnect(s);
         return 0;
     }
@@ -121,16 +121,16 @@ int dlr_connect(dlr_session* s, uint32_t ip, uint16_t port, const char* password
     //    authenticate() runs before the session key is used for
     //    anything, and the password crosses the wire in the clear.
     if (s->needs_password) {
-        n = recv_frame(s->sock, s->frame, DLR_MAX_FRAME, 5000);
+        n = dlr_frame_recv(s->sock, s->frame, DLR_MAX_FRAME, 5000);
         if (n < 1 || s->frame[0] != DLR_MSG_AUTH_REQUEST) { dlr_disconnect(s); return 0; }
 
         if (!password) { dlr_disconnect(s); return 0; }
-        if (!send_frame(s->sock, (const uint8_t*)password, (uint32_t)strlen(password))) {
+        if (!dlr_frame_send(s->sock, (const uint8_t*)password, (uint32_t)strlen(password))) {
             dlr_disconnect(s);
             return 0;
         }
 
-        n = recv_frame(s->sock, s->frame, DLR_MAX_FRAME, 5000);
+        n = dlr_frame_recv(s->sock, s->frame, DLR_MAX_FRAME, 5000);
         if (n < 1 || s->frame[0] != DLR_MSG_HELLO_ACK) { dlr_disconnect(s); return 0; }
     }
 
@@ -157,7 +157,7 @@ int dlr_send_msg(dlr_session* s, uint8_t type, const void* body, uint32_t body_l
     uint32_t plain_len = body_len + 1;
 
     if (!s->encrypted) {
-        return send_frame(s->sock, plain, plain_len);
+        return dlr_frame_send(s->sock, plain, plain_len);
     }
 
     // A fresh nonce per frame. Reuse under one key would be fatal, so
@@ -165,11 +165,11 @@ int dlr_send_msg(dlr_session* s, uint8_t type, const void* body, uint32_t body_l
     uint8_t* out = s->frame;
     dlr_random_bytes(out, DLR_GCM_IV_LEN);
     size_t sealed = dlr_seal(s->key, plain, plain_len, out);
-    return send_frame(s->sock, out, (uint32_t)sealed);
+    return dlr_frame_send(s->sock, out, (uint32_t)sealed);
 }
 
 int dlr_recv_msg(dlr_session* s, uint8_t* out_type, uint32_t* out_len, uint32_t timeout_ms) {
-    long n = recv_frame(s->sock, s->frame, DLR_MAX_FRAME, timeout_ms);
+    long n = dlr_frame_recv(s->sock, s->frame, DLR_MAX_FRAME, timeout_ms);
     if (n < 0) return 0;
 
     uint32_t plain_len;
@@ -193,7 +193,7 @@ int dlr_probe(uint32_t ip, uint16_t port, dlr_server* out, uint32_t timeout_ms) 
     if (sock == DLR_INVALID) return 0;
 
     uint8_t buf[256];
-    long n = recv_frame(sock, buf, sizeof(buf), timeout_ms);
+    long n = dlr_frame_recv(sock, buf, sizeof(buf), timeout_ms);
     dlr_tcp_close(sock);
 
     if (n < 11 || memcmp(buf, "DLR_SERVER|", 11) != 0) return 0;
@@ -234,6 +234,23 @@ static uint64_t parse_size_header(const uint8_t* body, uint32_t len) {
     return value;
 }
 
+// The header may carry "|KEY=VALUE" fields after the size; see dlr.h.
+// Absent or unrecognised means a tar, which is what every server that
+// predates the field sends.
+static int parse_format_field(const uint8_t* body, uint32_t len) {
+    static const char key[] = "|FORMAT=";
+    const uint32_t klen = sizeof(key) - 1;
+    for (uint32_t i = 0; i + klen <= len; i++) {
+        if (memcmp(body + i, key, klen) != 0) continue;
+        const uint8_t* v = body + i + klen;
+        uint32_t remain = len - i - klen;
+        if (remain >= 4 && memcmp(v, "mpkg", 4) == 0 &&
+            (remain == 4 || v[4] == '|')) return DLR_FORMAT_MPKG;
+        return DLR_FORMAT_TAR;
+    }
+    return DLR_FORMAT_TAR;
+}
+
 static void copy_err(char* err, size_t err_size, const uint8_t* body, uint32_t len) {
     if (!err || !err_size) return;
     uint32_t n = (len < err_size - 1) ? len : (uint32_t)err_size - 1;
@@ -243,7 +260,9 @@ static void copy_err(char* err, size_t err_size, const uint8_t* body, uint32_t l
 
 int dlr_download(dlr_session* s, const char* pkg_name, const char* stage_path,
                  void (*on_progress)(uint64_t received, uint64_t total),
+                 int* out_format,
                  char* err, size_t err_size) {
+    if (out_format) *out_format = DLR_FORMAT_TAR;
     if (!dlr_send_msg(s, DLR_MSG_INSTALL_REQUEST, pkg_name, (uint32_t)strlen(pkg_name))) {
         return 0;
     }
@@ -282,6 +301,7 @@ int dlr_download(dlr_session* s, const char* pkg_name, const char* stage_path,
             // The first INSTALL_DATA is the size header, not payload.
             if (expected == 0 && len >= 5 && memcmp(body, "SIZE:", 5) == 0) {
                 expected = parse_size_header(body, len);
+                if (out_format) *out_format = parse_format_field(body, len);
                 if (on_progress) on_progress(0, expected);
                 continue;
             }
