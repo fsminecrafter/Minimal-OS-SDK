@@ -225,6 +225,90 @@ static inline long mos_random(void* buf, uint32_t len) {
     return mos_syscall(SYS_RANDOM, (long)(uintptr_t)buf, (long)len, 0);
 }
 
+// --- TLS sessions (ktls) ------------------------------------------------
+//
+// NOT real TLS: no certificates, and the session key crosses the wire in
+// the clear (see net/tls.h in the kernel). A transport shape only.
+
+// TCP connect + hello. Returns a TLS handle > 0 or a negative SYS_ERR_*.
+// The session is not usable until mos_tls_wait_established() succeeds.
+static inline long mos_tls_connect(uint32_t ip, uint16_t port, uint32_t timeout_ms) {
+    uint64_t handle = 0;
+    syscall_net_request_t r = {0};
+    r.op = SYS_NET_TLS_CONNECT;
+    r.ip = ip;
+    r.port = port;
+    r.timeout_ms = timeout_ms;
+    r.out_handle = &handle;
+    long rc = mos_net_call(&r);
+    if (rc != (long)SYS_SUCCESS) return rc;
+    return (long)handle;
+}
+
+// Upgrades a TCP connection YOU OWN (from mos_tcp_accept + handoff) into a
+// server-side TLS session. On success the TCP handle must no longer be
+// used; closing the TLS handle closes it. On failure the TCP handle is
+// still yours.
+static inline long mos_tls_accept(long tcp_handle) {
+    uint64_t handle = 0;
+    syscall_net_request_t r = {0};
+    r.op = SYS_NET_TLS_ACCEPT;
+    r.handle = (uint64_t)tcp_handle;
+    r.out_handle = &handle;
+    long rc = mos_net_call(&r);
+    if (rc != (long)SYS_SUCCESS) return rc;
+    return (long)handle;
+}
+
+// SYSCALL_NET_TLS_* (0..2), or a negative SYS_ERR_* (BUSY = retry).
+static inline long mos_tls_state(long handle) {
+    syscall_net_request_t r = {0};
+    r.op = SYS_NET_TLS_STATE;
+    r.handle = (uint64_t)handle;
+    return mos_net_call(&r);
+}
+
+// Bytes sent (<= 4096 per call; short counts are normal), SYS_ERR_AGAIN
+// while the handshake is pending, SYS_ERR_BUSY = retry.
+static inline long mos_tls_send(long handle, const void* buf, uint32_t len) {
+    syscall_net_request_t r = {0};
+    r.op = SYS_NET_TLS_SEND;
+    r.handle = (uint64_t)handle;
+    r.buf = (void*)buf;
+    r.len = len;
+    return mos_net_call(&r);
+}
+
+// Bytes read, 0 = nothing yet, SYS_ERR_NOTFOUND = closed/dead and drained.
+static inline long mos_tls_recv(long handle, void* buf, uint32_t len) {
+    syscall_net_request_t r = {0};
+    r.op = SYS_NET_TLS_RECV;
+    r.handle = (uint64_t)handle;
+    r.buf = buf;
+    r.len = len;
+    return mos_net_call(&r);
+}
+
+static inline long mos_tls_close(long handle) {
+    syscall_net_request_t r = {0};
+    r.op = SYS_NET_TLS_CLOSE;
+    r.handle = (uint64_t)handle;
+    return mos_net_call(&r);
+}
+
+// Polls the handshake until it finishes or timeout_ms passes.
+static inline bool mos_tls_wait_established(long handle, uint32_t timeout_ms) {
+    long start = mos_uptime();
+    for (;;) {
+        long st = mos_tls_state(handle);
+        if (st == (long)SYSCALL_NET_TLS_ESTABLISHED) return true;
+        if (st == (long)SYSCALL_NET_TLS_CLOSED) return false;
+        if (st != (long)SYSCALL_NET_TLS_HANDSHAKING && st != (long)SYS_ERR_BUSY) return false;
+        if ((mos_uptime() - start) > (long)timeout_ms) return false;
+        mos_sleep(2);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Address helpers
 // ---------------------------------------------------------------------------
