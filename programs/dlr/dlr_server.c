@@ -372,6 +372,14 @@ int dlr_server_child(int argc, char** argv) {
         dlr_tcp_close(conn);
         return 2;
     }
+
+    if (cfg.tls) {
+        // The handshake happens HERE, in the child, so a silent or
+        // hostile client can only ever stall its own process.
+        conn = dlr_tls_accept(conn);         // consumes conn either way
+        if (conn == DLR_INVALID) return 2;
+    }
+    
     return dlr_server_session(conn, &cfg, ip);
 }
 
