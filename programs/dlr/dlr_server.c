@@ -411,7 +411,7 @@ int dlr_server_run(const dlr_server_cfg* cfg) {
 
     // What every child needs to know. Passed on the command line as the
     // password HASH, never the password.
-    const char* child_args[4];
+    const char* child_args[6];
     int child_argc = 0;
     child_args[child_argc++] = "--name";
     child_args[child_argc++] = cfg->name;
@@ -419,6 +419,7 @@ int dlr_server_run(const dlr_server_cfg* cfg) {
         child_args[child_argc++] = "--pwhash";
         child_args[child_argc++] = cfg->pw_hash;
     }
+    if (cfg->tls) child_args[child_argc++] = "--tls";
 
     long children[DLR_MAX_CLIENTS];
     for (int i = 0; i < DLR_MAX_CLIENTS; i++) children[i] = 0;
