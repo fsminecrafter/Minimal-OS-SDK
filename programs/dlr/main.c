@@ -57,6 +57,9 @@ static void load_servers(void) {
 // name matching) - a bad PORT after a good IP is still an error,
 // reported here rather than silently ignored.
 static int parse_address(const char* text, dlr_server* out) {
+    int tls = 0;
+    if (strncmp(text, "tls://", 6) == 0) { tls = 1; text += 6; }
+
     char host[64];
     size_t i = 0;
     while (text[i] && text[i] != ':' && i + 1 < sizeof(host)) { host[i] = text[i]; i++; }
@@ -67,7 +70,7 @@ static int parse_address(const char* text, dlr_server* out) {
 
     memset(out, 0, sizeof(*out));
     out->ip = ip;
-    out->port = DLR_DEFAULT_PORT;
+    out->port = tls ? DLR_TLS_PORT : DLR_DEFAULT_PORT;
 
     if (text[i] == ':') {
         uint32_t port = 0;
@@ -85,6 +88,11 @@ static int parse_address(const char* text, dlr_server* out) {
             return -1;
         }
         out->port = (uint16_t)port;
+    }
+
+    if (tls && out->port != DLR_TLS_PORT) {
+        printf("dlr: tls:// servers use port %u\n", DLR_TLS_PORT);
+        return -1;
     }
     return 1;
 }
