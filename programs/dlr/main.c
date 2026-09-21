@@ -222,9 +222,12 @@ static int cmd_servers(void) {
 }
 
 static int cmd_add(const char* spec) {
-    // "<ip>" or "<ip>:<port>"
+    // "<ip>", "<ip>:<port>", or "tls://<ip>[:<port>]" (tls:// = port 4342)
+    int tls = 0;
+    if (strncmp(spec, "tls://", 6) == 0) { tls = 1; spec += 6; }
+
     char host[64];
-    uint16_t port = DLR_DEFAULT_PORT;
+    uint16_t port = tls ? DLR_TLS_PORT : DLR_DEFAULT_PORT;
 
     size_t i = 0;
     while (spec[i] && spec[i] != ':' && i + 1 < sizeof(host)) { host[i] = spec[i]; i++; }
@@ -232,7 +235,11 @@ static int cmd_add(const char* spec) {
     if (spec[i] == ':') {
         uint32_t v = 0;
         for (size_t j = i + 1; spec[j] >= '0' && spec[j] <= '9'; j++) v = v * 10u + (uint32_t)(spec[j] - '0');
-        if (v) port = (uint16_t)v;
+        if (v && v <= 65535) port = (uint16_t)v;
+    }
+    if (tls && port != DLR_TLS_PORT) {
+        printf("dlr: tls:// servers use port %u\n", DLR_TLS_PORT);
+        return 1;
     }
 
     uint32_t ip = dlr_resolve(host);
@@ -243,7 +250,7 @@ static int cmd_add(const char* spec) {
 
     printf("Probing ");
     print_ip(ip);
-    printf(":%u ...\n", port);
+    printf(":%u%s ...\n", port, port == DLR_TLS_PORT ? " (ktls)" : "");
 
     dlr_server found;
     if (!dlr_probe(ip, port, &found, 4000)) {
@@ -771,7 +778,8 @@ static void usage(void) {
     printf("dlr - Deliver LAN package manager (Minimal-OS client)\n\n");
     printf("  dlr scan                       find servers on the LAN\n");
     printf("  dlr servers                    list known servers\n");
-    printf("  dlr add <ip>[:port]            register a server by address\n");
+    printf("  dlr add <ip>[:port]|tls://<ip>  register a server by address\n");
+    printf("  dlr serve [--name n] [--port p] [--password pw] [--tls]\n\n");
     printf("  dlr list [server]              list a server's packages\n");
     printf("  dlr search <query> [server]    search packages\n");
     printf("  dlr ping [server]              measure round-trip time\n");
