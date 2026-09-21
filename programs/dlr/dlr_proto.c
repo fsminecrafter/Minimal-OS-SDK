@@ -92,7 +92,8 @@ static void parse_hello(dlr_session* s, const char* hello, uint32_t len) {
 }
 
 int dlr_connect(dlr_session* s, uint32_t ip, uint16_t port, const char* password) {
-    s->sock = dlr_tcp_open(ip, port, 5000);
+    s->sock = (port == DLR_TLS_PORT) ? dlr_tls_open(ip, port, 5000)
+                                     : dlr_tcp_open(ip, port, 5000);
     if (s->sock == DLR_INVALID) return 0;
 
     // 1. Server speaks first, unencrypted.
