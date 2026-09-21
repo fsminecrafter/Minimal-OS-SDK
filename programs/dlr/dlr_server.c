@@ -64,6 +64,8 @@ void dlr_server_cfg_default(dlr_server_cfg* cfg) {
 }
 
 int dlr_server_parse_args(int argc, char** argv, int start, dlr_server_cfg* cfg, const char** bad) {
+    int port_given = 0;
+
     for (int i = start; i < argc; i++) {
         const char* a = argv[i];
         int has_value = (i + 1 < argc);
@@ -74,16 +76,27 @@ int dlr_server_parse_args(int argc, char** argv, int start, dlr_server_cfg* cfg,
             int p = atoi(argv[++i]);
             if (p <= 0 || p > 65535) { if (bad) *bad = a; return 0; }
             cfg->port = (uint16_t)p;
+            port_given = 1;
         } else if (strcmp(a, "--password") == 0 && has_value) {
             hex_of_password(argv[++i], cfg->pw_hash);
         } else if (strcmp(a, "--pwhash") == 0 && has_value) {
             const char* h = argv[++i];
             if (strlen(h) != 64) { if (bad) *bad = a; return 0; }
             memcpy(cfg->pw_hash, h, 65);
+        } else if (strcmp(a, "--tls") == 0) {
+            cfg->tls = 1;
         } else {
             if (bad) *bad = a;
             return 0;
         }
+    }
+
+    // Clients decide TLS-or-not from the port alone, so the two must agree.
+    if (cfg->tls && !port_given) cfg->port = DLR_TLS_PORT;
+    if (cfg->port == DLR_TLS_PORT) cfg->tls = 1;
+    if (cfg->tls && cfg->port != DLR_TLS_PORT) {
+        if (bad) *bad = "--tls (TLS servers must use port 4342 so clients can tell)";
+        return 0;
     }
     return 1;
 }
