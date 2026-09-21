@@ -7,6 +7,10 @@
 /* Wire constants - these mirror Deliver's types.hpp and must not drift. */
 #define DLR_DEFAULT_PORT    4242
 #define DLR_DISCOVERY_PORT  4243
+/* A server on this port speaks the ktls record layer (SYS_NET_TLS_*).
+ * Clients infer "TLS" from the port alone, so nothing else in the
+ * servers.txt format or the discovery hello had to change. */
+#define DLR_TLS_PORT        4342
 #define DLR_PROTOCOL_VERSION 1
 
 /* Message types (first byte of a decrypted payload). */
