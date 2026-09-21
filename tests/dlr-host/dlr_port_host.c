@@ -435,6 +435,17 @@ int dlr_proc_alive(long pid) {
 static void (*g_interrupt_cb)(void);
 static void on_signal(int sig) { (void)sig; if (g_interrupt_cb) g_interrupt_cb(); }
 
+long dlr_tls_open(uint32_t ip, uint16_t port, uint32_t timeout_ms) {
+    (void)ip; (void)port; (void)timeout_ms;
+    fprintf(stderr, "dlr(host): the TLS transport is Minimal-OS only\n");
+    return DLR_INVALID;
+}
+
+long dlr_tls_accept(long tcp_handle) {
+    dlr_tcp_close(tcp_handle);
+    return DLR_INVALID;
+}
+
 void dlr_on_interrupt(void (*cb)(void)) {
     g_interrupt_cb = cb;
     signal(SIGINT, on_signal);
