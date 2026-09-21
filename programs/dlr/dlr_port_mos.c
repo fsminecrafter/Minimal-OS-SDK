@@ -54,6 +54,12 @@ void dlr_sleep_ms(uint32_t ms) {
 
 /* --- TCP --------------------------------------------------------------- */
 
+static int  is_tls(long h)  { return h > 0 && (h & DLR_TLS_FLAG) != 0; }
+static long raw_h(long h)   { return h & ~DLR_TLS_FLAG; }
+static int  is_again(long rc) { return rc == (long)SYS_ERR_AGAIN; }
+
+#define DLR_TLS_STALL_MS 15000
+
 long dlr_tcp_open(uint32_t ip, uint16_t port, uint32_t timeout_ms) {
     for (int attempt = 0; attempt < 20; attempt++) {
         long h = mos_tcp_connect(ip, port, timeout_ms);
