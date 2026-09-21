@@ -141,4 +141,21 @@ long dlr_exec(const char* path);
 // Returns 1 if it exited within the timeout.
 int dlr_exec_wait(long pid, uint32_t timeout_ms);
 
+/* --- TLS-style transport (Minimal-OS to Minimal-OS only) ---------------- */
+
+/*
+ * TLS handles are ordinary `long` handles with DLR_TLS_FLAG or'ed in, so
+ * dlr_tcp_write / dlr_tcp_read_exact / dlr_tcp_close work on either kind
+ * and nothing above the port layer needs to know which it has.
+ */
+#define DLR_TLS_FLAG 0x1000L
+
+// Connects and completes the handshake. Returns a flagged handle or DLR_INVALID.
+long dlr_tls_open(uint32_t ip, uint16_t port, uint32_t timeout_ms);
+
+// Server side: upgrades an accepted TCP handle that this process owns.
+// Consumes `tcp_handle` on BOTH success and failure (on failure it is
+// closed). Returns a flagged handle or DLR_INVALID.
+long dlr_tls_accept(long tcp_handle);
+
 #endif // DLR_PORT_H
