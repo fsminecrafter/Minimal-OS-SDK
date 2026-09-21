@@ -136,6 +136,41 @@ void dlr_tcp_close(long handle) {
     }
 }
 
+long dlr_tls_open(uint32_t ip, uint16_t port, uint32_t timeout_ms) {
+    long h = DLR_INVALID;
+    for (int attempt = 0; attempt < 20; attempt++) {
+        h = mos_tls_connect(ip, port, timeout_ms);
+        if (is_busy(h)) { mos_sleep(DLR_RETRY_SLEEP_TICKS); continue; }
+        break;
+    }
+    if (h <= 0) return DLR_INVALID;
+
+    if (!mos_tls_wait_established(h, timeout_ms ? timeout_ms : 5000)) {
+        mos_tls_close(h);
+        return DLR_INVALID;
+    }
+    return h | DLR_TLS_FLAG;
+}
+
+long dlr_tls_accept(long tcp_handle) {
+    long h = DLR_INVALID;
+    for (int attempt = 0; attempt < 20; attempt++) {
+        h = mos_tls_accept(tcp_handle);
+        if (is_busy(h)) { mos_sleep(DLR_RETRY_SLEEP_TICKS); continue; }
+        break;
+    }
+    if (h <= 0) {                       // upgrade refused: TCP handle is still ours
+        dlr_tcp_close(tcp_handle);
+        return DLR_INVALID;
+    }
+
+    if (!mos_tls_wait_established(h, 5000)) {
+        mos_tls_close(h);               // also closes the wrapped TCP connection
+        return DLR_INVALID;
+    }
+    return h | DLR_TLS_FLAG;
+}
+
 /* --- UDP --------------------------------------------------------------- */
 
 long dlr_udp_open(uint16_t local_port) {
