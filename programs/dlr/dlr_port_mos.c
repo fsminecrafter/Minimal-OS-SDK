@@ -74,6 +74,23 @@ int dlr_tcp_write(long handle, const void* buf, uint32_t len) {
     const uint8_t* p = (const uint8_t*)buf;
     uint32_t sent = 0;
 
+    if (is_tls(handle)) {
+        long h = raw_h(handle);
+        uint64_t last = dlr_now_ms();
+        while (sent < len) {
+            long n = mos_tls_send(h, p + sent, len - sent);
+            if (is_busy(n) || is_again(n)) {
+                if (dlr_now_ms() - last > DLR_TLS_STALL_MS) return 0;
+                mos_sleep(DLR_RETRY_SLEEP_TICKS);
+                continue;
+            }
+            if (n <= 0) return 0;
+            sent += (uint32_t)n;
+            last = dlr_now_ms();
+        }
+        return 1;
+    }
+
     while (sent < len) {
         long n = mos_tcp_send(handle, p + sent, len - sent);
         if (is_busy(n)) { mos_sleep(DLR_RETRY_SLEEP_TICKS); continue; }
@@ -87,12 +104,15 @@ int dlr_tcp_read_exact(long handle, void* buf, uint32_t len, uint32_t idle_timeo
     uint8_t* p = (uint8_t*)buf;
     uint32_t got = 0;
     uint64_t last_progress = dlr_now_ms();
+    int tls = is_tls(handle);
+    long h = tls ? raw_h(handle) : handle;
 
     while (got < len) {
-        long n = mos_tcp_recv(handle, p + got, len - got);
+        long n = tls ? mos_tls_recv(h, p + got, len - got)
+                     : mos_tcp_recv(h, p + got, len - got);
 
         if (is_busy(n)) { mos_sleep(DLR_RETRY_SLEEP_TICKS); continue; }
-        if (n < 0) return 0;                       // peer closed, drained
+        if (n < 0) return 0;                       // closed / dead, drained
 
         if (n == 0) {
             if (dlr_now_ms() - last_progress > idle_timeout_ms) return 0;
@@ -107,8 +127,10 @@ int dlr_tcp_read_exact(long handle, void* buf, uint32_t len, uint32_t idle_timeo
 }
 
 void dlr_tcp_close(long handle) {
+    int tls = is_tls(handle);
+    long h = tls ? raw_h(handle) : handle;
     for (int attempt = 0; attempt < 20; attempt++) {
-        long rc = mos_tcp_close(handle);
+        long rc = tls ? mos_tls_close(h) : mos_tcp_close(h);
         if (!is_busy(rc)) return;
         mos_sleep(DLR_RETRY_SLEEP_TICKS);
     }
