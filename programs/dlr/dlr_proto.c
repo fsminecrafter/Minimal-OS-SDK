@@ -190,7 +190,8 @@ int dlr_recv_msg(dlr_session* s, uint8_t* out_type, uint32_t* out_len, uint32_t 
 }
 
 int dlr_probe(uint32_t ip, uint16_t port, dlr_server* out, uint32_t timeout_ms) {
-    long sock = dlr_tcp_open(ip, port, timeout_ms);
+    long sock = (port == DLR_TLS_PORT) ? dlr_tls_open(ip, port, timeout_ms)
+                                       : dlr_tcp_open(ip, port, timeout_ms);
     if (sock == DLR_INVALID) return 0;
 
     uint8_t buf[256];
