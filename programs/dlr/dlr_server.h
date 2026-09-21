@@ -25,9 +25,10 @@
  */
 
 typedef struct {
-    char     name[DLR_NAME_MAX];   // shown to clients; no '|' or newline
-    char     pw_hash[65];          // lowercase SHA-256 hex; "" = no password
+    char     name[DLR_NAME_MAX];
+    char     pw_hash[65];
     uint16_t port;
+    uint8_t  tls;          // 1 = serve the ktls record layer (forces port DLR_TLS_PORT)
 } dlr_server_cfg;
 
 void dlr_server_cfg_default(dlr_server_cfg* cfg);
