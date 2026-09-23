@@ -1,4 +1,4 @@
-# Minimal-OS SDK (v1)
+# Minimal-OS SDK (v1.1)
 
 Minimal-OS SDK is a Software Development Kit for Minimal-OS, Linked here: [Minimal-OS](https://github.com/fsminecrafter/Minimal-OS).
 
