@@ -68,6 +68,10 @@ static inline long mos_mkdir(const char* path) {
     return mos_syscall(SYS_MKDIR, (long)(uintptr_t)path, 0, 0);
 }
 
+static inline long mos_getcwd(char* path, size_t path_size) {
+    return mos_syscall(SYS_GETCWD, (long)(uintptr_t)path, (long)path_size, 0);
+}
+
 // --- MinimaFS extensions ---
 
 // Write to a file opened with mos_open(). Distinct from mos_write(),

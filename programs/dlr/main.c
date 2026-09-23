@@ -8,7 +8,8 @@
  * exist here. The protocol is the contract; the code is not shared.
  *
  * Build:  ./build.sh programs/dlr
- * Import: dlr.run into MinimaFS
+ * Import: build.sh places dlr.run in ../src/resources/install2 when this
+ * SDK is checked out with Minimal-OS; the image installs it at 0:/programs.
  * Usage:  dhcp                       (terminal, once per boot)
  *         run 0:/programs/dlr.run scan
  *         run 0:/programs/dlr.run install hello-deliver
@@ -223,6 +224,11 @@ static int cmd_servers(void) {
 
 static int cmd_add(const char* spec) {
     // "<ip>", "<ip>:<port>", or "tls://<ip>[:<port>]" (tls:// = port 4342)
+    if (strncmp(spec, "https://", 8) == 0 || strncmp(spec, "http://", 7) == 0) {
+        printf("dlr: GitHub/HTTP repositories are not Deliver protocol servers; ");
+        printf("remote file downloads are not supported by this build\n");
+        return 1;
+    }
     int tls = 0;
     if (strncmp(spec, "tls://", 6) == 0) { tls = 1; spec += 6; }
 
@@ -369,6 +375,190 @@ static int cmd_ping(const char* server_name, const char* password) {
 
     close_session(&s);
     return rc;
+}
+
+static uint64_t g_last_report;
+static void progress(uint64_t received, uint64_t total);
+static int join_path(char* out, size_t cap, const char* dir, const char* rel);
+
+static int tui_read_line(char* out, size_t cap) {
+    size_t len = 0;
+    char c;
+    if (cap == 0) return 0;
+    for (;;) {
+        long n = dlr_read_input(&c, 1);
+        if (n <= 0) return 0;
+        if (c == '\r') continue;
+        if (c == '\n') break;
+        if (len + 1 < cap) out[len++] = c;
+    }
+    out[len] = '\0';
+    return 1;
+}
+
+typedef struct {
+    char name[DLR_REG_NAME_MAX];
+} tui_package;
+
+static int tui_parse_packages(const uint8_t* body, uint32_t len,
+                              tui_package* packages, int max) {
+    char line[256];
+    size_t line_len = 0;
+    int count = 0;
+
+    for (uint32_t i = 0; i <= len; i++) {
+        char c = (i < len) ? (char)body[i] : '\n';
+        if (c != '\n') {
+            if (line_len + 1 < sizeof(line)) line[line_len++] = c;
+            continue;
+        }
+        line[line_len] = '\0';
+        line_len = 0;
+        if (!line[0] || strcmp(line, "NONE") == 0 || count >= max) continue;
+
+        char* separator = strchr(line, '|');
+        if (separator) *separator = '\0';
+        if (!dlr_reg_name_ok(line)) continue;
+        strcpy(packages[count++].name, line);
+    }
+    return count;
+}
+
+static int tui_copy_download(const char* destination, int format) {
+    dlr_file* input = dlr_file_open_read(DLR_STAGE_FILE);
+    dlr_file* output = dlr_file_create(destination);
+    if (!input || !output) {
+        dlr_file_close(input);
+        dlr_file_close(output);
+        return 0;
+    }
+
+    uint8_t buffer[4096];
+    int ok = 1;
+    for (;;) {
+        long n = dlr_file_read(input, buffer, sizeof(buffer));
+        if (n < 0 || (n > 0 && !dlr_file_write(output, buffer, (uint32_t)n))) {
+            ok = 0;
+            break;
+        }
+        if (n == 0) break;
+    }
+    dlr_file_close(input);
+    dlr_file_close(output);
+    if (!ok) dlr_remove(destination);
+    (void)format;
+    return ok;
+}
+
+static int tui_download(const dlr_server* server, const char* package,
+                        const char* password, const char* cwd) {
+    if (!dlr_mkdirs(DLR_CACHE_DIR)) {
+        printf("dlr: cannot create %s\n", DLR_CACHE_DIR);
+        return 0;
+    }
+
+    dlr_session session;
+    if (!open_session(&session, (dlr_server*)server, password)) return 0;
+
+    char err[128];
+    int format = DLR_FORMAT_TAR;
+    g_last_report = 0;
+    printf("Downloading '%s' ...\n", package);
+    int rc = dlr_download(&session, package, DLR_STAGE_FILE, progress,
+                          &format, err, sizeof(err));
+    close_session(&session);
+    if (rc != 1) {
+        printf("dlr: download failed: %s\n", err[0] ? err : "unknown error");
+        return 0;
+    }
+
+    char destination[256];
+    const char* suffix = format == DLR_FORMAT_MPKG ? ".mpkg" : ".tar";
+    if (!join_path(destination, sizeof(destination), cwd, package) ||
+        strlen(destination) + strlen(suffix) + 1 >= sizeof(destination)) {
+        printf("dlr: destination path is too long\n");
+        return 0;
+    }
+    size_t destination_len = strlen(destination);
+    memcpy(destination + destination_len, suffix, strlen(suffix) + 1);
+    if (!tui_copy_download(destination, format)) {
+        printf("dlr: could not save %s\n", destination);
+        return 0;
+    }
+    dlr_remove(DLR_STAGE_FILE);
+    printf("Saved %s\n", destination);
+    return 1;
+}
+
+static int tui_server_packages(const dlr_server* server, const char* password,
+                               const char* cwd) {
+    dlr_session session;
+    if (!open_session(&session, (dlr_server*)server, password)) return 0;
+
+    int rc = 0;
+    tui_package packages[32];
+    uint8_t type;
+    uint32_t len;
+    if (dlr_send_msg(&session, DLR_MSG_PKG_LIST, 0, 0) &&
+        dlr_recv_msg(&session, &type, &len, 8000) &&
+        type == DLR_MSG_PKG_LIST) {
+        int count = tui_parse_packages(session.plain + 1, len, packages, 32);
+        close_session(&session);
+        printf("\nPackages on %s:\n", server->name);
+        for (int i = 0; i < count; i++) printf("  %d. %s\n", i + 1, packages[i].name);
+        if (count == 0) { printf("  (none)\n"); return 1; }
+
+        char input[32];
+        printf("Choose a package number, or B to go back: ");
+        if (!tui_read_line(input, sizeof(input)) ||
+            (input[0] == 'b' || input[0] == 'B')) return 1;
+        int selected = atoi(input);
+        if (selected < 1 || selected > count) {
+            printf("Invalid package selection.\n");
+            return 1;
+        }
+        return tui_download(server, packages[selected - 1].name, password, cwd);
+    }
+    close_session(&session);
+    printf("dlr: could not read the package list\n");
+    return rc;
+}
+
+static int cmd_servers_tui(const char* password) {
+    char cwd[256];
+    if (!dlr_getcwd(cwd, sizeof(cwd))) {
+        printf("dlr: cannot determine the current directory\n");
+        return 1;
+    }
+
+    load_servers();
+    for (;;) {
+        printf("\nDeliver servers (current directory: %s)\n", cwd);
+        if (g_server_count == 0) printf("  (none - press R to scan)\n");
+        for (int i = 0; i < g_server_count; i++) {
+            printf("  %d. %s\n", i + 1,
+                   g_servers[i].name[0] ? g_servers[i].name : "(unnamed)");
+        }
+        printf("R = refresh, Q = quit, number + Enter = enter server\n> ");
+
+        char input[32];
+        if (!tui_read_line(input, sizeof(input))) return 1;
+        if (input[0] == 'q' || input[0] == 'Q') return 0;
+        if (input[0] == 'r' || input[0] == 'R') {
+            int before = g_server_count;
+            g_server_count = dlr_discover(g_servers, DLR_MAX_SERVERS, 5000, NULL);
+            if (g_server_count < 0) g_server_count = before;
+            else dlr_db_save(g_servers, g_server_count);
+            continue;
+        }
+
+        int selected = atoi(input);
+        if (selected < 1 || selected > g_server_count) {
+            printf("Invalid server selection.\n");
+            continue;
+        }
+        tui_server_packages(&g_servers[selected - 1], password, cwd);
+    }
 }
 
 /* --- install ------------------------------------------------------------ */
@@ -534,8 +724,6 @@ static int manifest_on_dir(void* user, const char* name) {
     (void)user; (void)name;
     return 1;
 }
-
-static uint64_t g_last_report = 0;
 
 static void progress(uint64_t received, uint64_t total) {
     // One line per 64 KiB: the terminal is slow and a per-chunk
@@ -778,6 +966,7 @@ static void usage(void) {
     printf("dlr - Deliver LAN package manager (Minimal-OS client)\n\n");
     printf("  dlr scan                       find servers on the LAN\n");
     printf("  dlr servers                    list known servers\n");
+    printf("  dlr servers-tui                browse servers and download packages\n");
     printf("  dlr add <ip>[:port]|tls://<ip>  register a server by address\n");
     printf("  dlr serve [--name n] [--port p] [--password pw] [--tls]\n\n");
     printf("  dlr list [server]              list a server's packages\n");
@@ -855,6 +1044,7 @@ int main(int argc, char** argv) {
 
     if (strcmp(cmd, "scan") == 0)    return cmd_scan();
     if (strcmp(cmd, "servers") == 0) return cmd_servers();
+    if (strcmp(cmd, "servers-tui") == 0) return cmd_servers_tui(password);
 
     if (strcmp(cmd, "add") == 0) {
         if (pos_count < 2) { printf("usage: dlr add <ip>[:port]\n"); return 1; }

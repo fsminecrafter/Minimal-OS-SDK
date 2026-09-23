@@ -22,6 +22,16 @@ program entry source, or select another source explicitly:
     ./build.sh programs
     ./build.sh programs --main programs/main.cpp
 
+The Minimal-OS `dlr`/`deliver` program is placed directly into the OS image's
+program package when built from this checkout:
+
+    ./build.sh programs/dlr
+
+This writes `../src/resources/install2/dlr.run`, which is installed as
+`0:/programs/dlr.run` by the normal image build. Its HTTPS transport uses the
+same kernel-linked minimaSSL implementation as `wget`; the matching library
+bundle is installed at `0:/etc/minimaSSL.slib`.
+
 Build a shared library with `--slib`:
 
     ./build.sh --slib libraries/math

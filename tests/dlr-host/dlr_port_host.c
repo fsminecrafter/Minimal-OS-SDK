@@ -354,6 +354,14 @@ int dlr_remove(const char* path) {
     return unlink(mapped(path, real, sizeof(real))) == 0;
 }
 
+int dlr_getcwd(char* path, size_t path_size) {
+    return getcwd(path, path_size) != NULL;
+}
+
+long dlr_read_input(void* buf, size_t len) {
+    return (long)read(STDIN_FILENO, buf, len);
+}
+
 /* --- server ------------------------------------------------------------- */
 
 long dlr_tcp_listen(uint16_t port) {

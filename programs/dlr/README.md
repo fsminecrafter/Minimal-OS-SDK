@@ -9,6 +9,7 @@ Run `dhcp` in the terminal once per boot first.
 ```
 dlr scan                       find servers on the LAN
 dlr add <ip>[:port]            register a server by address
+dlr servers-tui                browse servers and download packages
 dlr list [server]              a server's packages
 dlr search <query> [server]
 dlr ping [server]
@@ -16,6 +17,11 @@ dlr install <pkg> [server]     download, verify SHA-256, install
 ```
 
 `--password <pw>` for servers that require one. A package installs according to the `[Install.minimalos]` section of its `.pkg` manifest (`copy=`, `target=`).
+
+`servers-tui` shows known servers, uses `R` to refresh discovery, and accepts a
+server number followed by Enter. Choose a package number on the server screen
+to download its verified `.mpkg` or `.tar` archive into the terminal's current
+directory. Deliver servers provide packages, not arbitrary individual files.
 
 ## Serving packages
 

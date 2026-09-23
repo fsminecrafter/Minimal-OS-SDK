@@ -80,6 +80,8 @@ int dlr_mkdirs(const char* path);
 
 int dlr_exists(const char* path);
 int dlr_remove(const char* path);
+int dlr_getcwd(char* path, size_t path_size);
+long dlr_read_input(void* buf, size_t len);
 
 /* --- reading files, directories --------------------------------------- */
 

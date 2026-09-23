@@ -426,8 +426,9 @@ int dlr_server_run(const dlr_server_cfg* cfg) {
 
     dlr_on_interrupt(on_interrupt);
 
-    printf("dlr: serving '%s' on port %u%s (Ctrl+C to stop)\n",
-           cfg->name, cfg->tls ? " [ktls]" : "", cfg->port, cfg->pw_hash[0] ? ", password required" : "");
+        printf("dlr: serving '%s' on port %u%s%s (Ctrl+C to stop)\n",
+            cfg->name, cfg->port, cfg->tls ? " [ktls]" : "",
+            cfg->pw_hash[0] ? ", password required" : "");
 
     uint64_t next_hello = 0, next_reap = 0;
     int accept_errors = 0;

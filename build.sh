@@ -100,6 +100,13 @@ SLIB_CRT_OBJECT="$BUILD_DIR/slibcrt.o"
 ELF="$BUILD_DIR/$PROGRAM_NAME.elf"
 OUTPUT="$SCRIPT_DIR/$PROGRAM_NAME.$([ "$SLIB" -eq 1 ] && echo slib || echo run)"
 
+# The OS image packages install2 as 0:/programs. Keep the dlr build in that
+# directory when the SDK is checked out alongside the kernel source tree.
+if [ "$SLIB" -eq 0 ] && [ "$PROGRAM_NAME" = "dlr" ] &&
+    [ -d "$SCRIPT_DIR/../src/resources/install2" ]; then
+    OUTPUT="$SCRIPT_DIR/../src/resources/install2/dlr.run"
+fi
+
 mkdir -p "$BUILD_DIR"
 
 COMMON_FLAGS="
@@ -248,6 +255,7 @@ if [ "$SLIB" -eq 1 ]; then
 
     echo "Built shared library $OUTPUT"
 else
+    mkdir -p "$(dirname -- "$OUTPUT")"
     "$SCRIPT_DIR/mkrun.sh" "$ELF" "$OUTPUT"
     echo "Built $OUTPUT"
 fi

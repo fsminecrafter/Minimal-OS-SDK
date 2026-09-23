@@ -386,6 +386,14 @@ int dlr_remove(const char* path) {
     return mos_delete(path) == (long)SYS_SUCCESS;
 }
 
+int dlr_getcwd(char* path, size_t path_size) {
+    return mos_getcwd(path, path_size) == (long)SYS_SUCCESS;
+}
+
+long dlr_read_input(void* buf, size_t len) {
+    return mos_read(0, buf, len);
+}
+
 /* --- server ------------------------------------------------------------ */
 
 long dlr_tcp_listen(uint16_t port) {

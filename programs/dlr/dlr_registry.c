@@ -59,6 +59,11 @@ static void set_err(char* err, size_t cap, const char* msg) {
     if (err && cap) copy_str(err, cap, msg);
 }
 
+static int is_reserved_tree(const char* path) {
+    return strcmp(path, "0:/etc") == 0 || strcmp(path, "0:/programs") == 0 ||
+           strcmp(path, "0:/services") == 0;
+}
+
 /* --- names -------------------------------------------------------------- */
 
 int dlr_reg_name_ok(const char* name) {
@@ -312,6 +317,10 @@ static const char* base_name(const char* path) {
 }
 
 int dlr_reg_present(const char* src_dir, const char* name, char* err, size_t err_size) {
+    if (is_reserved_tree(src_dir)) {
+        set_err(err, err_size, "refusing to present a system directory");
+        return 0;
+    }
     if (!dlr_is_dir(src_dir)) { set_err(err, err_size, "source is not a directory"); return 0; }
 
     dlr_pkg pkg;
