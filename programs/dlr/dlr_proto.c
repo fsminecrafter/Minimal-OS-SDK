@@ -5,6 +5,9 @@
 
 #define DLR_IDLE_TIMEOUT_MS 15000
 
+static uint8_t g_frame[DLR_MAX_FRAME];
+static uint8_t g_plain[DLR_MAX_FRAME];
+
 /* --- framing ----------------------------------------------------------- */
 
 static void put_be32(uint8_t* p, uint32_t v) {
@@ -49,18 +52,14 @@ long dlr_frame_recv(long sock, uint8_t* buf, uint32_t cap, uint32_t timeout_ms) 
 int dlr_session_alloc(dlr_session* s) {
     memset(s, 0, sizeof(*s));
     s->sock = DLR_INVALID;
-    s->frame = (uint8_t*)malloc(DLR_MAX_FRAME);
-    s->plain = (uint8_t*)malloc(DLR_MAX_FRAME);
-    if (!s->frame || !s->plain) {
-        dlr_session_free(s);
-        return -1;
-    }
+    s->frame = g_frame;
+    s->plain = g_plain;
     return 0;
 }
 
 void dlr_session_free(dlr_session* s) {
-    if (s->frame) { free(s->frame); s->frame = 0; }
-    if (s->plain) { free(s->plain); s->plain = 0; }
+    s->frame = 0;
+    s->plain = 0;
 }
 
 static void parse_hello(dlr_session* s, const char* hello, uint32_t len) {

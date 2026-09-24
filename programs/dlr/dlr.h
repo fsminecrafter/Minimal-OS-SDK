@@ -37,7 +37,7 @@
  * prefix: it arrives before authentication and a hostile one would
  * otherwise size an allocation.
  */
-#define DLR_MAX_FRAME  (72u * 1024u)
+#define DLR_MAX_FRAME  (8u * 1024u)
 
 /*
  * Archive format of a download.
@@ -66,7 +66,7 @@
 #define DLR_HELLO_SRC_PORT    4244    /* source port of the UDP hello */
 #define DLR_HELLO_INTERVAL_MS 5000
 #define DLR_MAX_CLIENTS       3       /* concurrent per-connection processes */
-#define DLR_SERVE_CHUNK       16384   /* plaintext bytes per INSTALL_DATA frame */
+#define DLR_SERVE_CHUNK       4096    /* plaintext bytes per INSTALL_DATA frame */
 #define DLR_CLIENT_IDLE_MS    120000  /* drop a client that says nothing this long */
 
 /* MinimaFS layout the client owns. */

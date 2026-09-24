@@ -903,6 +903,55 @@ static int cmd_install(const char* pkg_name, const char* server_name,
     return 0;
 }
 
+static int cmd_download(const char* pkg_name, const char* server_name,
+                        const char* password) {
+    load_servers();
+    dlr_server* srv = pick_server(server_name);
+    if (!srv) return 1;
+
+    if (!dlr_mkdirs(DLR_CACHE_DIR)) {
+        printf("dlr: cannot create %s\n", DLR_CACHE_DIR);
+        return 1;
+    }
+
+    dlr_session session;
+    if (!open_session(&session, srv, password)) return 1;
+
+    char err[128];
+    int format = DLR_FORMAT_TAR;
+    g_last_report = 0;
+    printf("Downloading '%s' ...\n", pkg_name);
+    int rc = dlr_download(&session, pkg_name, DLR_STAGE_FILE, progress,
+                          &format, err, sizeof(err));
+    close_session(&session);
+    if (rc != 1) {
+        printf("dlr: download failed: %s\n", err[0] ? err : "unknown error");
+        return 1;
+    }
+    printf("Download verified (SHA-256 matches).\n");
+
+    char cwd[256], destination[256];
+    if (!dlr_getcwd(cwd, sizeof(cwd))) {
+        printf("dlr: cannot determine current directory\n");
+        return 1;
+    }
+    const char* suffix = format == DLR_FORMAT_MPKG ? ".mpkg" : ".tar";
+    if (!join_path(destination, sizeof(destination), cwd, pkg_name) ||
+        strlen(destination) + strlen(suffix) + 1 >= sizeof(destination)) {
+        printf("dlr: destination path is too long\n");
+        return 1;
+    }
+    size_t destination_len = strlen(destination);
+    memcpy(destination + destination_len, suffix, strlen(suffix) + 1);
+    if (!tui_copy_download(destination, format)) {
+        printf("dlr: could not save %s\n", destination);
+        return 1;
+    }
+    dlr_remove(DLR_STAGE_FILE);
+    printf("Saved %s\n", destination);
+    return 0;
+}
+
 /* --- server commands ---------------------------------------------------- */
 
 static int print_entry_cb(void* user, const dlr_reg_entry* e) {
@@ -995,6 +1044,7 @@ static void usage(void) {
     printf("  dlr search <query> [server]    search packages\n");
     printf("  dlr ping [server]              measure round-trip time\n");
     printf("  dlr install <pkg> [server]     download, verify and install\n\n");
+    printf("  dlr download <pkg> [server]    download and save the archive\n\n");
     printf("Serving packages to other machines:\n");
     printf("  dlr present <dir> [name]       add a package directory to this server's store\n");
     printf("  dlr createpkg [file.pkg]       create an example manifest here\n");
@@ -1086,6 +1136,10 @@ int main(int argc, char** argv) {
     if (strcmp(cmd, "install") == 0) {
         if (pos_count < 2) { printf("usage: dlr install <pkg> [server]\n"); return 1; }
         return cmd_install(positional[1], positional[2], password, force);
+    }
+    if (strcmp(cmd, "download") == 0) {
+        if (pos_count < 2) { printf("usage: dlr download <pkg> [server]\n"); return 1; }
+        return cmd_download(positional[1], positional[2], password);
     }
 
     printf("dlr: unknown command '%s'\n\n", cmd);
