@@ -36,11 +36,11 @@ static inline long mos_open(const char* path, long flags) {
     return mos_syscall(SYS_OPEN, (long)(uintptr_t)path, flags, 0);
 }
 
-static inline long mos_read(int fd, void* buf, size_t len) {
+static inline long mos_read(long fd, void* buf, size_t len) {
     return mos_syscall(SYS_READ, fd, (long)(uintptr_t)buf, (long)len);
 }
 
-static inline long mos_close(int fd) {
+static inline long mos_close(long fd) {
     return mos_syscall(SYS_CLOSE, fd, 0, 0);
 }
 
@@ -56,11 +56,11 @@ static inline long mos_gettime(void) {
     return mos_syscall(SYS_GETTIME, 0, 0, 0);
 }
 
-static inline long mos_seek(int fd, long offset) {
+static inline long mos_seek(long fd, long offset) {
     return mos_syscall(SYS_SEEK, fd, offset, 0);
 }
 
-static inline long mos_size(int fd) {
+static inline long mos_size(long fd) {
     return mos_syscall(SYS_SIZE, fd, 0, 0);
 }
 
@@ -76,7 +76,7 @@ static inline long mos_getcwd(char* path, size_t path_size) {
 
 // Write to a file opened with mos_open(). Distinct from mos_write(),
 // which is fixed to fd 1/2 (stdout/stderr -> terminal).
-static inline long mos_fwrite(int fd, const void* buf, size_t len) {
+static inline long mos_fwrite(long fd, const void* buf, size_t len) {
     return mos_syscall(SYS_FWRITE, fd, (long)(uintptr_t)buf, (long)len);
 }
 
