@@ -334,6 +334,8 @@ dlr_file* dlr_file_create(const char* path) {
 int dlr_file_write(dlr_file* f, const void* buf, uint32_t len) {
     if (!f) return 0;
     long n = mos_fwrite(f->fd, buf, len);
+    if (n != (long)len)
+        printf("dlr: file write returned %ld, expected %u\n", n, len);
     return n == (long)len;
 }
 
