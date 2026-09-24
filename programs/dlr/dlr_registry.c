@@ -3,6 +3,7 @@
 #include "dlr_pkg.h"
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 static const char* g_root = DLR_PKG_STORE;
 
@@ -101,15 +102,20 @@ static int read_manifest(const char* dir, dlr_pkg* out) {
     manifest_scan m;
     m.found = 0;
     m.file[0] = '\0';
+    printf("dlr: listing manifest directory...\n");
     if (dlr_dir_each(dir, manifest_cb, &m) < 0 || !m.found) return 0;
+    printf("dlr: found manifest %s\n", m.file);
 
     char path[256];
     if (!path_join(path, sizeof(path), dir, m.file)) return 0;
+    printf("dlr: opening manifest %s\n", path);
 
     static char text[8192];
     long n = dlr_file_slurp(path, text, sizeof(text) - 1);
+    printf("dlr: manifest bytes %d\n", (int)n);
     if (n <= 0) return 0;
     text[n] = '\0';
+    printf("dlr: parsing manifest...\n");
     return dlr_pkg_parse(text, (size_t)n, out);
 }
 
@@ -317,6 +323,7 @@ static const char* base_name(const char* path) {
 }
 
 int dlr_reg_present(const char* src_dir, const char* name, char* err, size_t err_size) {
+    printf("dlr: checking source directory...\n");
     if (is_reserved_tree(src_dir)) {
         set_err(err, err_size, "refusing to present a system directory");
         return 0;
@@ -324,6 +331,7 @@ int dlr_reg_present(const char* src_dir, const char* name, char* err, size_t err
     if (!dlr_is_dir(src_dir)) { set_err(err, err_size, "source is not a directory"); return 0; }
 
     dlr_pkg pkg;
+    printf("dlr: reading package manifest...\n");
     if (!read_manifest(src_dir, &pkg)) {
         set_err(err, err_size, "no .pkg manifest with [Info] name in that directory - clients could not install it");
         return 0;
@@ -348,16 +356,19 @@ int dlr_reg_present(const char* src_dir, const char* name, char* err, size_t err
         return 0;
     }
 
+    printf("dlr: preparing package store...\n");
     if (!dlr_mkdirs(g_root)) { set_err(err, err_size, "cannot create the package store"); return 0; }
 
     char why[96];
     uint32_t total = 0;
+    printf("dlr: copying package files...\n");
     if (!copy_tree(src_dir, dst, 0, &total, why, sizeof(why))) {
         dlr_reg_remove(chosen);         // leave nothing half-copied
         set_err(err, err_size, why);
         return 0;
     }
 
+    printf("dlr: building package archive...\n");
     if (!build_archive(dst, err, err_size)) {
         dlr_reg_remove(chosen);
         return 0;

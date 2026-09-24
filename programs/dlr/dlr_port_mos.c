@@ -226,7 +226,7 @@ uint32_t dlr_resolve(const char* host) {
 /* --- files ------------------------------------------------------------- */
 
 struct dlr_file {
-    int fd;
+    long fd;
     int used;
 };
 
@@ -235,6 +235,70 @@ struct dlr_file {
 // destination at once while copying a package into its store.
 #define DLR_MAX_OPEN_FILES 4
 static struct dlr_file g_files[DLR_MAX_OPEN_FILES];
+
+/* MinimaFS syscalls take drive-qualified paths.  Keep the DLR interface
+ * friendly to shell-style paths without relying on each caller to remember
+ * that ABI detail. */
+static int normalize_path(const char* path, char* out, size_t out_cap) {
+    if (!path || !out || out_cap == 0 || !path[0]) return 0;
+
+    char raw[256];
+    char cwd[256];
+    if (strchr(path, ':')) {
+        if (strlen(path) >= sizeof(raw)) return 0;
+        strcpy(raw, path);
+    } else {
+        if (mos_getcwd(cwd, sizeof(cwd)) != (long)SYS_SUCCESS) return 0;
+        size_t cwd_len = strlen(cwd);
+        size_t path_len = strlen(path);
+        if (cwd_len + path_len + 2 > sizeof(raw)) return 0;
+        strcpy(raw, cwd);
+        if (cwd_len && raw[cwd_len - 1] != '/') raw[cwd_len++] = '/';
+        strcpy(raw + cwd_len, path);
+    }
+
+    char* colon = strchr(raw, ':');
+    if (!colon || colon == raw) return 0;
+    size_t prefix_len = (size_t)(colon - raw) + 1;
+    if (prefix_len + 2 > out_cap) return 0;
+    memcpy(out, raw, prefix_len);
+    size_t length = prefix_len;
+    out[length++] = '/';
+
+    const char* cursor = colon + 1;
+    while (*cursor) {
+        while (*cursor == '/') cursor++;
+        if (!*cursor) break;
+
+        const char* component = cursor;
+        size_t component_len = 0;
+        while (cursor[component_len] && cursor[component_len] != '/') {
+            component_len++;
+        }
+
+        if (component_len == 1 && component[0] == '.') {
+            cursor += component_len;
+            continue;
+        }
+        if (component_len == 2 && component[0] == '.' && component[1] == '.') {
+            if (length > prefix_len + 1) {
+                length--;
+                while (length > prefix_len + 1 && out[length - 1] != '/') length--;
+            }
+            cursor += component_len;
+            continue;
+        }
+
+        if (length + component_len + 1 > out_cap) return 0;
+        memcpy(out + length, component, component_len);
+        length += component_len;
+        out[length++] = '/';
+        cursor += component_len;
+    }
+    if (length > prefix_len + 1) length--;
+    out[length] = '\0';
+    return 1;
+}
 
 static struct dlr_file* file_slot_take(void) {
     for (int i = 0; i < DLR_MAX_OPEN_FILES; i++) {
@@ -247,14 +311,20 @@ dlr_file* dlr_file_create(const char* path) {
     struct dlr_file* slot = file_slot_take();
     if (!slot) return NULL;
 
+    char normalized[256];
+    if (!normalize_path(path, normalized, sizeof(normalized))) {
+        slot->used = 0;
+        return NULL;
+    }
+
     // MinimaFS has no O_TRUNC and no create-on-open: SYS_OPEN only
     // ever opens what already exists, so the sequence is delete (if
     // present) -> SYS_CREATE -> open writable.
-    if (mos_exists(path)) mos_delete(path);
+    if (mos_exists(normalized)) mos_delete(normalized);
 
-    if (mos_create(path, "binary", "bin") != (long)SYS_SUCCESS) { slot->used = 0; return NULL; }
+    if (mos_create(normalized, "binary", "bin") != (long)SYS_SUCCESS) { slot->used = 0; return NULL; }
 
-    int fd = (int)mos_open(path, SYS_O_RDWR);
+    long fd = mos_open(normalized, SYS_O_RDWR);
     if (fd <= 0) { slot->used = 0; return NULL; }
 
     slot->fd = fd;
@@ -277,7 +347,13 @@ dlr_file* dlr_file_open_read(const char* path) {
     struct dlr_file* slot = file_slot_take();
     if (!slot) return NULL;
 
-    int fd = (int)mos_open(path, SYS_O_RDONLY);
+    char normalized[256];
+    if (!normalize_path(path, normalized, sizeof(normalized))) {
+        slot->used = 0;
+        return NULL;
+    }
+
+    long fd = mos_open(normalized, SYS_O_RDONLY);
     if (fd <= 0) { slot->used = 0; return NULL; }
 
     slot->fd = fd;
@@ -291,19 +367,21 @@ long dlr_file_read(dlr_file* f, void* buf, uint32_t len) {
 }
 
 int dlr_is_dir(const char* path) {
-    return mos_is_dir(path) == 1;
+    char normalized[256];
+    return normalize_path(path, normalized, sizeof(normalized)) &&
+           mos_is_dir(normalized) == 1;
 }
 
-#define DLR_DIR_MAX_ENTRIES 128
+#define DLR_DIR_MAX_ENTRIES 64
+static syscall_dirent_t g_dir_entries[DLR_DIR_MAX_ENTRIES];
 
 int dlr_dir_each(const char* path, dlr_dir_cb cb, void* user) {
-    // Heap, not static: the caller's callback may recurse into another
-    // directory, which would overwrite a shared buffer mid-iteration.
-    syscall_dirent_t* entries = (syscall_dirent_t*)malloc(sizeof(syscall_dirent_t) * DLR_DIR_MAX_ENTRIES);
-    if (!entries) return -1;
+    syscall_dirent_t* entries = g_dir_entries;
 
-    long n = mos_listdir(path, entries, DLR_DIR_MAX_ENTRIES);
-    if (n < 0) { free(entries); return -1; }
+    char normalized[256];
+    if (!normalize_path(path, normalized, sizeof(normalized))) return -1;
+    long n = mos_listdir(normalized, entries, DLR_DIR_MAX_ENTRIES);
+    if (n < 0) return -1;
 
     int visited = 0;
     for (long i = 0; i < n; i++) {
@@ -312,23 +390,28 @@ int dlr_dir_each(const char* path, dlr_dir_cb cb, void* user) {
         visited++;
         if (!cb(user, name, entries[i].type == SYSCALL_DIRENT_TYPE_DIR)) break;
     }
-    free(entries);
     return visited;
 }
 
 int dlr_remove_dir(const char* path) {
-    return mos_rmdir(path) == (long)SYS_SUCCESS;
+    char normalized[256];
+    return normalize_path(path, normalized, sizeof(normalized)) &&
+           mos_rmdir(normalized) == (long)SYS_SUCCESS;
 }
 
 int dlr_pack_dir(const char* dir, char* out_path, size_t out_cap) {
     // NULL algorithm = the kernel's default (LZSS, falling back to STORE
     // per file when it does not help).
-    long rc = mos_pkg_zip(dir, NULL, out_path, (uint32_t)out_cap);
+    char normalized[256];
+    if (!normalize_path(dir, normalized, sizeof(normalized))) return 0;
+    long rc = mos_pkg_zip(normalized, NULL, out_path, (uint32_t)out_cap);
     return rc == (long)SYS_SUCCESS;
 }
 
 long dlr_file_size(const char* path) {
-    int fd = (int)mos_open(path, SYS_O_RDONLY);
+    char normalized[256];
+    if (!normalize_path(path, normalized, sizeof(normalized))) return -1;
+    long fd = mos_open(normalized, SYS_O_RDONLY);
     if (fd <= 0) return -1;
     long size = mos_size(fd);
     mos_close(fd);
@@ -336,7 +419,9 @@ long dlr_file_size(const char* path) {
 }
 
 long dlr_file_slurp(const char* path, void* buf, uint32_t max) {
-    int fd = (int)mos_open(path, SYS_O_RDONLY);
+    char normalized[256];
+    if (!normalize_path(path, normalized, sizeof(normalized))) return -1;
+    long fd = mos_open(normalized, SYS_O_RDONLY);
     if (fd <= 0) return -1;
 
     long size = mos_size(fd);
@@ -357,15 +442,17 @@ int dlr_file_put(const char* path, const void* buf, uint32_t len) {
 
 int dlr_mkdirs(const char* path) {
     char partial[256];
-    size_t n = strlen(path);
+    char normalized[256];
+    if (!normalize_path(path, normalized, sizeof(normalized))) return 0;
+    size_t n = strlen(normalized);
     if (n >= sizeof(partial)) return 0;
 
     for (size_t i = 0; i <= n; i++) {
-        char c = path[i];
+        char c = normalized[i];
         if (c != '/' && c != '\0') continue;
         if (i == 0) continue;
 
-        memcpy(partial, path, i);
+        memcpy(partial, normalized, i);
         partial[i] = '\0';
 
         // "0:" alone is a drive, not a directory.
@@ -379,11 +466,15 @@ int dlr_mkdirs(const char* path) {
 }
 
 int dlr_exists(const char* path) {
-    return mos_exists(path) == 1;
+    char normalized[256];
+    return normalize_path(path, normalized, sizeof(normalized)) &&
+           mos_exists(normalized) == 1;
 }
 
 int dlr_remove(const char* path) {
-    return mos_delete(path) == (long)SYS_SUCCESS;
+    char normalized[256];
+    return normalize_path(path, normalized, sizeof(normalized)) &&
+           mos_delete(normalized) == (long)SYS_SUCCESS;
 }
 
 int dlr_getcwd(char* path, size_t path_size) {

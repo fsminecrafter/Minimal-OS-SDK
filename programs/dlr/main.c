@@ -931,6 +931,28 @@ static int cmd_present(const char* dir, const char* name) {
     return 0;
 }
 
+static int cmd_createpkg(const char* filename) {
+    const char* path = filename && filename[0] ? filename : "./example.pkg";
+    const char* manifest =
+        "[Info]\n"
+        "name=example\n"
+        "version=1.0.0\n"
+        "description=Example Minimal-OS package\n"
+        "arch=x86_64\n"
+        "operatingsystem=MINIMALOS\n"
+        "\n"
+        "[Install.minimalos]\n"
+        "copy=\n"
+        "target=0:/programs\n";
+
+    if (dlr_file_put(path, manifest, (uint32_t)strlen(manifest))) {
+        printf("Created package manifest %s\n", path);
+        return 0;
+    }
+    printf("dlr: could not create package manifest %s\n", path);
+    return 1;
+}
+
 static int cmd_unpresent(const char* name) {
     if (!dlr_reg_remove(name)) { printf("dlr: no package '%s' in the store\n", name); return 1; }
     printf("Removed '%s'.\n", name);
@@ -975,6 +997,7 @@ static void usage(void) {
     printf("  dlr install <pkg> [server]     download, verify and install\n\n");
     printf("Serving packages to other machines:\n");
     printf("  dlr present <dir> [name]       add a package directory to this server's store\n");
+    printf("  dlr createpkg [file.pkg]       create an example manifest here\n");
     printf("  dlr packages                   list what this server offers\n");
     printf("  dlr unpresent <name>           remove one\n");
     printf("  dlr rebuild <name>             rebuild its archive after editing its files\n");
@@ -1030,6 +1053,9 @@ int main(int argc, char** argv) {
     if (strcmp(cmd, "present") == 0) {
         if (pos_count < 2) { printf("usage: dlr present <dir> [name]\n"); return 1; }
         return cmd_present(positional[1], positional[2]);
+    }
+    if (strcmp(cmd, "createpkg") == 0) {
+        return cmd_createpkg(positional[1]);
     }
     if (strcmp(cmd, "unpresent") == 0) {
         if (pos_count < 2) { printf("usage: dlr unpresent <name>\n"); return 1; }
