@@ -27,6 +27,11 @@ static inline void mos_exit(void) {
     for (;;) { }
 }
 
+static inline void mos_exit_code(uint8_t code) {
+    mos_syscall1(SYS_EXIT, code);
+    for (;;) { }
+}
+
 static inline uint64_t mos_register_cleanup(void (*cleanup)(void)) {
     return mos_syscall1(SYS_REGISTER_CLEANUP, (uint64_t)(uintptr_t)cleanup);
 }
