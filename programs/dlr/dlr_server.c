@@ -350,6 +350,7 @@ out:
 
 int dlr_server_child(int argc, char** argv) {
     // argv: <self> --conn <handle> <ip> [--name N] [--pwhash H]
+    printf("dlr: child entered argc=%d\n", argc);
     if (argc < 4 || strcmp(argv[1], "--conn") != 0) return 2;
 
     long conn = atoi(argv[2]);
@@ -380,6 +381,7 @@ int dlr_server_child(int argc, char** argv) {
         if (conn == DLR_INVALID) return 2;
     }
     
+    printf("dlr: child entering session conn=%ld\n", conn);
     return dlr_server_session(conn, &cfg, ip);
 }
 
@@ -437,7 +439,9 @@ int dlr_server_run(const dlr_server_cfg* cfg) {
         uint64_t now = dlr_now_ms();
 
         if (udp != DLR_INVALID && now >= next_hello) {
-            dlr_udp_broadcast(udp, 4243, hello, (uint32_t)strlen(hello));
+            if (!dlr_udp_broadcast(udp, 4243, hello, (uint32_t)strlen(hello))) {
+                printf("dlr: discovery broadcast send failed\n");
+            }
             next_hello = now + DLR_HELLO_INTERVAL_MS;
         }
 
@@ -464,15 +468,20 @@ int dlr_server_run(const dlr_server_cfg* cfg) {
 
             if (r == 1) {
                 got = 1;
+                printf("dlr: accepted connection from %u\n", ip);
                 accept_errors = 0;
-                long pid = dlr_spawn_conn(conn, ip, child_args, child_argc);
+                long pid = DLR_INVALID;
+#ifndef MINIMALOS_TARGET
+                pid = dlr_spawn_conn(conn, ip, child_args, child_argc);
+#endif
                 if (pid == DLR_INVALID) {
-                    printf("dlr: could not start a handler process; dropping a client\n");
-                    dlr_tcp_close(conn);
+                    printf("dlr: handler process unavailable; serving client inline\n");
+                    dlr_server_session(conn, cfg, ip);
                 } else {
                     children[free_slot] = pid;
                 }
             } else if (r < 0) {
+                printf("dlr: accept failed\n");
                 // A persistent error means the listener is gone (the
                 // kernel reclaimed it, or the NIC went away).
                 if (++accept_errors > 50) { printf("dlr: listener failed, stopping\n"); break; }

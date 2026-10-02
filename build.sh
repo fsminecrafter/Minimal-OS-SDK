@@ -2,17 +2,22 @@
 set -eu
 
 usage() {
-    echo "Usage: $0 [--slib] [--main <source.c|source.cpp>] <source.c|source.cpp|folder>" >&2
+    echo "Usage: $0 [--slib] [--worker] [--main <source.c|source.cpp>] <source.c|source.cpp|folder>" >&2
     exit 1
 }
 
 SLIB=0
+WORKER=0
 MAIN_SOURCE=""
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --slib)
             SLIB=1
+            shift
+            ;;
+        --worker)
+            WORKER=1
             shift
             ;;
         --main)
@@ -93,6 +98,14 @@ if [ "$SOURCE_WAS_DIR" -eq 0 ]; then
     PROGRAM_NAME=${MAIN_SOURCE%.*}
 fi
 
+if [ "$WORKER" -eq 1 ]; then
+    [ "$PROGRAM_NAME" = "dlr" ] || {
+        echo "--worker is only supported for programs/dlr" >&2
+        exit 1
+    }
+    PROGRAM_NAME=dlrconnect
+fi
+
 BUILD_DIR="$SCRIPT_DIR/build"
 CRT_OBJECT="$BUILD_DIR/crt0.o"
 SLIB_CRT_OBJECT="$BUILD_DIR/slibcrt.o"
@@ -106,10 +119,17 @@ if [ "$SLIB" -eq 0 ] && [ "$PROGRAM_NAME" = "dlr" ] &&
     [ -d "$SCRIPT_DIR/../src/resources/install2" ]; then
     OUTPUT="$SCRIPT_DIR/../src/resources/install2/dlr.run"
 fi
+if [ "$SLIB" -eq 0 ] && [ "$PROGRAM_NAME" = "dlrconnect" ] &&
+    [ -d "$SCRIPT_DIR/../src/resources/install2" ]; then
+    OUTPUT="$SCRIPT_DIR/../src/resources/install2/dlrconnect.run"
+fi
 
 mkdir -p "$BUILD_DIR"
 
 COMMON_FLAGS="
+    -Os
+    -ffunction-sections
+    -fdata-sections
     -ffreestanding
     -fno-builtin
     -fno-stack-protector
@@ -172,13 +192,21 @@ if [ "$SOURCE_WAS_DIR" -eq 1 ]; then
                 -print | sort
         )
     else
-        SOURCES=$(
-            find "$SOURCE_ROOT" -type f \
+        if [ "$WORKER" -eq 1 ]; then
+            SOURCES=$(find "$SOURCE_ROOT" -type f \
                 \( -name '*.c' -o -name '*.cpp' \) \
+                ! -name 'main.c' \
                 ! -path "$SOURCE_ROOT/tests/*" \
                 ! -path "$SOURCE_ROOT/examples/*" \
-                -print | sort
-        )
+                -print | sort)
+        else
+            SOURCES=$(find "$SOURCE_ROOT" -type f \
+                \( -name '*.c' -o -name '*.cpp' \) \
+                ! -name 'dlrconnect_main.c' \
+                ! -path "$SOURCE_ROOT/tests/*" \
+                ! -path "$SOURCE_ROOT/examples/*" \
+                -print | sort)
+        fi
     fi
 else
     SOURCES=$SOURCE_FILE
@@ -226,6 +254,7 @@ fi
 
 "$LINKER" \
     -pie \
+    --gc-sections \
     --no-dynamic-linker \
     -T "$SCRIPT_DIR/link.ld" \
     -e "$ENTRY_POINT" \

@@ -13,11 +13,9 @@
  * Usage:  dhcp                       (terminal, once per boot)
  *         run 0:/programs/dlr.run scan
  *         run 0:/programs/dlr.run install hello-deliver
+ * The server worker is built separately as dlrconnect.run.
  *
- * The same program is also the SERVER (`serve`, `present`, ...): see
- * dlr_server.h. It is one binary because the server starts a copy of
- * itself for every client, and because build.sh links every .c in this
- * folder into a single .run anyway.
+ * The server worker is built separately as dlrconnect.run.
  */
 
 #include "dlr.h"
@@ -214,7 +212,7 @@ static int cmd_servers(void) {
         return 0;
     }
     for (int i = 0; i < g_server_count; i++) {
-        printf("  %-20s ", g_servers[i].name[0] ? g_servers[i].name : "(unnamed)");
+        printf("  %s ", g_servers[i].name[0] ? g_servers[i].name : "(unnamed)");
         print_ip(g_servers[i].ip);
         printf(":%u%s\n", g_servers[i].port,
                g_servers[i].needs_password ? "  (password required)" : "");
@@ -300,7 +298,7 @@ static void print_pkg_lines(const char* body, uint32_t len) {
         char* d = strchr(v, '|');
         if (d) *d++ = '\0';
 
-        printf("  %-24s %-10s %s\n", line, v, d ? d : "");
+        printf("  %s  %s  %s\n", line, v, d ? d : "");
         shown++;
     }
     if (!shown) printf("  (nothing)\n");
@@ -322,10 +320,8 @@ static int cmd_list(const char* server_name, const char* password) {
             printf("Packages on '%s':\n", s.server_name);
             print_pkg_lines((const char*)s.plain + 1, len);
             rc = 0;
-        } else {
-            printf("dlr: no usable reply\n");
-        }
-    }
+            }
+            }
 
     close_session(&s);
     return rc;
@@ -956,7 +952,7 @@ static int cmd_download(const char* pkg_name, const char* server_name,
 
 static int print_entry_cb(void* user, const dlr_reg_entry* e) {
     (*(int*)user)++;
-    printf("  %-24s %-10s %s\n", e->name, e->version[0] ? e->version : "-", e->description);
+    printf("  %s  %s  %s\n", e->name, e->version[0] ? e->version : "-", e->description);
     return 1;
 }
 
@@ -1059,14 +1055,6 @@ static void usage(void) {
 int main(int argc, char** argv) {
     // argv[0] is the .run path, so the command is argv[1].
     if (argc < 2) { usage(); return 0; }
-
-    // The server starts a copy of this program per client; that copy
-    // needs the network but none of the client's option parsing.
-    dlr_set_self(argv[0]);
-    if (strcmp(argv[1], "--conn") == 0) {
-        if (dlr_port_init() != 0) return 1;
-        return dlr_server_child(argc, argv);
-    }
 
     // `serve` has its own options (--name/--port/--password), so it is
     // dispatched before the generic loop below can misfile them as

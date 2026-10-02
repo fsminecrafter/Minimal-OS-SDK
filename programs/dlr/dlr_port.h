@@ -116,15 +116,12 @@ long dlr_tcp_listen(uint16_t port);
 int  dlr_tcp_accept(long listener, long* out_conn, uint32_t* out_ip);
 void dlr_tcp_unlisten(long listener);
 
-// Starts a new process running this same program in per-connection mode
-// (`<self> --conn <handle> <ip> <extra...>`) and passes it ownership of
+// Starts dlrconnect.run in per-connection mode
+// (`--conn <handle> <ip> <extra...>`) and passes it ownership of
 // the connection. Returns the child's pid, or DLR_INVALID; on failure
 // the caller still owns the connection and must close it.
 long dlr_spawn_conn(long conn, uint32_t peer_ip, const char* const* extra, int extra_count);
 int  dlr_proc_alive(long pid);
-
-// Must be called once with argv[0] before dlr_spawn_conn.
-void dlr_set_self(const char* argv0);
 
 // Asks for `cb` to be called when the user interrupts the program
 // (Ctrl+C in the terminal). It must only set a flag.

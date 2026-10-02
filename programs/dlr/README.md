@@ -35,7 +35,7 @@ dlr serve [--name n] [--port p] [--password pw]     (Ctrl+C to stop)
 
 The store is `0:/var/dlrd/packages/`: one directory per package plus `<name>.mpkg` beside it. `present` builds the `.mpkg` once, so a request is just a file read, and two clients asking for the same package cannot race on the archiver.
 
-`serve` broadcasts a hello every 5 s (which is what `dlr scan` on other machines hears) and accepts connections. Each client is served by its **own process** (this program re-run as `dlr --conn <handle> <ip> ...`); the kernel hands the connection over and closes it if that process dies. At most 3 clients are served at once, and a client that is silent for 5 s during the handshake is dropped.
+`serve` broadcasts a hello every 5 s (which is what `dlr scan` on other machines hears) and accepts connections. Each client is served by its **own process** (`dlrconnect.run --conn <handle> <ip> ...`); the kernel hands the connection over and closes it if that process dies. At most 3 clients are served at once, and a client that is silent for 5 s during the handshake is dropped.
 
 ## Archive format
 

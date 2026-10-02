@@ -516,15 +516,6 @@ void dlr_tcp_unlisten(long listener) {
     }
 }
 
-static char g_self_path[256];
-
-void dlr_set_self(const char* argv0) {
-    size_t n = strlen(argv0);
-    if (n >= sizeof(g_self_path)) n = sizeof(g_self_path) - 1;
-    memcpy(g_self_path, argv0, n);
-    g_self_path[n] = '\0';
-}
-
 // Decimal into a caller buffer; returns the length.
 static size_t fmt_uint(char* out, uint32_t v) {
     char tmp[12];
@@ -537,8 +528,6 @@ static size_t fmt_uint(char* out, uint32_t v) {
 }
 
 long dlr_spawn_conn(long conn, uint32_t peer_ip, const char* const* extra, int extra_count) {
-    if (!g_self_path[0]) return DLR_INVALID;
-
     // argv[1..]: --conn <handle> <a.b.c.d> <extra...>. The strings must
     // outlive the mos_exec call, hence static; the kernel copies them
     // into the child before returning.
@@ -554,15 +543,27 @@ long dlr_spawn_conn(long conn, uint32_t peer_ip, const char* const* extra, int e
         ip_str[p] = '\0';
     }
 
-    const char* argv[16];
+    static const char* argv[16];
     int argc = 0;
     argv[argc++] = "--conn";
     argv[argc++] = handle_str;
     argv[argc++] = ip_str;
-    for (int i = 0; i < extra_count && argc < 16; i++) argv[argc++] = extra[i];
+    for (int i = 0; i < extra_count && argc < 15; i++) argv[argc++] = extra[i];
+    argv[argc] = NULL;
 
-    long pid = mos_exec(g_self_path, argv, argc);
-    if (pid <= 0) return DLR_INVALID;
+    long pid = DLR_INVALID;
+    for (int attempt = 0; attempt < 5; attempt++) {
+        printf("dlr: spawning handler path=0:/programs/dlrconnect.run attempt=%d conn=%s ip=%s\n",
+               attempt + 1, handle_str, ip_str);
+        pid = mos_exec("0:/programs/dlrconnect.run", argv, argc);
+        printf("dlr: handler spawn attempt=%d returned=%ld\n", attempt + 1, pid);
+        if (pid > 0) break;
+        mos_sleep(20);
+    }
+    if (pid <= 0) {
+        printf("dlr: handler spawn failed after 5 attempts\n");
+        return DLR_INVALID;
+    }
 
     // From here the kernel closes the connection if the child dies. If
     // the handoff itself fails the child is still serving it; the only

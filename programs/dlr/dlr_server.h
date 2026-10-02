@@ -12,9 +12,9 @@
  *   - Downloads are .mpkg archives, not tars, announced in the SIZE
  *     header (see dlr.h). There is no tar writer on this platform.
  *   - A connection that does not open with "KEY:" is dropped. The C++
- *     server falls back to plaintext; no shipped client ever asks for
- *     that, and accepting it only gives a network attacker a downgrade.
- *
+ * accept loop (dlr_server_run) that starts dlrconnect.run per client in
+ * per-connection mode (`--conn <handle> ...`, dlr_server_child), handing
+ * the accepted connection to it with
  * Process model. Minimal-OS has no threads, but it has processes, and
  * the kernel keeps connection handles in a global table. So the server
  * is one accept loop (dlr_server_run) that starts a copy of this same
