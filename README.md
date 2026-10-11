@@ -22,6 +22,28 @@ program entry source, or select another source explicitly:
     ./build.sh programs
     ./build.sh programs --main programs/main.cpp
 
+`-h`/`--help` prints usage. `--output <path>` selects the generated `.run` or
+`-h`/`--help` prints usage. `--output <path>` selects the generated `.run` or
+`.slib` path.
+
+### Install the MSDK command
+
+From this directory, run:
+
+    ./install.sh
+
+The installer links both `MSDK` and `msdk` into `~/.local/bin` and adds that
+directory to `~/.bashrc` once. Apply the PATH update in the current terminal
+with `source ~/.bashrc`, or open a new terminal.
+
+Both command spellings accept the SDK build options:
+
+    MSDK --help
+    MSDK projectfolder --main entry.cpp
+    msdk main.cpp
+
+The same launcher works when invoked directly as `./msdk` from the SDK folder.
+
 The Minimal-OS `dlr`/`deliver` program is placed directly into the OS image's
 program package when built from this checkout:
 
@@ -41,9 +63,11 @@ Example library:
     ./build.sh --slib examples/example-slib
 
 The `.slib` bundle contains the linked ELF, an export manifest of global
-symbols, and all `.h`/`.hpp` files found below the library folder. Headers are
-kept as public interface metadata for the runtime loader; `static` symbols are
-not exported. The bundle format is `MINISLIB1`; kernel-side loading and
+symbols, and public `.h`/`.hpp` files. When a library has an `include/`
+directory, those headers are stored relative to it under the bundle's
+`include/` path; otherwise headers are stored relative to the library folder.
+Headers are kept as public interface metadata for the runtime loader; `static`
+symbols are not exported. The bundle format is `MINISLIB1`; kernel-side loading and
 per-process shared/private mapping are provided by the operating system, not
 by this packaging script.
 

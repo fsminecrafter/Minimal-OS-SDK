@@ -165,6 +165,74 @@ static inline long mos_register_cleanup(void (*cleanup)(void)) {
     return mos_syscall(SYS_REGISTER_CLEANUP, (long)(uintptr_t)cleanup, 0, 0);
 }
 
+static inline long mos_graphics_call(syscall_graphics_request_t* request) {
+    return mos_syscall(SYS_GRAPHICS, (long)(uintptr_t)request, 0, 0);
+}
+
+static inline long mos_graphics_acquire(void) {
+    syscall_graphics_request_t request = {0};
+    request.op = SYS_GRAPHICS_ACQUIRE;
+    return mos_graphics_call(&request);
+}
+
+static inline long mos_graphics_release(void) {
+    syscall_graphics_request_t request = {0};
+    request.op = SYS_GRAPHICS_RELEASE;
+    return mos_graphics_call(&request);
+}
+
+static inline long mos_graphics_info(syscall_graphics_info_t* info) {
+    syscall_graphics_request_t request = {0};
+    request.op = SYS_GRAPHICS_INFO;
+    request.info = info;
+    if (info) {
+        info->size = sizeof(*info);
+        info->version = SYS_GRAPHICS_ABI_VERSION;
+        info->reserved = 0;
+    }
+    return mos_graphics_call(&request);
+}
+
+static inline long mos_graphics_blit_surface(
+        const uint32_t* src, uint32_t width, uint32_t height,
+        uint32_t pitch, int32_t sx, int32_t sy, int32_t sw, int32_t sh,
+        int32_t dx, int32_t dy, uint32_t flags) {
+    syscall_blit_request_t blit = {0};
+    blit.size = sizeof(blit);
+    blit.version = SYS_GRAPHICS_ABI_VERSION;
+    blit.flags = flags;
+    blit.src_w = width;
+    blit.src_h = height;
+    blit.src_pitch = pitch;
+    blit.src = src;
+    blit.sx = sx;
+    blit.sy = sy;
+    blit.sw = sw;
+    blit.sh = sh;
+    blit.dx = dx;
+    blit.dy = dy;
+    syscall_graphics_request_t request = {0};
+    request.op = SYS_GRAPHICS_BLIT;
+    request.blit = &blit;
+    return mos_graphics_call(&request);
+}
+
+static inline long mos_graphics_present(int32_t x, int32_t y,
+                                        int32_t width, int32_t height) {
+    syscall_graphics_request_t request = {0};
+    request.op = SYS_GRAPHICS_PRESENT;
+    request.args[0] = x;
+    request.args[1] = y;
+    request.args[2] = width;
+    request.args[3] = height;
+    return mos_graphics_call(&request);
+}
+
+static inline long mos_mouse_call(uint64_t operation, uint64_t arg1,
+                                  uint64_t arg2) {
+    return mos_syscall(SYS_MOUSE, (long)operation, (long)arg1, (long)arg2);
+}
+
 // --- Process management ---
 
 // Lists up to `max_entries` currently known processes into `entries`.

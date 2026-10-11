@@ -78,6 +78,8 @@
 // (e.g. "bin"); both default sensibly when NULL.
 #define SYS_CREATE        34
 #define SYS_GETCWD        35
+#define SYS_INPUT_READ    36
+#define SYS_WINDOW        37
 
 #define SYS_O_RDONLY 0
 // Anything non-zero opens writable; SYS_OPEN maps flags==SYS_O_RDONLY
@@ -119,7 +121,54 @@ typedef enum {
     SYS_GRAPHICS_MEASURE_TEXT,
     SYS_GRAPHICS_SET_RESOLUTION,
     SYS_GRAPHICS_TERMINAL_CLEAR,
+    SYS_GRAPHICS_ACQUIRE,
+    SYS_GRAPHICS_RELEASE,
+    SYS_GRAPHICS_OWNER,
+    SYS_GRAPHICS_BLIT,
+    SYS_GRAPHICS_PRESENT,
+    SYS_GRAPHICS_INFO,
 } syscall_graphics_op_t;
+
+#define SYS_GRAPHICS_ABI_VERSION 1u
+#define SYS_GRAPHICS_BLIT_OPAQUE 1u
+#define SYS_GRAPHICS_BLIT_ALPHA 2u
+#define SYS_GRAPHICS_PIXEL_FORMAT_ARGB8888 1u
+#define SYSCALL_GFX_MAX_DIMENSION 16384u
+#define SYSCALL_GFX_MAX_BUFFER_BYTES (64u * 1024u * 1024u)
+
+typedef struct {
+    uint32_t size;
+    uint32_t version;
+    uint32_t width;
+    uint32_t height;
+    uint32_t pitch;
+    uint32_t pixel_format;
+    uint8_t bytes_per_pixel;
+    uint8_t red_position;
+    uint8_t red_mask_size;
+    uint8_t green_position;
+    uint8_t green_mask_size;
+    uint8_t blue_position;
+    uint8_t blue_mask_size;
+    uint8_t reserved;
+} syscall_graphics_info_t;
+
+typedef struct {
+    uint32_t size;
+    uint32_t version;
+    uint32_t flags;
+    uint32_t src_w;
+    uint32_t src_h;
+    uint32_t src_pitch;
+    const uint32_t* src;
+    int32_t sx;
+    int32_t sy;
+    int32_t sw;
+    int32_t sh;
+    int32_t dx;
+    int32_t dy;
+    uint32_t reserved[4];
+} syscall_blit_request_t;
 
 typedef struct {
     uint64_t op;
@@ -127,6 +176,8 @@ typedef struct {
     const char* text;
     uint32_t* out_width;
     uint32_t* out_height;
+    const syscall_blit_request_t* blit;
+    syscall_graphics_info_t* info;
 } syscall_graphics_request_t;
 
 typedef enum {
@@ -184,6 +235,121 @@ typedef struct {
     int32_t wheel;   // relative scroll since last GET_STATE call
     uint8_t buttons; // SYSCALL_MOUSE_BTN_* bitmask, current state
 } syscall_mouse_state_t;
+
+// ===========================================
+// Window manager (SYS_WINDOW)
+// ===========================================
+#define SYS_WINDOW_ABI_VERSION 1u
+#define SYSCALL_WINDOW_MAX_TITLE 64u
+#define SYSCALL_WINDOW_MAX_WINDOWS 64u
+#define SYSCALL_WINDOW_MAX_EVENTS 16u
+
+typedef enum {
+    SYS_WINDOW_CREATE = 1,
+    SYS_WINDOW_CLOSE,
+    SYS_WINDOW_SET_BOUNDS,
+    SYS_WINDOW_SET_TITLE,
+    SYS_WINDOW_SET_FLAGS,
+    SYS_WINDOW_SET_STYLE,
+    SYS_WINDOW_PRESENT,
+    SYS_WINDOW_GET_INFO,
+    SYS_WINDOW_LIST,
+    SYS_WINDOW_GET_FRAME,
+    SYS_WINDOW_NEXT_EVENT,
+    SYS_WINDOW_POST_EVENT,
+    SYS_WINDOW_REGISTER_MANAGER,
+} syscall_window_op_t;
+
+#define SYSCALL_WINDOW_VISIBLE      (1u << 0)
+#define SYSCALL_WINDOW_RESIZABLE    (1u << 1)
+#define SYSCALL_WINDOW_FULLSCREEN   (1u << 2)
+#define SYSCALL_WINDOW_MAXIMIZED   (1u << 3)
+#define SYSCALL_WINDOW_MINIMIZED   (1u << 4)
+#define SYSCALL_WINDOW_FOCUSED     (1u << 5)
+
+typedef enum {
+    SYSCALL_WINDOW_EVENT_RESIZED = 1,
+    SYSCALL_WINDOW_EVENT_CLOSE_REQUEST,
+    SYSCALL_WINDOW_EVENT_MINIMIZED,
+    SYSCALL_WINDOW_EVENT_MAXIMIZED,
+    SYSCALL_WINDOW_EVENT_RESTORED,
+    SYSCALL_WINDOW_EVENT_FOCUS_GAINED,
+    SYSCALL_WINDOW_EVENT_FOCUS_LOST,
+    SYSCALL_WINDOW_EVENT_KEY,
+    SYSCALL_WINDOW_EVENT_MOUSE,
+    SYSCALL_WINDOW_EVENT_MOUSE_WHEEL,
+} syscall_window_event_type_t;
+
+typedef struct {
+    uint32_t title_bar;
+    uint32_t title_text;
+    uint32_t close_button;
+    uint32_t minimize_button;
+    uint32_t maximize_button;
+    uint32_t close_icon;
+    uint32_t minimize_icon;
+    uint32_t maximize_icon;
+    uint32_t border;
+    uint32_t content_background;
+} syscall_window_style_t;
+
+typedef struct {
+    uint32_t id;
+    uint32_t parent_id;
+    uint32_t x;
+    uint32_t y;
+    uint32_t width;
+    uint32_t height;
+    uint32_t flags;
+    uint32_t frame_version;
+    uint64_t owner_pid;
+    char title[SYSCALL_WINDOW_MAX_TITLE];
+    syscall_window_style_t style;
+} syscall_window_info_t;
+
+typedef struct {
+    uint32_t id;
+    uint32_t type;
+    int32_t x;
+    int32_t y;
+    int32_t width;
+    int32_t height;
+    uint32_t key;
+    uint32_t buttons;
+    int32_t wheel;
+    uint8_t mods;
+    uint8_t reserved[3];
+    uint32_t time_ms;
+} syscall_window_event_t;
+
+typedef struct {
+    uint32_t width;
+    uint32_t height;
+    uint32_t pitch;
+    uint32_t* pixels;
+} syscall_window_frame_t;
+
+typedef struct {
+    uint32_t size;
+    uint32_t version;
+    uint32_t op;
+    uint32_t id;
+    uint32_t parent_id;
+    uint32_t x;
+    uint32_t y;
+    uint32_t width;
+    uint32_t height;
+    uint32_t flags;
+    char title[SYSCALL_WINDOW_MAX_TITLE];
+    const uint32_t* pixels;
+    uint32_t pitch;
+    syscall_window_info_t* info;
+    syscall_window_info_t* windows;
+    uint32_t capacity;
+    syscall_window_frame_t* frame;
+    syscall_window_event_t* event;
+    syscall_window_style_t style;
+} syscall_window_request_t;
 
 // ===========================================
 // MinimaFS extension structures

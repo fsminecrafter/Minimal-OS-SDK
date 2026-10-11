@@ -66,4 +66,19 @@ static inline uint64_t mos_sysinfo(uint64_t op) {
     return mos_syscall1(SYS_SYSINFO, op);
 }
 
+static inline uint64_t mos_input_read(syscall_input_event_t* events,
+                                      uint32_t capacity,
+                                      uint32_t timeout_ms,
+                                      uint64_t* dropped_count) {
+    syscall_input_read_request_t request = {
+        .size = sizeof(request),
+        .version = SYS_INPUT_ABI_VERSION,
+        .events = events,
+        .capacity = capacity,
+        .timeout_ms = timeout_ms,
+        .dropped_count = dropped_count
+    };
+    return mos_syscall1(SYS_INPUT_READ, (uint64_t)(uintptr_t)&request);
+}
+
 #endif

@@ -2,13 +2,18 @@
 set -eu
 
 usage() {
-    echo "Usage: $0 [--slib] [--worker] [--main <source.c|source.cpp>] <source.c|source.cpp|folder>" >&2
-    exit 1
+    echo "Usage: $0 [--slib] [--worker] [--main <source.c|source.cpp>] [--output <path>] <source.c|source.cpp|folder>"
+}
+
+fail_usage() {
+    usage >&2
+    exit 2
 }
 
 SLIB=0
 WORKER=0
 MAIN_SOURCE=""
+OUTPUT_PATH=""
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -21,22 +26,28 @@ while [ "$#" -gt 0 ]; do
             shift
             ;;
         --main)
-            [ "$#" -ge 2 ] || usage
+            [ "$#" -ge 2 ] || fail_usage
             MAIN_SOURCE=$2
+            shift 2
+            ;;
+        --output)
+            [ "$#" -ge 2 ] || fail_usage
+            OUTPUT_PATH=$2
             shift 2
             ;;
         -h|--help)
             usage
+            exit 0
             ;;
         *)
-            [ -z "${SOURCE_ROOT:-}" ] || usage
+            [ -z "${SOURCE_ROOT:-}" ] || fail_usage
             SOURCE_ROOT=$1
             shift
             ;;
     esac
 done
 
-[ -n "${SOURCE_ROOT:-}" ] || usage
+[ -n "${SOURCE_ROOT:-}" ] || fail_usage
 
 SOURCE_WAS_DIR=0
 
@@ -55,7 +66,7 @@ if [ -d "$SOURCE_ROOT" ]; then
 
     if [ "$SLIB" -eq 0 ] && [ -z "$MAIN_SOURCE" ]; then
         echo "No main.cpp/main.c found; use --main <source>" >&2
-        exit 1
+        exit 2
     fi
 else
     [ -f "$SOURCE_ROOT" ] || {
@@ -71,6 +82,10 @@ fi
 if [ -n "$MAIN_SOURCE" ] && [ ! -f "$SOURCE_ROOT/$MAIN_SOURCE" ]; then
     echo "Main source not found: $SOURCE_ROOT/$MAIN_SOURCE" >&2
     exit 1
+fi
+
+if [ -n "$OUTPUT_PATH" ] && [ "${OUTPUT_PATH#/}" = "$OUTPUT_PATH" ]; then
+    OUTPUT_PATH="$PWD/$OUTPUT_PATH"
 fi
 
 CRT_COMPILER=${CC:-gcc}
@@ -111,16 +126,16 @@ CRT_OBJECT="$BUILD_DIR/crt0.o"
 SLIB_CRT_OBJECT="$BUILD_DIR/slibcrt.o"
 SLIB_CRT_OBJECT="$BUILD_DIR/slibcrt.o"
 ELF="$BUILD_DIR/$PROGRAM_NAME.elf"
-OUTPUT="$SCRIPT_DIR/$PROGRAM_NAME.$([ "$SLIB" -eq 1 ] && echo slib || echo run)"
+OUTPUT=${OUTPUT_PATH:-"$SCRIPT_DIR/$PROGRAM_NAME.$([ "$SLIB" -eq 1 ] && echo slib || echo run)"}
 
 # The OS image packages install2 as 0:/programs. Keep the dlr build in that
 # directory when the SDK is checked out alongside the kernel source tree.
 if [ "$SLIB" -eq 0 ] && [ "$PROGRAM_NAME" = "dlr" ] &&
-    [ -d "$SCRIPT_DIR/../src/resources/install2" ]; then
+    [ -z "$OUTPUT_PATH" ] && [ -d "$SCRIPT_DIR/../src/resources/install2" ]; then
     OUTPUT="$SCRIPT_DIR/../src/resources/install2/dlr.run"
 fi
 if [ "$SLIB" -eq 0 ] && [ "$PROGRAM_NAME" = "dlrconnect" ] &&
-    [ -d "$SCRIPT_DIR/../src/resources/install2" ]; then
+    [ -z "$OUTPUT_PATH" ] && [ -d "$SCRIPT_DIR/../src/resources/install2" ]; then
     OUTPUT="$SCRIPT_DIR/../src/resources/install2/dlrconnect.run"
 fi
 
@@ -153,6 +168,10 @@ fi
 
 if [ -d "$SOURCE_ROOT/src" ]; then
     INCLUDE_FLAGS="-I$SOURCE_ROOT/src $INCLUDE_FLAGS"
+fi
+
+if [ -d "$SOURCE_ROOT/libraries/ttrend/include" ]; then
+    INCLUDE_FLAGS="-I$SOURCE_ROOT/libraries/ttrend/include $INCLUDE_FLAGS"
 fi
 
 OBJECTS=""
@@ -203,8 +222,8 @@ if [ "$SOURCE_WAS_DIR" -eq 1 ]; then
             SOURCES=$(find "$SOURCE_ROOT" -type f \
                 \( -name '*.c' -o -name '*.cpp' \) \
                 ! -name 'dlrconnect_main.c' \
-                ! -path "$SOURCE_ROOT/tests/*" \
-                ! -path "$SOURCE_ROOT/examples/*" \
+                ! -path '*/tests/*' \
+                ! -path '*/examples/*' \
                 -print | sort)
         fi
     fi
@@ -241,6 +260,7 @@ for SOURCE in $SOURCES; do
         $COMMON_FLAGS \
         $TARGET_FLAGS \
         $INCLUDE_FLAGS \
+        ${CFLAGS:-} \
         -c "$SOURCE" \
         -o "$OBJECT"
 
@@ -250,14 +270,18 @@ done
 ENTRY_POINT=_start
 if [ "$SLIB" -eq 1 ]; then
     ENTRY_POINT=0
+    GC_FLAGS=""
+else
+    GC_FLAGS="--gc-sections"
 fi
 
 "$LINKER" \
     -pie \
-    --gc-sections \
+    $GC_FLAGS \
     --no-dynamic-linker \
     -T "$SCRIPT_DIR/link.ld" \
     -e "$ENTRY_POINT" \
+    ${LDFLAGS:-} \
     -o "$ELF" \
     $OBJECTS
 
@@ -269,8 +293,12 @@ if [ "$SLIB" -eq 1 ]; then
         awk '$3 != "" { print $3 }' |
         sort -u > "$EXPORTS"
 
+    HEADER_ROOT="$SOURCE_ROOT"
+    if [ -d "$SOURCE_ROOT/include" ]; then
+        HEADER_ROOT="$SOURCE_ROOT/include"
+    fi
     HEADERS=$(
-        find "$SOURCE_ROOT" -type f \
+        find "$HEADER_ROOT" -type f \
             \( -name '*.h' -o -name '*.hpp' \) \
             -print | sort
     )
@@ -279,7 +307,7 @@ if [ "$SLIB" -eq 1 ]; then
         "$ELF" \
         "$EXPORTS" \
         "$OUTPUT" \
-        "$SOURCE_ROOT" \
+        "$HEADER_ROOT" \
         $HEADERS
 
     echo "Built shared library $OUTPUT"

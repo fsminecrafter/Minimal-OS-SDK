@@ -16,6 +16,64 @@ static inline uint32_t mos_graphics_get_height(void) {
     return (uint32_t)mos_graphics(&request);
 }
 
+static inline uint64_t mos_graphics_acquire(void) {
+    syscall_graphics_request_t request = { .op = SYS_GRAPHICS_ACQUIRE };
+    return mos_graphics(&request);
+}
+
+static inline uint64_t mos_graphics_release(void) {
+    syscall_graphics_request_t request = { .op = SYS_GRAPHICS_RELEASE };
+    return mos_graphics(&request);
+}
+
+static inline uint64_t mos_graphics_owner(void) {
+    syscall_graphics_request_t request = { .op = SYS_GRAPHICS_OWNER };
+    return mos_graphics(&request);
+}
+
+static inline uint64_t mos_graphics_info(syscall_graphics_info_t* info) {
+    if (info) {
+        info->size = sizeof(*info);
+        info->version = SYS_GRAPHICS_ABI_VERSION;
+        info->reserved = 0;
+    }
+    syscall_graphics_request_t request = { .op = SYS_GRAPHICS_INFO,
+                                           .info = info };
+    return mos_graphics(&request);
+}
+
+static inline uint64_t mos_graphics_blit_surface(
+        const uint32_t* src, uint32_t width, uint32_t height,
+        uint32_t pitch, int32_t sx, int32_t sy, int32_t sw, int32_t sh,
+        int32_t dx, int32_t dy, uint32_t flags) {
+    syscall_blit_request_t blit = {
+        .size = sizeof(blit),
+        .version = SYS_GRAPHICS_ABI_VERSION,
+        .flags = flags,
+        .src_w = width,
+        .src_h = height,
+        .src_pitch = pitch,
+        .src = src,
+        .sx = sx,
+        .sy = sy,
+        .sw = sw,
+        .sh = sh,
+        .dx = dx,
+        .dy = dy
+    };
+    syscall_graphics_request_t request = { .op = SYS_GRAPHICS_BLIT,
+                                           .blit = &blit };
+    return mos_graphics(&request);
+}
+
+static inline uint64_t mos_graphics_present(int32_t x, int32_t y,
+                                            int32_t width, int32_t height) {
+    syscall_graphics_request_t request = {
+        .op = SYS_GRAPHICS_PRESENT,
+        .args = { x, y, width, height }
+    };
+    return mos_graphics(&request);
+}
 static inline void mos_graphics_clear(uint8_t r, uint8_t g, uint8_t b) {
     syscall_graphics_request_t request = {};
     request.op = SYS_GRAPHICS_CLEAR;

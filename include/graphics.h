@@ -18,5 +18,10 @@
 #define graphics_text            mos_graphics_text
 #define graphics_set_resolution  mos_graphics_set_resolution
 #define graphics_measure_text    mos_graphics_measure_text
+#define graphics_acquire         mos_graphics_acquire
+#define graphics_release         mos_graphics_release
+#define graphics_info            mos_graphics_info
+#define graphics_blit_surface    mos_graphics_blit_surface
+#define graphics_present         mos_graphics_present
 
 #endif
