@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include "x86_64/syscall.h"
+#include "x86_64/user_common.h"
 
 static inline uint64_t mos_syscall3(uint64_t number, uint64_t arg1,
                                     uint64_t arg2, uint64_t arg3) {
@@ -18,29 +19,9 @@ static inline uint64_t mos_syscall1(uint64_t number, uint64_t arg1) {
     return mos_syscall3(number, arg1, 0, 0);
 }
 
-static inline uint64_t mos_write(const char* text, uint64_t length) {
-    return mos_syscall3(SYS_WRITE, 1, (uint64_t)(uintptr_t)text, length);
-}
-
-static inline void mos_exit(void) {
-    mos_syscall1(SYS_EXIT, 0);
-    for (;;) { }
-}
-
 static inline void mos_exit_code(uint8_t code) {
     mos_syscall1(SYS_EXIT, code);
     for (;;) { }
-}
-
-static inline uint64_t mos_register_cleanup(void (*cleanup)(void)) {
-    return mos_syscall1(SYS_REGISTER_CLEANUP, (uint64_t)(uintptr_t)cleanup);
-}
-
-static inline uint64_t mos_getpid(void) { return mos_syscall1(SYS_GETPID, 0); }
-static inline uint64_t mos_uptime(void) { return mos_syscall1(SYS_UPTIME, 0); }
-
-static inline void mos_sleep(uint64_t milliseconds) {
-    mos_syscall1(SYS_SLEEP, milliseconds);
 }
 
 static inline uint64_t mos_graphics(syscall_graphics_request_t* request) {

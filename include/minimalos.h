@@ -4,33 +4,9 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "syscall.h"
-
-static inline long mos_syscall(long num, long a1, long a2, long a3) {
-    long ret;
-    asm volatile(
-        "int $0x80"
-        : "=a"(ret)
-        : "a"(num), "D"(a1), "S"(a2), "d"(a3)
-        : "memory"
-    );
-    return ret;
-}
-
-static inline long mos_write(int fd, const void* buf, size_t len) {
-    return mos_syscall(SYS_WRITE, fd, (long)(uintptr_t)buf, (long)len);
-}
-
-static inline long mos_getpid(void) {
-    return mos_syscall(SYS_GETPID, 0, 0, 0);
-}
-
-static inline long mos_uptime(void) {
-    return mos_syscall(SYS_UPTIME, 0, 0, 0);
-}
-
-static inline long mos_sleep(long ticks) {
-    return mos_syscall(SYS_SLEEP, ticks, 0, 0);
-}
+// mos_syscall, mos_write, mos_exit, files, packages and framebuffer calls
+// shared with the x86_64/user_*.h headers:
+#include "x86_64/user_common.h"
 
 static inline long mos_open(const char* path, long flags) {
     return mos_syscall(SYS_OPEN, (long)(uintptr_t)path, flags, 0);
@@ -72,80 +48,6 @@ static inline long mos_getcwd(char* path, size_t path_size) {
     return mos_syscall(SYS_GETCWD, (long)(uintptr_t)path, (long)path_size, 0);
 }
 
-// --- MinimaFS extensions ---
-
-// Write to a file opened with mos_open(). Distinct from mos_write(),
-// which is fixed to fd 1/2 (stdout/stderr -> terminal).
-static inline long mos_fwrite(long fd, const void* buf, size_t len) {
-    return mos_syscall(SYS_FWRITE, fd, (long)(uintptr_t)buf, (long)len);
-}
-
-// Lists up to `max_entries` entries of the directory at `path` into
-// `entries` (an array of syscall_dirent_t - see syscall.h). Returns
-// the number of entries written, or a negative SYS_ERR_* value.
-static inline long mos_listdir(const char* path, syscall_dirent_t* entries,
-                               size_t max_entries) {
-    return mos_syscall(SYS_LISTDIR, (long)(uintptr_t)path,
-                       (long)(uintptr_t)entries, (long)max_entries);
-}
-
-static inline long mos_delete(const char* path) {
-    return mos_syscall(SYS_DELETE, (long)(uintptr_t)path, 0, 0);
-}
-
-static inline long mos_rmdir(const char* path) {
-    return mos_syscall(SYS_RMDIR, (long)(uintptr_t)path, 0, 0);
-}
-
-static inline long mos_get_metadata(const char* path, syscall_file_metadata_t* out) {
-    return mos_syscall(SYS_GET_METADATA, (long)(uintptr_t)path, (long)(uintptr_t)out, 0);
-}
-
-static inline long mos_tell(int fd) {
-    return mos_syscall(SYS_TELL, fd, 0, 0);
-}
-
-static inline long mos_feof(int fd) {
-    return mos_syscall(SYS_EOF, fd, 0, 0);
-}
-
-// --- MPKG (.mpkg archive) ---
-
-static inline long mos_pkg_unzip(const char* archive_path, const char* target_dir,
-                                 uint32_t* out_installed, uint32_t* out_failed) {
-    syscall_pkg_request_t request = {0};
-    request.op = SYS_PKG_UNZIP;
-    request.path = archive_path;
-    request.extra = target_dir;
-    request.out_count = out_installed;
-    request.out_failed = out_failed;
-    return mos_syscall(SYS_PKG, (long)(uintptr_t)&request, 0, 0);
-}
-
-static inline long mos_pkg_zip(const char* source_path, const char* algorithm,
-                               char* out_path, uint32_t out_path_size) {
-    syscall_pkg_request_t request = {0};
-    request.op = SYS_PKG_ZIP;
-    request.path = source_path;
-    request.extra = algorithm;
-    request.out_path = out_path;
-    request.out_path_size = out_path_size;
-    return mos_syscall(SYS_PKG, (long)(uintptr_t)&request, 0, 0);
-}
-
-static inline long mos_pkg_info(const char* archive_path, uint32_t* out_entry_count) {
-    syscall_pkg_request_t request = {0};
-    request.op = SYS_PKG_INFO;
-    request.path = archive_path;
-    request.out_count = out_entry_count;
-    return mos_syscall(SYS_PKG, (long)(uintptr_t)&request, 0, 0);
-}
-
-static inline void mos_exit(int code) {
-    mos_syscall(SYS_EXIT, code, 0, 0);
-    for (;;) { } // never reached - SYS_EXIT never returns
-}
-
 // Creates an empty file. Open it afterwards with SYS_O_RDWR to write.
 // filetype/fileformat may be NULL for "binary"/"bin".
 static inline long mos_create(const char* path, const char* filetype,
@@ -159,73 +61,6 @@ static inline long mos_create(const char* path, const char* filetype,
 // (argv[0] is always the path itself). Pass NULL/0 for none.
 static inline long mos_exec(const char* path, const char** argv, long argc) {
     return mos_syscall(SYS_EXEC, (long)(uintptr_t)path, (long)(uintptr_t)argv, argc);
-}
-
-static inline long mos_register_cleanup(void (*cleanup)(void)) {
-    return mos_syscall(SYS_REGISTER_CLEANUP, (long)(uintptr_t)cleanup, 0, 0);
-}
-
-static inline long mos_graphics_call(syscall_graphics_request_t* request) {
-    return mos_syscall(SYS_GRAPHICS, (long)(uintptr_t)request, 0, 0);
-}
-
-static inline long mos_graphics_acquire(void) {
-    syscall_graphics_request_t request = {0};
-    request.op = SYS_GRAPHICS_ACQUIRE;
-    return mos_graphics_call(&request);
-}
-
-static inline long mos_graphics_release(void) {
-    syscall_graphics_request_t request = {0};
-    request.op = SYS_GRAPHICS_RELEASE;
-    return mos_graphics_call(&request);
-}
-
-static inline long mos_graphics_info(syscall_graphics_info_t* info) {
-    syscall_graphics_request_t request = {0};
-    request.op = SYS_GRAPHICS_INFO;
-    request.info = info;
-    if (info) {
-        info->size = sizeof(*info);
-        info->version = SYS_GRAPHICS_ABI_VERSION;
-        info->reserved = 0;
-    }
-    return mos_graphics_call(&request);
-}
-
-static inline long mos_graphics_blit_surface(
-        const uint32_t* src, uint32_t width, uint32_t height,
-        uint32_t pitch, int32_t sx, int32_t sy, int32_t sw, int32_t sh,
-        int32_t dx, int32_t dy, uint32_t flags) {
-    syscall_blit_request_t blit = {0};
-    blit.size = sizeof(blit);
-    blit.version = SYS_GRAPHICS_ABI_VERSION;
-    blit.flags = flags;
-    blit.src_w = width;
-    blit.src_h = height;
-    blit.src_pitch = pitch;
-    blit.src = src;
-    blit.sx = sx;
-    blit.sy = sy;
-    blit.sw = sw;
-    blit.sh = sh;
-    blit.dx = dx;
-    blit.dy = dy;
-    syscall_graphics_request_t request = {0};
-    request.op = SYS_GRAPHICS_BLIT;
-    request.blit = &blit;
-    return mos_graphics_call(&request);
-}
-
-static inline long mos_graphics_present(int32_t x, int32_t y,
-                                        int32_t width, int32_t height) {
-    syscall_graphics_request_t request = {0};
-    request.op = SYS_GRAPHICS_PRESENT;
-    request.args[0] = x;
-    request.args[1] = y;
-    request.args[2] = width;
-    request.args[3] = height;
-    return mos_graphics_call(&request);
 }
 
 static inline long mos_mouse_call(uint64_t operation, uint64_t arg1,

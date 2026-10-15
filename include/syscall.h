@@ -237,6 +237,48 @@ typedef struct {
 } syscall_mouse_state_t;
 
 // ===========================================
+// RAW INPUT (SYS_INPUT_READ)
+// ===========================================
+// Keyboard and mouse events as the kernel queues them; mosWM reads these
+// and turns them into window events.
+#define SYS_INPUT_ABI_VERSION 1u
+#define SYSCALL_INPUT_KEY_DOWN 1u
+#define SYSCALL_INPUT_KEY_UP 2u
+#define SYSCALL_INPUT_MOUSE_MOVE 3u
+#define SYSCALL_INPUT_MOUSE_BUTTON 4u
+#define SYSCALL_INPUT_MOUSE_WHEEL 5u
+#define SYSCALL_INPUT_MOD_SHIFT (1u << 0)
+#define SYSCALL_INPUT_MOD_CTRL (1u << 1)
+#define SYSCALL_INPUT_MOD_ALT (1u << 2)
+#define SYSCALL_INPUT_BTN_LEFT (1u << 0)
+#define SYSCALL_INPUT_BTN_RIGHT (1u << 1)
+#define SYSCALL_INPUT_BTN_MIDDLE (1u << 2)
+#define SYSCALL_INPUT_QUEUE_CAPACITY 256u
+#define SYSCALL_INPUT_MAX_READ 256u
+#define SYSCALL_INPUT_MAX_TIMEOUT_MS 5000u
+
+typedef struct {
+    uint8_t type;
+    uint8_t key;
+    uint8_t mods;
+    uint8_t buttons;
+    int32_t dx;
+    int32_t dy;
+    int32_t wheel;
+    uint32_t time_ms;
+} syscall_input_event_t;
+
+typedef struct {
+    uint32_t size;
+    uint32_t version;
+    syscall_input_event_t* events;
+    uint32_t capacity;
+    uint32_t timeout_ms;
+    uint64_t* dropped_count;
+    uint32_t reserved[4];
+} syscall_input_read_request_t;
+
+// ===========================================
 // Window manager (SYS_WINDOW)
 // ===========================================
 #define SYS_WINDOW_ABI_VERSION 1u
