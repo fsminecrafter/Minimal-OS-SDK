@@ -80,6 +80,7 @@ reconfiguring shared hardware through the syscall gate.
 | `stdlib.h` | `malloc` and friends, random bytes, `atoi` (includes `minimalos.h`) |
 | `string.h` | String and memory helpers (no syscalls) |
 | `window.h` | mosWM windows and their events |
+| `easyui.h` | Ready-made widgets for window apps (see [easyui](easyui.md)) |
 | `graphics.h` | Short `graphics_*` names for the framebuffer API |
 | `net.h` | Networking (includes `minimalos.h`) |
 | `user_sysinfo.h` | System statistics |

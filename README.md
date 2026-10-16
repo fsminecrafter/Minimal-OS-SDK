@@ -7,6 +7,10 @@ its signature, parameters, return values, errors and an example, grouped by
 header. The same reference is on the website under Docs → SDK functions, and
 in Run Studio's docs panel.
 
+For window apps, `include/easyui.h` adds buttons, sliders, text inputs,
+radio buttons, toggles, dropdowns, lists and more in the MOSdesk theme -
+see [`docs/easyui.md`](docs/easyui.md) and `examples/easyui-demo.c`.
+
 
 Install the native compiler and linker tools on Debian or Ubuntu:
 

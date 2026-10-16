@@ -15,6 +15,7 @@ truth; these pages describe them as of SDK v1.1 and the kernel's
 | [Strings and memory](strings.md) | `string.h` | `strlen`, `strcmp`, `strstr`, `memcpy`, constant-time compare … |
 | [Formatted output](output.md) | `stdio.h`, `iostream` | `printf` and `std::cout` |
 | [Windows](windows.md) | `window.h` | mosWM windows: create, draw, present, events |
+| [easyui widgets](easyui.md) | `easyui.h` | Buttons, sliders, text inputs, radio buttons, lists and more, in the MOSdesk theme |
 | [Graphics](graphics.md) | `graphics.h`, `x86_64/user_graphics.h` | Full-screen framebuffer: acquire, blit, present, primitives |
 | [Input](input.md) | `x86_64/user_syscalls.h`, `user_mouse.h`, `user_usb.h` | Raw keyboard and mouse events for full-screen programs |
 | [Networking](network.md) | `net.h` | DNS, TCP client and server, UDP, the ktls transport |
