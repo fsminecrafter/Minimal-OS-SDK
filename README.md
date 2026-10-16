@@ -2,6 +2,11 @@
 
 Minimal-OS SDK is a Software Development Kit for Minimal-OS, Linked here: [Minimal-OS](https://github.com/fsminecrafter/Minimal-OS).
 
+Every function in the SDK headers is documented in [`docs/`](docs/README.md):
+its signature, parameters, return values, errors and an example, grouped by
+header. The same reference is on the website under Docs → SDK functions, and
+in Run Studio's docs panel.
+
 
 Install the native compiler and linker tools on Debian or Ubuntu:
 
