@@ -4,9 +4,10 @@ Buttons, sliders, text inputs, radio buttons and more for mosWM apps, in
 one header. Include `easyui.h`.
 
 easyui opens one window, keeps a list of widgets, draws them, and turns
-mouse and keyboard events into callbacks. Its colours follow the MOSdesk
-theme picked in Settings > Appearance, and they change while the app is
-running when the user picks another theme.
+mouse and keyboard events into callbacks. Text is smooth, anti-aliased
+Inter drawn by the same OpenType renderer mosWM uses. Its colours follow
+the MOSdesk theme picked in Settings > Appearance, and they change while
+the app is running when the user picks another theme.
 
 ```c
 #include "easyui.h"
@@ -148,6 +149,32 @@ after [`easyui.setdarkmode(1)`](#easyui-setdarkmode).
 | Rose | `0xFFD66B83` |
 | Gold | `0xFFE1B64C` |
 
+## Text
+
+easyui draws text the way mosWM does:
+
+- **Smooth text (normal).** `easyui_text.h` is a bundled copy of
+  ttrend_outline, the anti-aliased OpenType/TrueType renderer mosWM uses
+  (integer maths only, no libc). When the window opens, easyui loads the
+  Inter fonts mosWM installs, `0:/programs/mosWM/assets/fonts/Inter-Regular.otf`
+  and `Inter-Medium.otf`. Text size 1 is 12 px Inter Regular; size 2 and up
+  is `8 × size` px Inter Medium, the same sizes mosWM uses for its own text.
+  Text is proportional: wrapping, alignment and the text-input caret are
+  measured with the real glyph widths.
+- **Bitmap fallback.** If neither font can be read (mosWM is not installed,
+  or the files are missing), or after
+  [`easyui.setsmoothtext(0)`](#easyui-setsmoothtext), text uses the 8 × 8
+  bitmap font mosWM falls back to, scaled by the text size.
+- **Your own font.** [`easyui.loadfont`](#easyui-loadfont) loads any
+  `.otf` or `.ttf` file instead.
+
+Run Studio's preview has the same Inter files at the same path, so smooth
+text looks the same there as on MOSdesk.
+
+`include/easyui_text.h` is generated from MOSdesk's
+`mosdesk/libraries/ttrend_outline` by `tools/bundle-ttrend.py`; do not edit
+it by hand.
+
 ## Limits
 
 | Limit | Value |
@@ -156,7 +183,7 @@ after [`easyui.setdarkmode(1)`](#easyui-setdarkmode).
 | Widget text | `EASYUI_TEXT_MAX` - 1 (127) bytes |
 | Timers | `EASYUI_MAX_TIMERS` (8) |
 | Windows | One per program |
-| Text | The 8 × 8 font mosWM uses as its fallback, ASCII only, scaled by `settextsize` |
+| Text | Inter via the OpenType renderer (8 × 8 bitmap fallback); ASCII from the keyboard. No kerning or right-to-left text |
 
 ## `easyui.init`
 
@@ -335,6 +362,59 @@ const easyui_theme_t* easyui.theme(void);
 
 ```c
 easyui.fillrect(x, y, w, h, easyui.theme()->surface);
+```
+
+## `easyui.loadfont`
+
+```c
+int easyui.loadfont(const char* path, int bold);
+```
+
+Loads an OpenType (`.otf`, CFF outlines) or TrueType (`.ttf`) font file
+and uses it for every widget.
+
+| Parameter | Description |
+| --- | --- |
+| `path` | Font file, for example a resource of your app: `"0:/programs/myapp/Resources/Font.ttf"` |
+| `bold` | `0` for size-1 text, `1` for size 2 and larger. Load the same file into both to use one face everywhere |
+
+**Returns** `1`, or `0` if the file could not be read or is not a font the
+renderer understands (CID-keyed CFF, variable or colour fonts). The font
+already loaded stays in use when it fails.
+
+**Notes** Call it after `init`, which has already loaded Inter. The file
+is read into the heap and kept for the life of the program.
+
+**Example**
+
+```c
+if (!easyui.loadfont("0:/programs/notes/Resources/Mono.ttf", 0))
+    mos_puts("using Inter\n");
+```
+
+## `easyui.setsmoothtext`
+
+```c
+void easyui.setsmoothtext(int on);
+```
+
+`0` draws every text with the 8 × 8 bitmap font even when a font is
+loaded (for a retro look, or pixel-exact layouts); `1` (the default) goes
+back to smooth text.
+
+## `easyui.smoothtext`
+
+```c
+int easyui.smoothtext(void);
+```
+
+**Returns** `1` if text is being drawn with an outline font, `0` if it is
+using the bitmap fallback.
+
+**Example**
+
+```c
+if (!easyui.smoothtext()) easyui.settext(status, "Install mosWM for nicer text");
 ```
 
 ## `easyui.createbutton`
@@ -880,8 +960,10 @@ the fill of a panel. Pass `0` to go back to the theme.
 void easyui.settextsize(int widget, int size);
 ```
 
-Text scale, 1 … 8. Size 1 is 8 pixels tall, size 2 is 16. Checkbox, radio
-and toggle boxes and list rows grow with it.
+Text size, 1 … 8. With smooth text, size 1 is 12 px Inter Regular and
+size `n` (2 and up) is `8 × n` px Inter Medium, as in mosWM. With the
+bitmap font, each size is `8 × n` pixels tall. Checkbox, radio and toggle
+boxes and list rows grow with it.
 
 **Example**
 
@@ -1127,7 +1209,8 @@ void easyui.drawtext(int x, int y, const char* text, uint32_t argb, int size);
 ```
 
 Draws text with its top-left corner at `(x, y)`, in the same font as the
-widgets. `\n` starts a new line 10 × `size` pixels lower.
+widgets (blended onto what is underneath). `\n` starts a new line one line
+height lower.
 
 ## `easyui.textwidth`
 

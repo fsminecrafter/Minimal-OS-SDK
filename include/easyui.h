@@ -17,7 +17,9 @@
  *
  * One window per program, holding buttons, labels, sliders, checkboxes,
  * radio buttons, toggles, text inputs, progress bars, dropdowns, list
- * boxes, panels, images and canvases. Colours follow the MOSdesk theme
+ * boxes, panels, images and canvases. Text is anti-aliased Inter, drawn
+ * with mosWM's OpenType renderer (easyui_text.h) from the fonts mosWM
+ * installs; the 8x8 bitmap font is the fallback. Colours follow the MOSdesk theme
  * chosen in Settings > Appearance (the accent colour in
  * 0:/programs/mosdesk/settings.dat), and change while the app runs when the
  * user picks another theme.
@@ -159,6 +161,10 @@ typedef struct {
     void (*setaccent)(uint32_t argb);
     uint32_t (*accent)(void);
     const easyui_theme_t* (*theme)(void);
+    /* --- text --- */
+    int  (*loadfont)(const char* path, int bold);
+    void (*setsmoothtext)(int on);
+    int  (*smoothtext)(void);
     /* --- creating widgets --- */
     easyui_widget (*createbutton)(int x, int y, int w, int h, const char* text);
     easyui_widget (*createlabel)(int x, int y, int w, int h, const char* text);
@@ -338,6 +344,16 @@ static const uint8_t eui_font[95][8] = {
     {0x07, 0x0C, 0x0C, 0x38, 0x0C, 0x0C, 0x07, 0x00},  /* '}' */
     {0x6E, 0x3B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},  /* '~' */
 };
+
+/* Smooth text: ttrend_outline, the OpenType renderer mosWM draws with. */
+#include "easyui_text.h"
+
+#define EASYUI_FONT_REGULAR "0:/programs/mosWM/assets/fonts/Inter-Regular.otf"
+#define EASYUI_FONT_MEDIUM  "0:/programs/mosWM/assets/fonts/Inter-Medium.otf"
+
+static ttrend_outline_font_t eui_ttf_font[2];   /* [0] regular, [1] medium */
+static void* eui_ttf_data[2];
+static int eui_ttf_ok[2], eui_smooth = 1, eui_fonts_tried;
 
 typedef struct {
     uint8_t used, type, visible, enabled;
@@ -521,12 +537,57 @@ static void eui_thickline(int x1, int y1, int x2, int y2, int t, uint32_t c) {
     for (int o = 0; o < t; o++) { eui_drawline(x1, y1 + o, x2, y2 + o, c); eui_drawline(x1 + o, y1, x2 + o, y2, c); }
 }
 
-static int eui_textwidth(const char* s, int size) {
-    int n = 0, best = 0;
+/* The outline font for a text size, or NULL to use the bitmap font. Size 1
+ * is 12 px regular, size 2 and up 8*size px medium, as in mosWM. */
+static ttrend_outline_font_t* eui_ttf(int size) {
+    int want = size >= 2 ? 1 : 0;
+    ttrend_outline_font_t* f;
+    if (!eui_smooth) return 0;
+    if (eui_ttf_ok[want]) f = &eui_ttf_font[want];
+    else if (eui_ttf_ok[!want]) f = &eui_ttf_font[!want];
+    else return 0;
+    f->pixel_size = size <= 1 ? 12u : 8u * (uint32_t)size;
+    return f;
+}
+
+/* height of one line of text (the box text is centred in) */
+static int32_t eui_texth(int size) {
+    ttrend_outline_font_t* f = eui_ttf(size);
     if (size < 1) size = 1;
-    for (; s && *s; s++) { if (*s == '\n') { if (n > best) best = n; n = 0; } else n++; }
-    if (n > best) best = n;
-    return best * 8 * size;
+    return f ? ttrend_outline_ascent(f) + ttrend_outline_descent(f) : 8 * size;
+}
+
+/* distance from one line to the next */
+static int32_t eui_lineh(int size) {
+    ttrend_outline_font_t* f = eui_ttf(size);
+    int32_t h = f ? ttrend_outline_line_height(f) : 10 * size;
+    int32_t t = eui_texth(size);
+    return h > t ? h : t + 2;
+}
+
+/* width of the first n bytes of s, on one line */
+static int32_t eui_linew(const char* s, int32_t n, int size) {
+    ttrend_outline_font_t* f = eui_ttf(size);
+    char line[260];
+    if (size < 1) size = 1;
+    if (!f) return n * 8 * size;
+    if (n > 259) n = 259;
+    for (int32_t i = 0; i < n; i++) line[i] = s[i];
+    line[n] = '\0';
+    return (int32_t)ttrend_outline_text_width(line, f);
+}
+
+static int eui_textwidth(const char* s, int size) {
+    int32_t best = 0;
+    while (s && *s) {
+        int32_t n = 0;
+        while (s[n] && s[n] != '\n') n++;
+        int32_t w = eui_linew(s, n, size);
+        if (w > best) best = w;
+        s += n;
+        if (*s) s++;
+    }
+    return best;
 }
 
 static void eui_char(int x, int y, char ch, uint32_t c, int size) {
@@ -541,16 +602,78 @@ static void eui_char(int x, int y, char ch, uint32_t c, int size) {
     }
 }
 
-static void eui_drawtext(int x, int y, const char* s, uint32_t c, int size) {
-    int cx = x;
+/* one line, top-left at (x, y), clipped to the clip rectangle */
+static void eui_drawline_text(int x, int y, const char* s, int32_t n, uint32_t c, int size) {
+    ttrend_outline_font_t* f = eui_ttf(size);
     if (size < 1) size = 1;
-    for (; s && *s; s++) {
-        if (*s == '\n') { cx = x; y += 10 * size; continue; }
-        if (cx >= eui_cx1) continue;
-        if (cx + 8 * size > eui_cx0) eui_char(cx, y, *s, c, size);
+    if (f) {
+        char line[260];
+        if (!eui_px || eui_cx1 <= eui_cx0 || eui_cy1 <= eui_cy0) return;
+        if (n > 259) n = 259;
+        for (int32_t i = 0; i < n; i++) line[i] = s[i];
+        line[n] = '\0';
+        /* a view of the window clipped to the clip rectangle */
+        ttrend_outline_surface_t view = {
+            eui_px + (size_t)eui_cy0 * (size_t)eui_W + (size_t)eui_cx0,
+            (uint32_t)(eui_cx1 - eui_cx0), (uint32_t)(eui_cy1 - eui_cy0), (uint32_t)eui_W
+        };
+        ttrend_outline_draw_text_baseline(&view, x - eui_cx0, y + ttrend_outline_ascent(f) - eui_cy0, line, c, f);
+        return;
+    }
+    int cx = x;
+    for (int32_t i = 0; i < n; i++) {
+        if (cx >= eui_cx1) break;
+        if (cx + 8 * size > eui_cx0) eui_char(cx, y, s[i], c, size);
         cx += 8 * size;
     }
 }
+
+static void eui_drawtext(int x, int y, const char* s, uint32_t c, int size) {
+    while (s && *s) {
+        int32_t n = 0;
+        while (s[n] && s[n] != '\n') n++;
+        eui_drawline_text(x, y, s, n, c, size);
+        y += eui_lineh(size);
+        s += n;
+        if (*s) s++;
+    }
+}
+
+/* Loads an .otf/.ttf font file for regular (bold = 0) or larger (bold = 1)
+ * text. Returns 1 on success. */
+static int eui_loadfont(const char* path, int bold) {
+    int slot = bold ? 1 : 0;
+    long fd = mos_open(path, SYS_O_RDONLY);
+    if (fd <= 0) return 0;
+    long size = mos_size(fd);
+    uint8_t* data = size > 0 && size <= 8L * 1024 * 1024 ? (uint8_t*)malloc((size_t)size) : 0;
+    long got = 0;
+    while (data && got < size) {
+        long n = mos_read(fd, data + got, (size_t)(size - got));
+        if (n <= 0) break;
+        got += n;
+    }
+    mos_close(fd);
+    if (!data) return 0;
+    ttrend_outline_font_t font;
+    if (got != size || ttrend_outline_font_load_memory(&font, data, (size_t)size, 12u) != 0) { free(data); return 0; }
+    if (eui_ttf_data[slot]) free(eui_ttf_data[slot]);
+    eui_ttf_data[slot] = data;
+    eui_ttf_font[slot] = font;
+    eui_ttf_ok[slot] = 1;
+    eui_dirty = 1;
+    return 1;
+}
+
+static void eui_load_default_fonts(void) {
+    if (eui_fonts_tried) return;
+    eui_fonts_tried = 1;
+    if (!eui_ttf_ok[0]) eui_loadfont(EASYUI_FONT_REGULAR, 0);
+    if (!eui_ttf_ok[1]) eui_loadfont(EASYUI_FONT_MEDIUM, 1);
+}
+
+static void eui_setsmoothtext(int on) { eui_smooth = on != 0; eui_dirty = 1; }
+static int eui_smoothtext(void) { return eui_ttf(1) != 0; }
 
 static void eui_drawpixels(int x, int y, const uint32_t* p, int w, int h) {
     if (!p) return;
@@ -561,38 +684,43 @@ static void eui_drawpixels(int x, int y, const uint32_t* p, int w, int h) {
         }
 }
 
+/* Length of the next line of `s` that fits in `w` pixels: whole words when
+ * possible, cut mid-word only when one word is wider than the box. */
+static int32_t eui_fit(const char* s, int32_t w, int size) {
+    int32_t len = 0, cut = -1;
+    while (s[len] && s[len] != '\n') {
+        if (eui_linew(s, len + 1, size) > w) break;
+        if (s[len] == ' ') cut = len;
+        len++;
+    }
+    if (s[len] && s[len] != '\n' && s[len] != ' ' && cut > 0) len = cut;
+    if (len == 0 && s[0] && s[0] != '\n') len = 1;
+    return len;
+}
+
 /* Draws `text` word-wrapped inside a box, vertically centred. */
 static void eui_textbox(int32_t x, int32_t y, int32_t w, int32_t h, const char* text,
                         uint32_t color, int size, int align) {
-    char line[EASYUI_TEXT_MAX + 1];
-    int pass, lines = 0, max = w / (8 * size);
-    int32_t ty = 0;
-    if (max < 1) max = 1;
-    if (max > EASYUI_TEXT_MAX) max = EASYUI_TEXT_MAX;
-    for (pass = 0; pass < 2; pass++) {
-        const char* s = text;
-        int n = 0;
-        if (pass == 1) ty = y + (h - (lines * 10 * size - 2 * size)) / 2;
-        while (1) {
-            /* the longest run of whole words that fits */
-            int len = 0, cut = -1;
-            while (s[len] && s[len] != '\n' && len < max) { if (s[len] == ' ') cut = len; len++; }
-            if (s[len] && s[len] != '\n' && s[len] != ' ' && cut > 0) len = cut;
-            if (pass == 1) {
-                for (int i = 0; i < len; i++) line[i] = s[i];
-                line[len] = '\0';
-                int32_t lw = len * 8 * size;
-                int32_t lx = align == EASYUI_ALIGN_CENTER ? x + (w - lw) / 2
-                           : align == EASYUI_ALIGN_RIGHT ? x + w - lw : x;
-                eui_drawtext(lx, ty, line, color, size);
-                ty += 10 * size;
-            }
-            n++;
-            s += len;
-            if (*s == ' ' || *s == '\n') s++;
-            if (!*s) break;
-        }
-        lines = n;
+    int32_t lines = 0, lh = eui_lineh(size), th = eui_texth(size), ty;
+    const char* s;
+    if (!text || !*text) return;
+    for (s = text; *s;) {
+        int32_t len = eui_fit(s, w, size);
+        lines++;
+        s += len;
+        if (*s == ' ' || *s == '\n') s++;
+    }
+    ty = y + (h - ((lines - 1) * lh + th)) / 2;
+    for (s = text; *s;) {
+        int32_t len = eui_fit(s, w, size), shown = len;
+        while (shown > 0 && s[shown - 1] == ' ') shown--;
+        int32_t lw = eui_linew(s, shown, size);
+        int32_t lx = align == EASYUI_ALIGN_CENTER ? x + (w - lw) / 2
+                   : align == EASYUI_ALIGN_RIGHT ? x + w - lw : x;
+        eui_drawline_text(lx, ty, s, shown, color, size);
+        ty += lh;
+        s += len;
+        if (*s == ' ' || *s == '\n') s++;
     }
 }
 
@@ -600,6 +728,14 @@ static void eui_textbox(int32_t x, int32_t y, int32_t w, int32_t h, const char* 
  *  Widgets
  * --------------------------------------------------------------------- */
 static int eui_valid(easyui_widget id) { return id > 0 && id <= EASYUI_MAX_WIDGETS && eui_w[id].used; }
+
+/* what a text input shows: its text, or stars for a password */
+static int32_t eui_shown(const eui_widget_t* e, char* out) {
+    int32_t n = 0;
+    for (; e->text[n]; n++) out[n] = e->password ? '*' : e->text[n];
+    out[n] = '\0';
+    return n;
+}
 
 static void eui_copy(char* dst, const char* src, int size) {
     int i = 0;
@@ -690,7 +826,7 @@ static void eui_activate(int id) {
     eui_fire(id, EASYUI_ONCE, 0);
 }
 
-static int32_t eui_row_h(eui_widget_t* e) { return 8 * e->size + 12; }
+static int32_t eui_row_h(eui_widget_t* e) { return eui_texth(e->size) + 12; }
 
 static int32_t eui_list_rows(eui_widget_t* e) {
     int32_t rows = (e->h - 4) / eui_row_h(e);
@@ -771,9 +907,14 @@ static void eui_press(int id) {
     if (e->type == EASYUI_SLIDER) eui_slider_drag(id, eui_mx, eui_my);
     else if (e->type == EASYUI_DROPDOWN) { eui_open = id; e->scroll = e->value > 7 ? e->value - 7 : 0; }
     else if (e->type == EASYUI_TEXTINPUT) {
-        int32_t pos = (eui_mx - e->x - 8) / (8 * e->size) + e->scroll;
-        int32_t len = (int32_t)strlen(e->text);
-        e->cursor = pos < 0 ? 0 : pos > len ? len : pos;
+        char shown[EASYUI_TEXT_MAX];
+        int32_t len = eui_shown(e, shown), target = eui_mx - e->x - 8 + e->scroll, best = 0, dist = -1;
+        for (int32_t i = 0; i <= len; i++) {
+            int32_t d = eui_linew(shown, i, e->size) - target;
+            if (d < 0) d = -d;
+            if (dist < 0 || d < dist) { dist = d; best = i; }
+        }
+        e->cursor = best;
     } else if (e->type == EASYUI_LISTBOX) {
         int32_t row = (eui_my - e->y - 2) / eui_row_h(e) + e->scroll;
         if (row >= 0 && row < e->count) {
@@ -990,7 +1131,7 @@ static void eui_paint_widget(int id) {
     uint32_t text = e->enabled ? eui_th.text : eui_th.disabled_text;
     uint32_t acc = eui_accent_of(e);
     int focus = id == eui_focus, hover = e->hovered && e->enabled, pressed = id == eui_pressed && hover;
-    int32_t th = 8 * sz;
+    int32_t th = eui_texth(sz);
     switch (e->type) {
     case EASYUI_BUTTON: {
         uint32_t bg, fg = eui_th.text;
@@ -1040,7 +1181,7 @@ static void eui_paint_widget(int id) {
     case EASYUI_CHECKBOX:
     case EASYUI_RADIO:
     case EASYUI_TOGGLE: {
-        int32_t box = 10 + th, bx = x, by = y + (h - box) / 2, lx;
+        int32_t box = 10 + 8 * sz, bx = x, by = y + (h - box) / 2, lx;
         uint32_t on = e->enabled ? acc : eui_th.disabled_text;
         if (e->type == EASYUI_TOGGLE) {
             int32_t tw = box * 2 - 2;
@@ -1074,23 +1215,20 @@ static void eui_paint_widget(int id) {
         eui_fillroundrect(x, y, w, h, 6, focus ? acc : eui_th.border);
         eui_fillroundrect(x + (focus ? 2 : 1), y + (focus ? 2 : 1), w - (focus ? 4 : 2), h - (focus ? 4 : 2), 5,
                           e->enabled ? eui_th.surface : eui_th.disabled);
-        int32_t cw = 8 * sz, visible = (w - 16) / cw, len = (int32_t)strlen(e->text);
-        if (visible < 1) visible = 1;
+        char shown[EASYUI_TEXT_MAX];
+        int32_t len = eui_shown(e, shown), avail = w - 16;
         if (e->cursor > len) e->cursor = len;
-        if (e->cursor < e->scroll) e->scroll = e->cursor;
-        if (e->cursor > e->scroll + visible - 1) e->scroll = e->cursor - visible + 1;
+        /* e->scroll is the pixel offset that keeps the caret in view */
+        int32_t caret = eui_linew(shown, e->cursor, sz);
+        if (caret - e->scroll > avail) e->scroll = caret - avail;
+        if (caret - e->scroll < 0) e->scroll = caret;
+        if (eui_linew(shown, len, sz) - e->scroll < avail) e->scroll = eui_linew(shown, len, sz) - avail;
         if (e->scroll < 0) e->scroll = 0;
         int32_t ty = y + (h - th) / 2;
         eui_clip(x + 6, y + 2, w - 12, h - 4);
         if (!len && !focus) eui_drawtext(x + 8, ty, e->placeholder, eui_th.muted, sz);
-        else {
-            char shown[EASYUI_TEXT_MAX];
-            int32_t n = 0;
-            for (int32_t i = e->scroll; i < len && n < visible + 1; i++) shown[n++] = e->password ? '*' : e->text[i];
-            shown[n] = '\0';
-            eui_drawtext(x + 8, ty, shown, text, sz);
-        }
-        if (focus && eui_caret_on) eui_fillrect(x + 8 + (e->cursor - e->scroll) * cw, ty - 2, sz > 1 ? 2 : 1, th + 4, acc);
+        else eui_drawline_text(x + 8 - e->scroll, ty, shown, len, text, sz);
+        if (focus && eui_caret_on) eui_fillrect(x + 8 + caret - e->scroll, ty - 2, sz > 1 ? 2 : 1, th + 4, acc);
         break;
     }
     case EASYUI_PROGRESS: {
@@ -1133,7 +1271,7 @@ static void eui_paint_widget(int id) {
                 if (idx == e->value) eui_fillroundrect(x + 3, ry, w - 6 - (scroll ? 6 : 0), rh, 5, acc);
                 else if (idx == e->item_hover) eui_fillroundrect(x + 3, ry, w - 6 - (scroll ? 6 : 0), rh, 5, eui_th.button_hover);
                 eui_clip(x + 4, ry, w - 14, rh);
-                eui_drawtext(x + 10, ry + 6, e->items[idx], idx == e->value ? eui_th.accent_text : text, sz);
+                eui_drawtext(x + 10, ry + (rh - th) / 2, e->items[idx], idx == e->value ? eui_th.accent_text : text, sz);
             }
             if (scroll) {
                 eui_clip_all();
@@ -1178,7 +1316,7 @@ static void eui_paint_dropdown(void) {
         int32_t idx = i + e->scroll, ry = y + 2 + i * rh;
         if (idx == e->item_hover) eui_fillroundrect(x + 3, ry, w - 6, rh, 5, eui_accent_of(e));
         eui_clip(x + 4, ry, w - 8, rh);
-        eui_drawtext(x + 10, ry + 6, e->items[idx], idx == e->item_hover ? eui_th.accent_text : eui_th.text, e->size);
+        eui_drawtext(x + 10, ry + (rh - eui_texth(e->size)) / 2, e->items[idx], idx == e->item_hover ? eui_th.accent_text : eui_th.text, e->size);
         if (idx == e->value) eui_fillrect(x + 4, ry + 6, 2, rh - 12, idx == e->item_hover ? eui_th.accent_text : eui_accent_of(e));
         eui_clip_all();
     }
@@ -1192,12 +1330,12 @@ static void eui_paint_message(void) {
     eui_fillroundrect(x, y, mw, mh, 12, eui_th.border);
     eui_fillroundrect(x + 1, y + 1, mw - 2, mh - 2, 11, eui_th.background);
     eui_clip(x + 20, y, mw - 40, mh);
-    eui_drawtext(x + 20, y + 20, eui_msg_title, eui_th.text, 2);
+    eui_drawtext(x + 20, y + 18, eui_msg_title, eui_th.text, 2);
     eui_textbox(x + 20, y + 48, mw - 40, mh - 110, eui_msg_text, eui_th.muted, 1, EASYUI_ALIGN_LEFT);
     eui_clip_all();
     int32_t bw = 90, bh = 30, bx = x + mw - bw - 16, by = y + mh - bh - 16;
     eui_fillroundrect(bx, by, bw, bh, 7, eui_msg_hover ? eui_th.accent_hover : eui_th.accent);
-    eui_drawtext(bx + (bw - 16) / 2, by + (bh - 8) / 2, "OK", eui_th.accent_text, 1);
+    eui_drawtext(bx + (bw - eui_textwidth("OK", 1)) / 2, by + (bh - eui_texth(1)) / 2, "OK", eui_th.accent_text, 1);
 }
 
 static void eui_paint(void) {
@@ -1220,6 +1358,7 @@ static int eui_init(const char* title, int width, int height) {
     if (height < 48) height = 48;
     eui_poll_theme();
     eui_make_theme();
+    eui_load_default_fonts();
     eui_last_poll = mos_uptime();
     eui_win = mos_window_create(0, 120, 80, (uint32_t)width, (uint32_t)height, title ? title : "App");
     if (!eui_win) return 0;
@@ -1515,6 +1654,7 @@ static uint32_t* eui_pixels(void) { return eui_px; }
 const easyui_api_t easyui = {
     eui_init, eui_run, eui_update, eui_quit, eui_settitle, eui_width, eui_height, eui_window, eui_redraw,
     eui_setdarkmode, eui_setaccent, eui_accent, eui_theme,
+    eui_loadfont, eui_setsmoothtext, eui_smoothtext,
     eui_createbutton, eui_createlabel, eui_createslider, eui_createcheckbox, eui_createradio,
     eui_createtoggle, eui_createtextinput, eui_createprogress, eui_createdropdown, eui_createlistbox,
     eui_createpanel, eui_createimage, eui_createcanvas, eui_createseparator, eui_remove,
