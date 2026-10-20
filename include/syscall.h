@@ -2,6 +2,7 @@
 #define SYSCALL_H
 
 #include <stdint.h>
+#include "fgpu_abi.h"   // SYS_GPU (FarcadeGL's kernel interface)
 
 #define SYS_WRITE   1
 #define SYS_EXIT    2
@@ -103,6 +104,8 @@
 // Non-blocking call with nothing to report yet (SYS_NET_TCP_ACCEPT with
 // an empty backlog). Not an error: call again.
 #define SYS_ERR_AGAIN    ((uint64_t)-7)
+// Out of memory (kernel heap or video memory).
+#define SYS_ERR_NOMEM    ((uint64_t)-8)
 
 typedef enum {
     SYS_GRAPHICS_GET_WIDTH = 1,
@@ -649,5 +652,92 @@ typedef enum {
 // syscall.c. User processes enter through the DPL3 int 0x80 gate;
 // syscall policy remains a separate capability boundary.
 void syscall_dispatch(syscall_regs_t* regs);
+
+
+// ===========================================
+// RUN A KERNEL COMMAND (SYS_ROOT)
+// ===========================================
+//
+// rdi = syscall_root_t*. Lets a user program (the MOSdesk Terminal) run a
+// kernel terminal command as root (like sudo). The kernel checks the password of a
+// MOSdesk account itself (0:/programs/mosdesk/accounts.dat) and then gives
+// the calling process a ticket for SYS_ROOT_TICKET_MS, so the password is
+// asked for once and not for every command.
+//   AUTH   username + password -> status 0 and a ticket, or an error
+//   RUN    command (needs a ticket) -> starts it; one command at a time
+//   READ   copies the output printed since the last READ; running = 0
+//          once the command has finished
+//   STATUS ticket_ms_left for the caller
+//   DROP   ends the caller's ticket (root -k)
+#define SYS_ROOT 39
+
+#define SYS_ROOT_AUTH   1u
+#define SYS_ROOT_RUN    2u
+#define SYS_ROOT_READ   3u
+#define SYS_ROOT_STATUS 4u
+#define SYS_ROOT_DROP   5u
+#define SYS_ROOT_TICKET_MS (5u * 60u * 1000u)
+#define SYS_ROOT_OUTPUT_SIZE 2048u
+
+typedef struct {
+    uint32_t op;
+    uint32_t running;           // READ: 1 while the command still runs
+    char username[32];
+    char password[64];
+    char command[256];
+    uint64_t ticket_ms_left;    // STATUS/AUTH/RUN
+    uint32_t output_length;     // READ
+    char output[SYS_ROOT_OUTPUT_SIZE];
+} syscall_root_t;
+
+// ===========================================
+// STORAGE DEVICES (SYS_STORAGE)
+// ===========================================
+//
+// rdi = syscall_storage_request_t*. Read-only view of the disks and
+// partitions the kernel knows (the 'disks' command shows the same). Used
+// by the MOSdesk Installer. Changing disks goes through SYS_ROOT commands
+// (part, format, install), which need an account password.
+#define SYS_STORAGE 41
+#define SYS_STORAGE_ABI_VERSION 1u
+
+#define SYS_STORAGE_LIST   1u   // fill devices[capacity], returns the count
+#define SYS_STORAGE_STATUS 2u   // install_payload, boot_device
+
+#define SYSCALL_STORAGE_KIND_DISK      0u
+#define SYSCALL_STORAGE_KIND_PARTITION 1u
+
+#define SYSCALL_STORAGE_TABLE_NONE 0u
+#define SYSCALL_STORAGE_TABLE_MBR  1u
+#define SYSCALL_STORAGE_TABLE_GPT  2u
+
+// fs: 0 unknown, 1 empty, 2 MinimaFS, 3 FAT, 4 partitioned
+#define SYSCALL_STORAGE_FLAG_BOOT  (1u << 0)   // holds the running system (0:)
+#define SYSCALL_STORAGE_FLAG_IN_USE (1u << 1)  // it or a partition on it is mounted
+
+typedef struct {
+    char name[16];          // "sata0", "nvme0p2"
+    char parent[16];        // partitions: their disk
+    char model[41];
+    char label[37];
+    uint8_t kind;
+    uint8_t table;          // disks
+    uint8_t fs;
+    uint8_t part_kind;      // partitions: 0 minimafs, 1 esp, 2 biosboot, 3 fat, 4 other
+    int32_t mounted_drive;  // -1 if not mounted
+    uint32_t flags;
+    uint32_t sector_size;
+    uint64_t size_bytes;
+} syscall_storage_device_t;
+
+typedef struct {
+    uint32_t size;          // sizeof(syscall_storage_request_t)
+    uint32_t version;       // SYS_STORAGE_ABI_VERSION
+    uint32_t op;
+    uint32_t capacity;
+    syscall_storage_device_t* devices;
+    uint32_t install_payload;   // STATUS: 1 when 'install' can run
+    char boot_device[16];       // STATUS: device mounted as 0:
+} syscall_storage_request_t;
 
 #endif // SYSCALL_H

@@ -121,7 +121,8 @@ if [ "$WORKER" -eq 1 ]; then
     PROGRAM_NAME=dlrconnect
 fi
 
-BUILD_DIR="$SCRIPT_DIR/build"
+# One directory per program: several builds may run at once (make -j).
+BUILD_DIR="$SCRIPT_DIR/build/$PROGRAM_NAME"
 CRT_OBJECT="$BUILD_DIR/crt0.o"
 SLIB_CRT_OBJECT="$BUILD_DIR/slibcrt.o"
 SLIB_CRT_OBJECT="$BUILD_DIR/slibcrt.o"

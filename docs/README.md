@@ -22,6 +22,8 @@ truth; these pages describe them as of SDK v1.1 and the kernel's
 | [System information](sysinfo.md) | `user_sysinfo.h` | CPU, RAM, heap, cores, uptime, processes |
 | [Packages](packages.md) | `minimalos.h` | `.mpkg` archives: unzip, zip, inspect |
 | [Device managers](managers.md) | `x86_64/user_managers.h` | GPU, audio, storage and USB manager calls |
+| [FarcadeGL 3D](farcadegl.md) | `farcadegl.h`, `fgpu_abi.h` | GPU-backed 3D: buffers, matrices, lighting, drawing into a window or the screen |
+| [Disks and root commands](storage.md) | `storage.h` | List disks and partitions, run kernel commands as root (installer) |
 
 ## Reading an entry
 
