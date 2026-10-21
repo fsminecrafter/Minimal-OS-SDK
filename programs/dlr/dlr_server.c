@@ -387,115 +387,164 @@ int dlr_server_child(int argc, char** argv) {
 
 /* --- accept loop -------------------------------------------------------- */
 
-static volatile int g_stop = 0;
-static void on_interrupt(void) { g_stop = 1; }
+int dlr_server_cfg_set(dlr_server_cfg* cfg, const char* name, const char* password,
+                       int port, int tls) {
+    dlr_server_cfg_default(cfg);
+    if (name && name[0]) sanitize_field(cfg->name, sizeof(cfg->name), name);
+    if (password && password[0]) hex_of_password(password, cfg->pw_hash);
+    if (port < 0 || port > 65535) return 0;
+    if (port) cfg->port = (uint16_t)port;
+    // Clients decide TLS-or-not from the port alone, so the two must agree.
+    if (tls) {
+        if (port && port != DLR_TLS_PORT) return 0;
+        cfg->tls = 1;
+        cfg->port = DLR_TLS_PORT;
+    }
+    if (cfg->port == DLR_TLS_PORT) cfg->tls = 1;
+    return 1;
+}
 
-int dlr_server_run(const dlr_server_cfg* cfg) {
-    long listener = dlr_tcp_listen(cfg->port);
-    if (listener == DLR_INVALID) {
+int dlr_server_start(dlr_server_state* st, const dlr_server_cfg* cfg) {
+    memset(st->children, 0, sizeof(st->children));
+    st->cfg = *cfg;
+    st->udp = DLR_INVALID;
+    st->next_hello = 0;
+    st->next_reap = 0;
+    st->accept_errors = 0;
+    st->clients_served = 0;
+
+    st->listener = dlr_tcp_listen(cfg->port);
+    if (st->listener == DLR_INVALID) {
         printf("dlr: cannot listen on port %u (already in use, or no network)\n", cfg->port);
-        return 1;
+        return 0;
     }
 
     // Discovery hello. Optional: without it clients can still add the
     // server by address.
-    long udp = dlr_udp_open(DLR_HELLO_SRC_PORT);
-    if (udp == DLR_INVALID) printf("dlr: discovery broadcast disabled (could not open UDP)\n");
+    st->udp = dlr_udp_open(DLR_HELLO_SRC_PORT);
+    if (st->udp == DLR_INVALID) printf("dlr: discovery broadcast disabled (could not open UDP)\n");
 
-    char hello[DLR_NAME_MAX + 32];
     {
-        size_t p = put_str(hello, sizeof(hello), 0, "DLR|");
-        p = put_str(hello, sizeof(hello), p, cfg->name);
-        p = put_str(hello, sizeof(hello), p, cfg->pw_hash[0] ? "|1|" : "|0|");
-        p = put_uint(hello, sizeof(hello), p, cfg->port);
-        put_str(hello, sizeof(hello), p, "\n");
+        size_t p = put_str(st->hello, sizeof(st->hello), 0, "DLR|");
+        p = put_str(st->hello, sizeof(st->hello), p, st->cfg.name);
+        p = put_str(st->hello, sizeof(st->hello), p, st->cfg.pw_hash[0] ? "|1|" : "|0|");
+        p = put_uint(st->hello, sizeof(st->hello), p, st->cfg.port);
+        put_str(st->hello, sizeof(st->hello), p, "\n");
     }
 
     // What every child needs to know. Passed on the command line as the
     // password HASH, never the password.
-    const char* child_args[6];
-    int child_argc = 0;
-    child_args[child_argc++] = "--name";
-    child_args[child_argc++] = cfg->name;
-    if (cfg->pw_hash[0]) {
-        child_args[child_argc++] = "--pwhash";
-        child_args[child_argc++] = cfg->pw_hash;
+    st->child_argc = 0;
+    st->child_args[st->child_argc++] = "--name";
+    st->child_args[st->child_argc++] = st->cfg.name;
+    if (st->cfg.pw_hash[0]) {
+        st->child_args[st->child_argc++] = "--pwhash";
+        st->child_args[st->child_argc++] = st->cfg.pw_hash;
     }
-    if (cfg->tls) child_args[child_argc++] = "--tls";
+    if (st->cfg.tls) st->child_args[st->child_argc++] = "--tls";
+    return 1;
+}
 
-    long children[DLR_MAX_CLIENTS];
-    for (int i = 0; i < DLR_MAX_CLIENTS; i++) children[i] = 0;
+int dlr_server_poll(dlr_server_state* st) {
+    if (st->listener == DLR_INVALID) return -1;
+    uint64_t now = dlr_now_ms();
+
+    if (st->udp != DLR_INVALID && now >= st->next_hello) {
+        if (!dlr_udp_broadcast(st->udp, DLR_DISCOVERY_PORT, st->hello,
+                               (uint32_t)strlen(st->hello))) {
+            printf("dlr: discovery broadcast send failed\n");
+        }
+        st->next_hello = now + DLR_HELLO_INTERVAL_MS;
+    }
+
+    // Forget children that have finished. Listing processes is a
+    // syscall, so not on every 10 ms pass.
+    if (now >= st->next_reap) {
+        for (int i = 0; i < DLR_MAX_CLIENTS; i++) {
+            if (st->children[i] && !dlr_proc_alive(st->children[i])) st->children[i] = 0;
+        }
+        st->next_reap = now + 250;
+    }
+
+    int free_slot = -1;
+    for (int i = 0; i < DLR_MAX_CLIENTS && free_slot < 0; i++) {
+        if (!st->children[i]) free_slot = i;
+    }
+    if (free_slot < 0) return 0;
+
+    long conn = DLR_INVALID;
+    uint32_t ip = 0;
+    int r = dlr_tcp_accept(st->listener, &conn, &ip);
+    if (r < 0) {
+        printf("dlr: accept failed\n");
+        // A persistent error means the listener is gone (the kernel
+        // reclaimed it, or the NIC went away).
+        if (++st->accept_errors > 50) {
+            printf("dlr: listener failed, stopping\n");
+            dlr_server_stop(st);
+            return -1;
+        }
+        return 0;
+    }
+    if (r == 0) return 0;
+
+    printf("dlr: accepted connection from %u\n", ip);
+    st->accept_errors = 0;
+    st->clients_served++;
+    long pid = DLR_INVALID;
+#ifndef MINIMALOS_TARGET
+    pid = dlr_spawn_conn(conn, ip, st->child_args, st->child_argc);
+#endif
+    if (pid != DLR_INVALID) {
+        st->children[free_slot] = pid;
+        return 1;
+    }
+
+    printf("dlr: handler process unavailable; serving client inline\n");
+    if (st->on_client) st->on_client(st->user, ip);
+    if (st->cfg.tls) {
+        conn = dlr_tls_accept(conn);         // consumes conn either way
+        if (conn == DLR_INVALID) return 1;
+    }
+    dlr_server_session(conn, &st->cfg, ip);
+    return 1;
+}
+
+void dlr_server_stop(dlr_server_state* st) {
+    if (st->listener != DLR_INVALID) dlr_tcp_unlisten(st->listener);
+    if (st->udp != DLR_INVALID) dlr_udp_close(st->udp);
+    st->listener = DLR_INVALID;
+    st->udp = DLR_INVALID;
+}
+
+static volatile int g_stop = 0;
+static void on_interrupt(void) { g_stop = 1; }
+
+int dlr_server_run(const dlr_server_cfg* cfg) {
+    static dlr_server_state st;
+    memset(&st, 0, sizeof(st));
+    if (!dlr_server_start(&st, cfg)) return 1;
 
     dlr_on_interrupt(on_interrupt);
 
-        printf("dlr: serving '%s' on port %u%s%s (Ctrl+C to stop)\n",
-            cfg->name, cfg->port, cfg->tls ? " [ktls]" : "",
-            cfg->pw_hash[0] ? ", password required" : "");
-
-    uint64_t next_hello = 0, next_reap = 0;
-    int accept_errors = 0;
+    printf("dlr: serving '%s' on port %u%s%s (Ctrl+C to stop)\n",
+           st.cfg.name, st.cfg.port, st.cfg.tls ? " [ktls]" : "",
+           st.cfg.pw_hash[0] ? ", password required" : "");
 
     while (!g_stop) {
-        uint64_t now = dlr_now_ms();
+        int got = dlr_server_poll(&st);
+        if (got < 0) break;
 
-        if (udp != DLR_INVALID && now >= next_hello) {
-            if (!dlr_udp_broadcast(udp, 4243, hello, (uint32_t)strlen(hello))) {
-                printf("dlr: discovery broadcast send failed\n");
-            }
-            next_hello = now + DLR_HELLO_INTERVAL_MS;
-        }
-
-        // Forget children that have finished. Listing processes is a
-        // syscall, so not on every 10 ms pass.
-        if (now >= next_reap) {
-            for (int i = 0; i < DLR_MAX_CLIENTS; i++) {
-                if (children[i] && !dlr_proc_alive(children[i])) children[i] = 0;
-            }
-            next_reap = now + 250;
-        }
-
-        int active = 0, free_slot = -1;
-        for (int i = 0; i < DLR_MAX_CLIENTS; i++) {
-            if (children[i]) active++;
-            else if (free_slot < 0) free_slot = i;
-        }
-
-        int got = 0;
-        if (free_slot >= 0) {
-            long conn = DLR_INVALID;
-            uint32_t ip = 0;
-            int r = dlr_tcp_accept(listener, &conn, &ip);
-
-            if (r == 1) {
-                got = 1;
-                printf("dlr: accepted connection from %u\n", ip);
-                accept_errors = 0;
-                long pid = DLR_INVALID;
-#ifndef MINIMALOS_TARGET
-                pid = dlr_spawn_conn(conn, ip, child_args, child_argc);
-#endif
-                if (pid == DLR_INVALID) {
-                    printf("dlr: handler process unavailable; serving client inline\n");
-                    dlr_server_session(conn, cfg, ip);
-                } else {
-                    children[free_slot] = pid;
-                }
-            } else if (r < 0) {
-                printf("dlr: accept failed\n");
-                // A persistent error means the listener is gone (the
-                // kernel reclaimed it, or the NIC went away).
-                if (++accept_errors > 50) { printf("dlr: listener failed, stopping\n"); break; }
-            }
-        }
+        int busy = 1;
+        for (int i = 0; i < DLR_MAX_CLIENTS; i++) if (!st.children[i]) busy = 0;
 
         // With every slot busy there is nothing to accept, so idle
         // gently; otherwise poll fast enough that a connect does not
         // wait noticeably.
-        dlr_sleep_ms(got ? 1 : (free_slot >= 0 ? 10 : 50));
+        dlr_sleep_ms(got ? 1 : (busy ? 50 : 10));
     }
 
     printf("dlr: stopping\n");
-    dlr_tcp_unlisten(listener);
-    if (udp != DLR_INVALID) dlr_udp_close(udp);
+    dlr_server_stop(&st);
     return 0;
 }

@@ -38,6 +38,46 @@ void dlr_server_cfg_default(dlr_server_cfg* cfg);
 // one that was not.
 int dlr_server_parse_args(int argc, char** argv, int start, dlr_server_cfg* cfg, const char** bad);
 
+// Fills a configuration without going through argv (what --name,
+// --password, --port and --tls do). `port` 0 means the default; an
+// empty password means none. Returns 0 if the port and TLS disagree.
+int dlr_server_cfg_set(dlr_server_cfg* cfg, const char* name, const char* password,
+                       int port, int tls);
+
+/*
+ * The accept loop in pieces, for a program that has its own main loop
+ * (the Deliver Manager app): start, then poll every few milliseconds,
+ * then stop. dlr_server_run below is exactly that with a sleep.
+ */
+typedef struct {
+    dlr_server_cfg cfg;
+    long     listener;
+    long     udp;
+    char     hello[DLR_NAME_MAX + 32];
+    const char* child_args[6];
+    int      child_argc;
+    long     children[DLR_MAX_CLIENTS];
+    uint64_t next_hello;
+    uint64_t next_reap;
+    int      accept_errors;
+    unsigned clients_served;
+
+    // Called just before a client is served inside this process (which
+    // blocks until the client leaves). May be NULL.
+    void   (*on_client)(void* user, uint32_t peer_ip);
+    void*    user;
+} dlr_server_state;
+
+// Listens and prepares the discovery hello. The state must stay where it
+// is until dlr_server_stop. Returns 1 on success.
+int  dlr_server_start(dlr_server_state* st, const dlr_server_cfg* cfg);
+
+// One pass: discovery hello when due, then at most one accept. Returns
+// 1 if a client was handled, 0 if nobody was waiting, -1 if the
+// listener has failed (the server is then stopped).
+int  dlr_server_poll(dlr_server_state* st);
+void dlr_server_stop(dlr_server_state* st);
+
 // Accept loop. Runs until interrupted; returns a process exit code.
 int dlr_server_run(const dlr_server_cfg* cfg);
 

@@ -11,7 +11,7 @@ gcc -O1 -g -Wall -Wextra -Wno-unused-parameter \
     \
     "$SRC/main.c" "$SRC/dlr_proto.c" "$SRC/dlr_crypto.c" \
     "$SRC/dlr_tar.c" "$SRC/dlr_mpkg.c" "$SRC/dlr_pkg.c" "$SRC/dlr_db.c" \
-    "$SRC/dlr_registry.c" "$SRC/dlr_server.c" \
+    "$SRC/dlr_registry.c" "$SRC/dlr_server.c" "$SRC/dlr_client.c" \
     "$HERE/dlr_port_host.c" \
     -o "$HERE/dlr-host"
 echo "Built $HERE/dlr-host"

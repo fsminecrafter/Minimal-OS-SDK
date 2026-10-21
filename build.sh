@@ -314,6 +314,12 @@ if [ "$SLIB" -eq 1 ]; then
     echo "Built shared library $OUTPUT"
 else
     mkdir -p "$(dirname -- "$OUTPUT")"
+    # A program folder's Resources/ (icon.bmp, fonts, ...) goes into the
+    # bundle; runbundle.py picks it up from beside the ELF.
+    rm -rf "$BUILD_DIR/Resources"
+    if [ "$SOURCE_WAS_DIR" -eq 1 ] && [ -d "$SOURCE_ROOT/Resources" ]; then
+        cp -R "$SOURCE_ROOT/Resources" "$BUILD_DIR/Resources"
+    fi
     "$SCRIPT_DIR/mkrun.sh" "$ELF" "$OUTPUT"
     echo "Built $OUTPUT"
 fi

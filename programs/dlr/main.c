@@ -28,6 +28,7 @@
 #include "dlr_crypto.h"
 #include "dlr_registry.h"
 #include "dlr_server.h"
+#include "dlr_client.h"
 
 #include "minimalos.h"
 #include "stdio.h"
@@ -559,74 +560,6 @@ static int cmd_servers_tui(const char* password) {
 
 /* --- install ------------------------------------------------------------ */
 
-typedef struct {
-    const char* target_dir;
-    const dlr_pkg* pkg;
-    const char* requested_name;  /* the name passed to `dlr install` */
-    int only_listed;         /* honour pkg->mos_copy */
-    int written;
-    int skipped;
-} install_ctx;
-
-static int name_in_copy_list(const dlr_pkg* pkg, const char* name) {
-    const char* cursor = pkg->mos_copy;
-    char entry[128];
-    while (dlr_pkg_next_copy_entry(&cursor, entry, sizeof(entry))) {
-        if (strcmp(entry, name) == 0) return 1;
-    }
-    return 0;
-}
-
-/*
- * Reduces a tar entry to the path a package author actually wrote in
- * `copy=`. Two wrapper conventions exist in the wild and both get
- * stripped here, in order:
- *
- *  - `tar -cf x -C dir .` (a hand-built package, or the SDK's own
- *    build.sh output) prefixes every entry with "./".
- *
- *  - `dlr_server presentfolder <dir> <name>` - the common case, and
- *    what a real dlr_server does - tars from its data directory with
- *    every entry prefixed "<name>/", one path component. Stripping it
- *    only when it equals the package's own name (not blindly stripping
- *    the first component of every archive) avoids mangling a package
- *    that has a real top-level directory of its own.
- *
- * The result is used for both copy= matching and the installed path,
- * so a package author writing `copy=hello.txt` and a client unpacking
- * `mostest/hello.txt` agree on what "hello.txt" means.
- */
-static const char* canonical_rel(const char* name, const char* pkg_name,
-                                 const char* requested_name,
-                                 char* scratch, size_t scratch_size) {
-    if (name[0] == '.' && name[1] == '/') name += 2;
-
-    // The server always tars from its data directory using the NAME
-    // IT WAS PRESENTED AS (build_tar() in package_registry.cpp), which
-    // is the name the user passed to `dlr install`, not necessarily
-    // the manifest's own [Info] name= - those are usually the same but
-    // are not required to be. Try the requested name first since it is
-    // the one guaranteed to match server behaviour; fall back to the
-    // manifest name for a hand-built archive with no server involved.
-    const char* candidates[2] = { requested_name, pkg_name };
-    for (int i = 0; i < 2; i++) {
-        const char* cand = candidates[i];
-        if (!cand || !cand[0]) continue;
-        size_t plen = strlen(cand);
-        if (strncmp(name, cand, plen) == 0 && name[plen] == '/') {
-            name += plen + 1;
-            break;
-        }
-    }
-
-    if (!name[0]) return ".";
-    size_t n = strlen(name);
-    if (n >= scratch_size) n = scratch_size - 1;
-    memcpy(scratch, name, n);
-    scratch[n] = '\0';
-    return scratch;
-}
-
 static int join_path(char* out, size_t cap, const char* dir, const char* rel) {
     size_t n = 0;
     for (const char* p = dir; *p && n + 1 < cap; p++) out[n++] = *p;
@@ -634,90 +567,6 @@ static int join_path(char* out, size_t cap, const char* dir, const char* rel) {
     for (const char* p = rel; *p && n + 1 < cap; p++) out[n++] = *p;
     if (n + 1 >= cap) return 0;
     out[n] = '\0';
-    return 1;
-}
-
-// Creates every parent directory of a file path.
-static int ensure_parent(const char* path) {
-    char dir[256];
-    size_t n = strlen(path);
-    if (n >= sizeof(dir)) return 0;
-
-    memcpy(dir, path, n + 1);
-    char* slash = 0;
-    for (size_t i = 0; i < n; i++) if (dir[i] == '/') slash = dir + i;
-    if (!slash) return 1;
-    *slash = '\0';
-    return dlr_mkdirs(dir);
-}
-
-static int install_on_dir(void* user, const char* name) {
-    install_ctx* ctx = (install_ctx*)user;
-    char scratch[256];
-    const char* rel = canonical_rel(name, ctx->pkg->name, ctx->requested_name,
-                                    scratch, sizeof(scratch));
-    if (!rel[0] || strcmp(rel, ".") == 0) return 1;
-
-    char full[256];
-    if (!join_path(full, sizeof(full), ctx->target_dir, rel)) return 1;
-    dlr_mkdirs(full);
-    return 1;
-}
-
-static int install_on_file(void* user, const char* name, const uint8_t* data, uint32_t len) {
-    install_ctx* ctx = (install_ctx*)user;
-    char scratch[256];
-    const char* rel = canonical_rel(name, ctx->pkg->name, ctx->requested_name,
-                                    scratch, sizeof(scratch));
-
-    // The manifest travels inside the bundle; it is metadata, not
-    // payload, so it does not get installed.
-    size_t rel_len = strlen(rel);
-    if (rel_len > 4 && strcmp(rel + rel_len - 4, ".pkg") == 0) return 1;
-
-    if (ctx->only_listed && !name_in_copy_list(ctx->pkg, rel)) {
-        ctx->skipped++;
-        return 1;
-    }
-
-    char full[256];
-    if (!join_path(full, sizeof(full), ctx->target_dir, rel)) {
-        printf("  ! path too long: %s\n", rel);
-        return 1;
-    }
-    if (!ensure_parent(full)) {
-        printf("  ! cannot create directory for %s\n", rel);
-        return 1;
-    }
-
-    if (!dlr_file_put(full, data, len)) {
-        printf("  ! write failed: %s\n", full);
-        return 0;                       // aborts extraction
-    }
-
-    printf("  -> %s (%u bytes)\n", full, len);
-    ctx->written++;
-    return 1;
-}
-
-/* First pass: locate and parse the .pkg manifest. */
-typedef struct {
-    dlr_pkg* pkg;
-    int found;
-} manifest_ctx;
-
-static int manifest_on_file(void* user, const char* name, const uint8_t* data, uint32_t len) {
-    manifest_ctx* ctx = (manifest_ctx*)user;
-    const char* rel = (name[0] == '.' && name[1] == '/') ? name + 2 : name;
-    size_t n = strlen(rel);
-    if (n > 4 && strcmp(rel + n - 4, ".pkg") == 0 && !ctx->found) {
-        ctx->found = dlr_pkg_parse((const char*)data, len, ctx->pkg);
-    }
-    return 1;
-}
-
-static int manifest_on_dir(void* user, const char* name) {
-    (void)user; (void)name;
     return 1;
 }
 
@@ -734,169 +583,25 @@ static void progress(uint64_t received, uint64_t total) {
     }
 }
 
+static void cli_log(void* user, const char* line) {
+    (void)user;
+    printf("%s\n", line);
+}
+
+static void cli_progress(void* user, uint64_t received, uint64_t total) {
+    (void)user;
+    progress(received, total);
+}
+
 static int cmd_install(const char* pkg_name, const char* server_name,
                        const char* password, int force) {
     load_servers();
     dlr_server* srv = pick_server(server_name);
     if (!srv) return 1;
 
-    if (!dlr_mkdirs(DLR_CACHE_DIR)) {
-        printf("dlr: cannot create %s\n", DLR_CACHE_DIR);
-        return 1;
-    }
-
-    dlr_session s;
-    if (!open_session(&s, srv, password)) return 1;
-
-    printf("Requesting '%s' from '%s' ...\n", pkg_name, s.server_name);
     g_last_report = 0;
-
-    char err[128];
-    err[0] = '\0';
-    int format = DLR_FORMAT_TAR;
-    int rc = dlr_download(&s, pkg_name, DLR_STAGE_FILE, progress, &format, err, sizeof(err));
-    close_session(&s);
-
-    if (rc == -1) {
-        printf("dlr: server refused: %s\n", err);
-        return 1;
-    }
-    if (rc != 1) {
-        printf("dlr: download failed: %s\n", err[0] ? err : "unknown error");
-        return 1;
-    }
-    printf("Download verified (SHA-256 matches).\n");
-
-    long size = dlr_file_size(DLR_STAGE_FILE);
-    if (size <= 0) {
-        printf("dlr: staged file is empty\n");
-        return 1;
-    }
-
-    uint8_t* archive = (uint8_t*)malloc((size_t)size);
-    if (!archive) {
-        printf("dlr: out of memory for a %u KiB archive\n", (unsigned)(size / 1024));
-        return 1;
-    }
-    if (dlr_file_slurp(DLR_STAGE_FILE, archive, (uint32_t)size) != size) {
-        printf("dlr: cannot read staged archive\n");
-        free(archive);
-        return 1;
-    }
-
-    // A Minimal-OS server says "FORMAT=mpkg"; every other server sends
-    // a tar without saying so. Trust the magic bytes over the header
-    // if they disagree - an .mpkg is unmistakable and a tar never
-    // starts with them, so the file itself is the better witness.
-    if (dlr_mpkg_is_archive(archive, (size_t)size)) format = DLR_FORMAT_MPKG;
-    long (*extract)(const uint8_t*, size_t, const dlr_tar_sink*) =
-        (format == DLR_FORMAT_MPKG) ? dlr_mpkg_extract_mem : dlr_tar_extract_mem;
-    const char* format_name = (format == DLR_FORMAT_MPKG) ? ".mpkg" : "tar";
-
-    // Pass 1: manifest.
-    dlr_pkg pkg;
-    manifest_ctx mctx = { &pkg, 0 };
-    dlr_tar_sink msink = { manifest_on_file, manifest_on_dir, &mctx };
-    if (extract(archive, (size_t)size, &msink) < 0) {
-        printf("dlr: the package is not a readable %s archive\n", format_name);
-        free(archive);
-        return 1;
-    }
-
-    if (!mctx.found) {
-        printf("dlr: no .pkg manifest inside the bundle\n");
-        free(archive);
-        return 1;
-    }
-
-    printf("Package: %s %s\n", pkg.name, pkg.version[0] ? pkg.version : "");
-    if (pkg.description[0]) printf("  %s\n", pkg.description);
-
-    const char* why = "";
-    if (!dlr_pkg_runs_here(&pkg, &why)) {
-        printf("dlr: %s\n", why);
-        printf("     (arch=%s os=%s)\n",
-               pkg.arch[0] ? pkg.arch : "any",
-               pkg.operatingsystem[0] ? pkg.operatingsystem : "any");
-        if (!force) {
-            printf("     Refusing. Pass --force to install anyway.\n");
-            free(archive);
-            return 1;
-        }
-        printf("     --force given; installing regardless.\n");
-    }
-
-    if (!pkg.has_minimalos_section) {
-        // Not fatal: a package of plain data files installs fine with
-        // the defaults. It is worth saying out loud, though, because
-        // anything relying on installscript/installcommand will not
-        // have run.
-        printf("Note: no [Install.minimalos] section; copying everything to %s.\n",
-               DLR_INSTALL_DIR);
-    }
-
-    install_ctx ctx;
-    memset(&ctx, 0, sizeof(ctx));
-    ctx.pkg = &pkg;
-    ctx.requested_name = pkg_name;
-    ctx.target_dir = pkg.mos_target[0] ? pkg.mos_target : DLR_INSTALL_DIR;
-    ctx.only_listed = pkg.mos_copy[0] ? 1 : 0;
-
-    if (!dlr_mkdirs(ctx.target_dir)) {
-        printf("dlr: cannot create %s\n", ctx.target_dir);
-        free(archive);
-        return 1;
-    }
-
-    printf("Installing into %s ...\n", ctx.target_dir);
-    dlr_tar_sink isink = { install_on_file, install_on_dir, &ctx };
-    long entries = extract(archive, (size_t)size, &isink);
-    free(archive);
-
-    if (entries < 0) {
-        printf("dlr: extraction aborted\n");
-        return 1;
-    }
-
-    printf("Installed %d file(s)%s.\n", ctx.written,
-           ctx.skipped ? " (some skipped by copy=)" : "");
-
-    dlr_remove(DLR_STAGE_FILE);
-
-    if (pkg.mos_run[0]) {
-        char run_path[256];
-        const char* target = pkg.mos_run;
-
-        // An absolute MinimaFS path is used as-is; a bare name is
-        // resolved inside the install directory. A package cannot ask
-        // us to run something it did not ship.
-        if (strchr(target, ':')) {
-            size_t n = strlen(target);
-            if (n >= sizeof(run_path)) { printf("dlr: run= path too long\n"); return 1; }
-            memcpy(run_path, target, n + 1);
-        } else if (!join_path(run_path, sizeof(run_path), ctx.target_dir, target)) {
-            printf("dlr: run= path too long\n");
-            return 1;
-        }
-
-        if (!dlr_exists(run_path)) {
-            printf("dlr: run= names '%s', which the package did not install\n", run_path);
-            return 1;
-        }
-
-        printf("Running %s ...\n", run_path);
-        long pid = dlr_exec(run_path);
-        if (pid == DLR_INVALID) {
-            printf("dlr: could not launch it (SYS_EXEC failed)\n");
-            return 1;
-        }
-        if (!dlr_exec_wait(pid, 30000)) {
-            printf("dlr: post-install program is still running after 30s; leaving it.\n");
-        }
-    }
-
-    printf("Done.\n");
-    return 0;
+    dlr_io io = { cli_log, cli_progress, 0 };
+    return dlr_client_install(srv, password, pkg_name, force, &io) ? 0 : 1;
 }
 
 static int cmd_download(const char* pkg_name, const char* server_name,
@@ -1055,6 +760,14 @@ static void usage(void) {
 int main(int argc, char** argv) {
     // argv[0] is the .run path, so the command is argv[1].
     if (argc < 2) { usage(); return 0; }
+
+    // Per-connection mode. On Minimal-OS the server starts
+    // dlrconnect.run for this; the host test backend re-runs this
+    // program instead.
+    if (strcmp(argv[1], "--conn") == 0) {
+        if (dlr_port_init() != 0) return 1;
+        return dlr_server_child(argc, argv);
+    }
 
     // `serve` has its own options (--name/--port/--password), so it is
     // dispatched before the generic loop below can misfile them as

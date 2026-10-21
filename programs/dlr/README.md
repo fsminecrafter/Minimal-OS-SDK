@@ -37,6 +37,8 @@ The store is `0:/var/dlrd/packages/`: one directory per package plus `<name>.mpk
 
 `serve` broadcasts a hello every 5 s (which is what `dlr scan` on other machines hears) and accepts connections. Each client is served by its **own process** (`dlrconnect.run --conn <handle> <ip> ...`); the kernel hands the connection over and closes it if that process dies. At most 3 clients are served at once, and a client that is silent for 5 s during the handshake is dropped.
 
+For a window instead of commands, see [Deliver Manager](../delivermanager/README.md) (`0:/programs/DeliverManager.run`).
+
 ## Archive format
 
 A Minimal-OS server sends its native **`.mpkg`**; Linux and Windows servers send a tar. This client reads both. The first `INSTALL_DATA` frame says which:
@@ -57,7 +59,8 @@ Clients that predate the field still read the size (they stop at the first non-d
 
 | file | role |
 |---|---|
-| `main.c` | commands, install pass |
+| `main.c` | commands |
+| `dlr_client.c` | connecting, package lists, the install pass (shared with Deliver Manager) |
 | `dlr_proto.c` | framing, session, requests |
 | `dlr_crypto.c` | SHA-256, AES-256-GCM, base64 (no heap use per frame) |
 | `dlr_tar.c`, `dlr_mpkg.c` | in-memory extractors feeding the same install pass |

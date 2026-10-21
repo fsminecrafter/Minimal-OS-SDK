@@ -69,6 +69,10 @@ This writes `../src/resources/install2/dlr.run`, which is installed as
 same kernel-linked minimaSSL implementation as `wget`; the matching library
 bundle is installed at `0:/etc/minimaSSL.slib`.
 
+`programs/delivermanager` is Deliver Manager, a MOSdesk app for the same
+thing (getting and sharing Deliver packages) built from the same code. The
+image build installs it as `0:/programs/DeliverManager.run`.
+
 Build a shared library with `--slib`:
 
     ./build.sh --slib libraries/math
@@ -114,6 +118,8 @@ The `.run` file uses the `MINIRUN1` format. Its manifest contains `main.elf`
 and every file below a `Resources` directory when those files exist. The
 manifest and payload are stored in the same regular file, so copying or
 importing the bundle does not require creating a directory tree.
+`build.sh` copies a program folder's `Resources/` directory into its bundle,
+so `programs/<name>/Resources/icon.bmp` becomes the app's desktop icon.
 
 For the C++ example, compile with the same freestanding flags plus the C++
 runtime restrictions:
