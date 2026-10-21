@@ -10,7 +10,7 @@
  * fglCreateShader() calls this for you; use it directly only to
  * precompile shaders or inspect the result.
  *
- *     static fglsl_program_t prog;           // large: ~100 KiB, don't put it on the stack
+ *     static fglsl_program_t prog;           // large: ~160 KiB, keep it off the stack
  *     if (fglsl_compile(&prog, vertex_src, fragment_src) != 0)
  *         print(prog.error);
  *     // prog.words / prog.size: the blob; prog.uniforms: where each uniform lives
@@ -413,7 +413,18 @@ static uint32_t fglsl__dst(fglsl__val d, int comps) {
 }
 
 // Places pending jumps here.
-static void fglsl__patch(fglsl_program_t* c, const uint32_t* list, int n) {
+static void fglsl__patch(fglsl_program_t* c, uint32_t* list, int n) {
+    // A jump that is the last instruction would land on the next one:
+    // drop it (e.g. "return" at the end of an inlined function).
+    for (;;) {
+        int found = -1;
+        for (int i = 0; i < n; i++)
+            if (c->count && list[i] == c->count - 1 &&
+                c->code[(size_t)(c->count - 1) * FGPU_SHADER_INSTRUCTION_WORDS] == FGPU_SOP_JMP) found = i;
+        if (found < 0 || c->label_pc == c->count) break;
+        c->count--;
+        list[found] = list[--n];
+    }
     for (int i = 0; i < n; i++) c->code[(size_t)list[i] * FGPU_SHADER_INSTRUCTION_WORDS + 1] = c->count;
     c->label_pc = c->count;
 }
@@ -1166,13 +1177,14 @@ static void fglsl__declaration(fglsl_program_t* c, int type, int is_const) {
         var.count = count;
         var.lvalue = 1;
         int mark = c->ntemp;
-        // Start at zero, so results never depend on old register contents.
-        fglsl__val zero = fglsl__scalar(c, 0.0f);
-        for (int r = 0; r < regs; r++)
-            fglsl__emit(c, FGPU_SOP_MOV, FGPU_DST(FGPU_FILE_TEMP, var.index + r, 0xF), fglsl__src(zero), 0, 0);
         if (!count && fglsl__accept(c, '=')) {
             fglsl__val v = fglsl__expr(c);
             fglsl__store(c, var, v);
+        } else {
+            // Start at zero, so results never depend on old register contents.
+            fglsl__val zero = fglsl__scalar(c, 0.0f);
+            for (int r = 0; r < regs; r++)
+                fglsl__emit(c, FGPU_SOP_MOV, FGPU_DST(FGPU_FILE_TEMP, var.index + r, 0xF), fglsl__src(zero), 0, 0);
         }
         c->ntemp = mark;
         if (is_const) var.lvalue = 0;
@@ -1666,7 +1678,7 @@ static int fglsl__stage(fglsl_program_t* c, const char* src, int fragment, uint3
     fglsl__block(c);
     if (c->err) return -1;
     fglsl__patch(c, rets, nrets);
-    if (c->count == 0 || c->label_pc == c->count) fglsl__emit(c, FGPU_SOP_NOP, 0, 0, 0, 0);
+    if (c->count == 0) fglsl__emit(c, FGPU_SOP_NOP, 0, 0, 0, 0);
     if (c->err) return -1;
     uint32_t words = c->count * FGPU_SHADER_INSTRUCTION_WORDS;
     if (*used + words > FGLSL_MAX_BLOB_WORDS) { fglsl__error(c, "program too large", 0); return -1; }

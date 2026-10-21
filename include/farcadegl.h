@@ -475,6 +475,49 @@ static inline void fglClear(FGLContext* gl, uint32_t bits) {
     fgl__emit(gl, FGPU_OP_CLEAR, p, sizeof(p));
 }
 
+// Writes a value into a shader's uniform registers (count elements of the
+// uniform's type, packed tightly in `v`).
+static inline void fgl__uniform_set(FGLShader* sh, int loc, uint32_t first, const float* v, uint32_t count) {
+    if (!sh || loc < 0 || (uint32_t)loc >= sh->uniform_count) return;
+    const fglsl_uniform_t* u = &sh->uniforms[loc];
+    if (u->type == FGLSL_SAMPLER) return;
+    uint32_t elems = u->array ? u->array : 1;
+    uint32_t floats = u->type == FGLSL_MAT4 ? 16u : (uint32_t)u->type;
+    uint32_t stride = u->type == FGLSL_MAT4 ? 4u : 1u;      // registers per element
+    for (uint32_t e = 0; e < count && first + e < elems; e++) {
+        float* dst = sh->values[u->reg + (first + e) * stride];
+        const float* src = v + e * floats;
+        if (u->type == FGLSL_MAT4) memcpy(dst, src, 64);
+        else for (uint32_t k = 0; k < floats; k++) dst[k] = src[k];
+    }
+    sh->dirty = 1;
+}
+
+static inline void fgl__builtin_uniforms(FGLContext* gl, FGLShader* sh, const fgpu_uniforms_t* u) {
+    FGLMat4 mv = fglMul(gl->view, gl->model);
+    for (int i = 0; i < FGL__U_COUNT; i++) {
+        int loc = sh->builtin[i];
+        if (loc < 0) continue;
+        float tmp[4] = { 0, 0, 0, 0 };
+        switch (i) {
+            case FGL__U_MVP:        fgl__uniform_set(sh, loc, 0, u->mvp, 1); break;
+            case FGL__U_MODEL:      fgl__uniform_set(sh, loc, 0, gl->model.m, 1); break;
+            case FGL__U_VIEW:       fgl__uniform_set(sh, loc, 0, gl->view.m, 1); break;
+            case FGL__U_PROJECTION: fgl__uniform_set(sh, loc, 0, gl->projection.m, 1); break;
+            case FGL__U_MODELVIEW:  fgl__uniform_set(sh, loc, 0, mv.m, 1); break;
+            case FGL__U_NORMAL:     fgl__uniform_set(sh, loc, 0, u->normal, 1); break;
+            case FGL__U_LIGHT_DIR:  fgl__uniform_set(sh, loc, 0, u->light_dir, 1); break;
+            case FGL__U_LIGHT_COLOR:fgl__uniform_set(sh, loc, 0, u->light_color, 1); break;
+            case FGL__U_AMBIENT:    fgl__uniform_set(sh, loc, 0, u->ambient, 1); break;
+            case FGL__U_CAMERA:     fgl__uniform_set(sh, loc, 0, u->camera_pos, 1); break;
+            case FGL__U_MATERIAL:
+                tmp[0] = gl->specular; tmp[1] = gl->shininess;
+                fgl__uniform_set(sh, loc, 0, tmp, 1);
+                break;
+        }
+    }
+}
+
 static inline void fgl__flush_state(FGLContext* gl) {
     if (gl->state_dirty) {
         uint32_t s = 0;
@@ -531,19 +574,11 @@ static inline void fgl__flush_state(FGLContext* gl) {
     }
     FGLShader* sh = gl->shader;
     if (sh && sh->registers && (sh->dirty || gl->uploaded != sh)) {
-        uint32_t head[2] = { 0, sh->registers };
-        uint32_t words = 1 + 2 + sh->registers * 4;
-        // Header and register values in one command.
-        if (gl->cmd_len + words > gl->cmd_cap) fgl__emit(gl, FGPU_OP_SET_CONSTANTS, 0, 0), gl->cmd_len--;
-        if (!gl->error) {
-            fgl__emit(gl, FGPU_OP_SET_CONSTANTS, head, sizeof(head));
-            gl->cmd_len -= 3;
-            uint32_t at = gl->cmd_len;
-            fgl__emit(gl, FGPU_OP_SET_CONSTANTS, 0, (2 + sh->registers * 4) * 4);
-            gl->cmd[at + 1] = head[0];
-            gl->cmd[at + 2] = head[1];
-            memcpy(gl->cmd + at + 3, sh->values, sh->registers * 16);
-        }
+        uint32_t buf[2 + FGPU_SHADER_MAX_UNIFORMS * 4];
+        buf[0] = 0;                     // first register
+        buf[1] = sh->registers;         // count
+        memcpy(buf + 2, sh->values, sh->registers * 16);
+        fgl__emit(gl, FGPU_OP_SET_CONSTANTS, buf, (2 + sh->registers * 4) * 4);
         sh->dirty = 0;
         gl->uploaded = sh;
     } else if (sh && !sh->registers) {
@@ -551,10 +586,203 @@ static inline void fgl__flush_state(FGLContext* gl) {
     }
 }
 
+/* ============================================================= shaders */
+
+static inline int fglSubmit(FGLContext* gl);
+
+// Compiles an FGSL vertex + fragment shader (docs/fgsl.md) and loads it
+// onto the GPU. Returns NULL on failure; fglShaderLog(gl) says why.
+static inline FGLShader* fglCreateShader(FGLContext* gl, const char* vertex_src, const char* fragment_src) {
+    gl->shader_log[0] = '\0';
+    fglsl_program_t* c = (fglsl_program_t*)malloc(sizeof(fglsl_program_t));
+    FGLShader* sh = (FGLShader*)calloc(1, sizeof(FGLShader));
+    if (!c || !sh) {
+        free(c);
+        free(sh);
+        strcpy(gl->shader_log, "out of memory");
+        return NULL;
+    }
+    if (fglsl_compile(c, vertex_src, fragment_src) != 0) {
+        memcpy(gl->shader_log, c->error, sizeof(gl->shader_log));
+        gl->shader_log[sizeof(gl->shader_log) - 1] = '\0';
+        free(c);
+        free(sh);
+        return NULL;
+    }
+    syscall_gpu_request_t r;
+    memset(&r, 0, sizeof(r));
+    r.op = SYS_GPU_CREATE_PROGRAM;
+    r.data = c->words;
+    r.bytes = c->size;
+    if (fgl__call(&r) != SYS_SUCCESS) {
+        strcpy(gl->shader_log, "the GPU rejected the program (see the serial log)");
+        free(c);
+        free(sh);
+        return NULL;
+    }
+    sh->handle = r.handle;
+    sh->uniform_count = c->uniform_count;
+    memcpy(sh->uniforms, c->uniforms, sizeof(sh->uniforms));
+    sh->registers = c->next_uniform_reg;
+    static const char* const names[FGL__U_COUNT] = {
+        "fgl_ModelViewProjection", "fgl_Model", "fgl_View", "fgl_Projection", "fgl_ModelView",
+        "fgl_NormalMatrix", "fgl_LightDirection", "fgl_LightColor", "fgl_Ambient",
+        "fgl_CameraPosition", "fgl_Material" };
+    for (int i = 0; i < FGL__U_COUNT; i++) sh->builtin[i] = fglsl_find_uniform(c, names[i]);
+    sh->dirty = 1;
+    free(c);
+    return sh;
+}
+
+// Why the last fglCreateShader failed ("" if it did not).
+static inline const char* fglShaderLog(FGLContext* gl) { return gl->shader_log; }
+
+static inline void fglUseShader(FGLContext* gl, FGLShader* sh) {
+    gl->shader = sh;
+    gl->state_dirty = 1;
+    gl->uniforms_dirty = 1;     // refresh its fgl_* uniforms
+}
+
+static inline void fglDestroyShader(FGLContext* gl, FGLShader* sh) {
+    if (!sh) return;
+    fglSubmit(gl);      // recorded commands may still use it
+    if (gl->shader == sh) fglUseProgram(gl, gl->program);
+    if (gl->uploaded == sh) gl->uploaded = NULL;
+    fgl__destroy(SYS_GPU_DESTROY_PROGRAM, sh->handle);
+    free(sh);
+}
+
+// Location of a uniform (an index for fglUniform*), or -1 if the shaders
+// do not declare it (or the compiler found it unused).
+static inline int fglUniformLocation(FGLShader* sh, const char* name) {
+    if (!sh) return -1;
+    for (uint32_t i = 0; i < sh->uniform_count; i++)
+        if (strcmp(sh->uniforms[i].name, name) == 0) return (int)i;
+    return -1;
+}
+
+// Uniform values belong to the shader and stay set until changed.
+static inline void fglUniform1f(FGLShader* sh, int loc, float x) {
+    float v[4] = { x, 0, 0, 0 };
+    fgl__uniform_set(sh, loc, 0, v, 1);
+}
+static inline void fglUniform2f(FGLShader* sh, int loc, float x, float y) {
+    float v[4] = { x, y, 0, 0 };
+    fgl__uniform_set(sh, loc, 0, v, 1);
+}
+static inline void fglUniform3f(FGLShader* sh, int loc, float x, float y, float z) {
+    float v[4] = { x, y, z, 0 };
+    fgl__uniform_set(sh, loc, 0, v, 1);
+}
+static inline void fglUniform4f(FGLShader* sh, int loc, float x, float y, float z, float w) {
+    float v[4] = { x, y, z, w };
+    fgl__uniform_set(sh, loc, 0, v, 1);
+}
+static inline void fglUniformVec3(FGLShader* sh, int loc, FGLVec3 v) { fglUniform3f(sh, loc, v.x, v.y, v.z); }
+static inline void fglUniformMatrix4(FGLShader* sh, int loc, FGLMat4 m) { fgl__uniform_set(sh, loc, 0, m.m, 1); }
+// `count` elements of the uniform's type (an array), tightly packed
+// (vec3 = 3 floats, mat4 = 16), starting at element `first`.
+static inline void fglUniformArray(FGLShader* sh, int loc, uint32_t first, const float* values, uint32_t count) {
+    fgl__uniform_set(sh, loc, first, values, count);
+}
+
+/* ============================================================ textures */
+
+// Creates a texture from width x height ARGB8888 pixels (rows packed);
+// pixels may be NULL (black). Up to 4096 x 4096. Returns 0 on failure.
+static inline FGLTexture fglCreateTexture(FGLContext* gl, uint32_t width, uint32_t height, const uint32_t* pixels) {
+    (void)gl;
+    FGLTexture t = fgl__surface(width, height, FGPU_FORMAT_XRGB8888, 0);
+    if (t && pixels) {
+        syscall_gpu_request_t r;
+        memset(&r, 0, sizeof(r));
+        r.op = SYS_GPU_WRITE_SURFACE;
+        r.handle = t;
+        r.data = pixels;
+        r.pitch = width * 4;
+        if (fgl__call(&r) != SYS_SUCCESS) { fgl__destroy(SYS_GPU_DESTROY_SURFACE, t); return 0; }
+    }
+    return t;
+}
+
+// Replaces a texture's pixels (pitch = bytes per row).
+static inline int fglTextureData(FGLContext* gl, FGLTexture t, const uint32_t* pixels, uint32_t pitch) {
+    fglSubmit(gl);      // draws recorded so far see the old pixels
+    syscall_gpu_request_t r;
+    memset(&r, 0, sizeof(r));
+    r.op = SYS_GPU_WRITE_SURFACE;
+    r.handle = t;
+    r.data = pixels;
+    r.pitch = pitch;
+    return fgl__call(&r) == SYS_SUCCESS ? 0 : -1;
+}
+
+static inline void fglDestroyTexture(FGLContext* gl, FGLTexture t) {
+    fglSubmit(gl);
+    for (uint32_t i = 0; i < FGPU_MAX_TEXTURE_UNITS; i++)
+        if (gl->textures[i] == t) gl->textures[i] = 0;
+    fgl__destroy(SYS_GPU_DESTROY_SURFACE, t);
+}
+
+// Binds a texture to a unit (0-3); flags: FGL_TEXTURE_LINEAR, FGL_TEXTURE_CLAMP.
+static inline void fglBindTexture(FGLContext* gl, uint32_t unit, FGLTexture t, uint32_t flags) {
+    if (unit >= FGPU_MAX_TEXTURE_UNITS) return;
+    gl->textures[unit] = t;
+    gl->texture_flags[unit] = flags;
+    gl->textures_dirty = 1;
+    if (!t) {   // unbinding must reach the GPU too
+        uint32_t w[3] = { unit, 0, 0 };
+        fgl__emit(gl, FGPU_OP_BIND_TEXTURE, w, sizeof(w));
+    }
+}
+
+// Binds a texture to the unit of a sampler2D uniform.
+static inline void fglUniformTexture(FGLContext* gl, FGLShader* sh, int loc, FGLTexture t, uint32_t flags) {
+    if (!sh || loc < 0 || (uint32_t)loc >= sh->uniform_count || sh->uniforms[loc].type != FGLSL_SAMPLER) return;
+    fglBindTexture(gl, sh->uniforms[loc].reg, t, flags);
+}
+
+/* ====================================================== vertex layouts */
+
+// Describes your own vertex struct: `stride` bytes per vertex, and for
+// each attribute location 0..count-1 its byte offset and float count.
+// Offsets and the stride must be multiples of 4. Returns 0, or -1 if the
+// layout is invalid (it is then not changed).
+static inline int fglVertexLayout(FGLContext* gl, uint32_t stride, uint32_t count, const FGLAttribute* attribs) {
+    if (!stride || (stride & 3) || stride / 4 > FGPU_MAX_VERTEX_STRIDE || count > FGPU_MAX_ATTRIBS) return -1;
+    uint32_t words[FGPU_MAX_ATTRIBS];
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t off = attribs[i].offset, n = attribs[i].components;
+        if (n > 4 || (off & 3) || (n && off / 4 + n > stride / 4)) return -1;
+        words[i] = FGPU_ATTRIB(off / 4, n);
+    }
+    gl->layout_stride = stride / 4;
+    gl->layout_count = count;
+    memcpy(gl->layout, words, count * 4);
+    gl->layout_dirty = 1;
+    return 0;
+}
+
+// Back to FGLVertex.
+static inline void fglVertexLayoutDefault(FGLContext* gl) {
+    gl->layout_stride = 0;
+    gl->layout_count = 0;
+    gl->layout_dirty = 1;
+}
+
+// FGLVertexUV: position, normal, color, uv at locations 0-3.
+static inline void fglVertexLayoutUV(FGLContext* gl) {
+    static const FGLAttribute a[4] = { { 0, 3 }, { 12, 3 }, { 24, 4 }, { 40, 2 } };
+    fglVertexLayout(gl, sizeof(FGLVertexUV), 4, a);
+}
+
+/* ============================================================= drawing */
+
 // Draws `count` vertices (triangles) starting at `first`.
 static inline void fglDraw(FGLContext* gl, FGLBuffer vertices, uint32_t first, uint32_t count) {
     fgl__flush_state(gl);
-    fgpu_draw_t d = { vertices, FGPU_VERTEX_P3N3C4, first, count, 0, 0, 0 };
+    uint32_t format = gl->layout_stride ? FGPU_VERTEX_LAYOUT : FGPU_VERTEX_P3N3C4;
+    fgpu_draw_t d = { vertices, format, first, count, 0, 0, 0 };
     fgl__emit(gl, FGPU_OP_DRAW, &d, sizeof(d));
 }
 
@@ -562,7 +790,8 @@ static inline void fglDraw(FGLContext* gl, FGLBuffer vertices, uint32_t first, u
 static inline void fglDrawIndexed(FGLContext* gl, FGLBuffer vertices, FGLBuffer indices,
                                   uint32_t first_index, uint32_t count) {
     fgl__flush_state(gl);
-    fgpu_draw_t d = { vertices, FGPU_VERTEX_P3N3C4, 0, 0, indices, first_index, count };
+    uint32_t format = gl->layout_stride ? FGPU_VERTEX_LAYOUT : FGPU_VERTEX_P3N3C4;
+    fgpu_draw_t d = { vertices, format, 0, 0, indices, first_index, count };
     fgl__emit(gl, FGPU_OP_DRAW, &d, sizeof(d));
 }
 
@@ -642,6 +871,21 @@ static inline uint32_t fglMakeCube(FGLVertex out[36], float s, const float face_
             v->r = face_colors[f][0]; v->g = face_colors[f][1]; v->b = face_colors[f][2];
             v->a = 1.0f;
         }
+    }
+    return n;
+}
+
+// The same cube as fglMakeCube with texture coordinates: each face shows
+// the whole texture, upright. Use with fglVertexLayoutUV(gl). Returns 36.
+static inline uint32_t fglMakeCubeUV(FGLVertexUV out[36], float s, const float face_colors[6][3]) {
+    FGLVertex v[36];
+    uint32_t n = fglMakeCube(v, s, face_colors);
+    // v = 0 is the top row of a texture: the bottom corners get v = 1.
+    static const float su[6] = { 0, 1, 1, 0, 1, 0 }, sv[6] = { 1, 1, 0, 1, 0, 0 };
+    for (uint32_t i = 0; i < n; i++) {
+        memcpy(&out[i], &v[i], sizeof(FGLVertex));
+        out[i].u = su[i % 6];
+        out[i].v = sv[i % 6];
     }
     return n;
 }

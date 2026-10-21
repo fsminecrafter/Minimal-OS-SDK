@@ -10,6 +10,12 @@ in Run Studio's docs panel.
 For window apps, `include/easyui.h` adds buttons, sliders, text inputs,
 radio buttons, toggles, dropdowns, lists and more in the MOSdesk theme -
 see [`docs/easyui.md`](docs/easyui.md) and `examples/easyui-demo.c`.
+Programs that draw their own pixels can use `include/font.h` for the same
+smooth text ([`docs/font.md`](docs/font.md)).
+
+For 3D, `include/farcadegl.h` is FarcadeGL, an OpenGL/Vulkan-style API with
+GLSL-style shaders (FGSL) - see [`docs/farcadegl.md`](docs/farcadegl.md),
+[`docs/fgsl.md`](docs/fgsl.md) and `programs/fglcube`.
 
 
 Install the native compiler and linker tools on Debian or Ubuntu:
