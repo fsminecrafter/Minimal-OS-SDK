@@ -32,9 +32,18 @@
  *     fglDraw(gl, cube, 0, 36);
  *     fglPresent(gl);
  *
+ * Shaders (FGSL, a GLSL-style language) replace the built-in programs:
+ *
+ *     FGLShader* sh = fglCreateShader(gl, vertex_src, fragment_src);
+ *     if (!sh) print(fglShaderLog(gl));
+ *     fglUseShader(gl, sh);
+ *     fglUniform1f(sh, fglUniformLocation(sh, "time"), t);
+ *
  * Rendering currently runs on the CPU inside the kernel (the FGPU
  * software backend), drawing into video memory when the GPU driver has
  * some. Programs do not change when a hardware backend arrives.
+ *
+ * Full guide: docs/farcadegl.md; shading language: docs/fgsl.md.
  */
 
 #include <stdint.h>
@@ -43,6 +52,7 @@
 #include "stdlib.h"
 #include "string.h"
 #include "x86_64/user_syscalls.h"
+#include "fglsl.h"
 
 /* ================================================================ math */
 
@@ -191,17 +201,57 @@ typedef uint32_t FGLSurface;
 #define FGL_DEPTH_TEST  (1u << 0)
 #define FGL_CULL_FACE   (1u << 1)   // cull back faces (counter-clockwise = front)
 #define FGL_WIREFRAME   (1u << 2)
+#define FGL_BLEND       (1u << 3)   // color = src * src.a + dst * (1 - src.a)
 
 #define FGL_PROGRAM_COLOR   FGPU_PROGRAM_COLOR
 #define FGL_PROGRAM_GOURAUD FGPU_PROGRAM_GOURAUD
 #define FGL_PROGRAM_PHONG   FGPU_PROGRAM_PHONG
 
-// One vertex: position, normal, color (rgba 0-1).
+// One vertex: position, normal, color (rgba 0-1). Shader attribute
+// locations 0, 1, 2 (see docs/fgsl.md, "Attributes").
 typedef struct {
     float px, py, pz;
     float nx, ny, nz;
     float r, g, b, a;
 } FGLVertex;
+
+// FGLVertex plus texture coordinates (location 3). Use it after
+// fglVertexLayoutUV(gl).
+typedef struct {
+    float px, py, pz;
+    float nx, ny, nz;
+    float r, g, b, a;
+    float u, v;
+} FGLVertexUV;
+
+// One attribute of a custom vertex layout (fglVertexLayout).
+typedef struct {
+    uint32_t offset;            // bytes from the start of the vertex
+    uint32_t components;        // 1-4 floats; 0 = not present
+} FGLAttribute;
+
+typedef uint32_t FGLTexture;    // a color surface; 0 = none
+
+#define FGL_TEXTURE_LINEAR FGPU_TEXTURE_LINEAR   // bilinear filtering (default: nearest)
+#define FGL_TEXTURE_CLAMP  FGPU_TEXTURE_CLAMP    // clamp to the edge (default: repeat)
+#define FGL_MAX_TEXTURE_UNITS FGPU_MAX_TEXTURE_UNITS
+
+// The fgl_* uniforms FarcadeGL fills in for every shader that declares them.
+enum {
+    FGL__U_MVP, FGL__U_MODEL, FGL__U_VIEW, FGL__U_PROJECTION, FGL__U_MODELVIEW,
+    FGL__U_NORMAL, FGL__U_LIGHT_DIR, FGL__U_LIGHT_COLOR, FGL__U_AMBIENT, FGL__U_CAMERA,
+    FGL__U_MATERIAL, FGL__U_COUNT
+};
+
+typedef struct {
+    uint32_t handle;            // kernel program
+    fglsl_uniform_t uniforms[FGLSL_MAX_UNIFORMS];
+    uint32_t uniform_count;
+    uint32_t registers;         // uniform registers in use
+    float values[FGPU_SHADER_MAX_UNIFORMS][4];
+    int builtin[FGL__U_COUNT];  // index into uniforms, or -1
+    int dirty;
+} FGLShader;
 
 typedef struct {
     uint32_t width, height;     // render size
@@ -226,6 +276,17 @@ typedef struct {
     float specular, shininess;
     int state_dirty, uniforms_dirty;
     uint32_t last_triangles;
+    // shaders, layouts, textures (ABI 2)
+    FGLShader* shader;                  // NULL = built-in program
+    FGLShader* uploaded;                // whose uniforms the GPU has now
+    uint32_t layout_stride;             // floats; 0 = FGLVertex
+    uint32_t layout_count;
+    uint32_t layout[FGPU_MAX_ATTRIBS];
+    int layout_dirty;
+    FGLTexture textures[FGPU_MAX_TEXTURE_UNITS];
+    uint32_t texture_flags[FGPU_MAX_TEXTURE_UNITS];
+    int textures_dirty;
+    char shader_log[192];               // why the last fglCreateShader failed
 } FGLContext;
 
 /* ============================================================ syscalls */
@@ -285,7 +346,10 @@ static inline void fgl__emit(FGLContext* gl, uint32_t op, const void* payload, u
 static inline void fgl__bind(FGLContext* gl) {
     uint32_t t[2] = { gl->back ? gl->color2 : gl->color, gl->depth };
     fgl__emit(gl, FGPU_OP_BIND_TARGET, t, sizeof(t));
+    // Every command buffer starts from the defaults: send state again.
     gl->state_dirty = gl->uniforms_dirty = 1;
+    gl->layout_dirty = gl->textures_dirty = 1;
+    gl->uploaded = NULL;
 }
 
 static inline void fglDestroyContext(FGLContext* gl) {
@@ -368,7 +432,12 @@ static inline void fglDestroyBuffer(FGLContext* gl, FGLBuffer buffer) {
 
 static inline void fglEnable(FGLContext* gl, uint32_t caps) { gl->enabled |= caps; gl->state_dirty = 1; }
 static inline void fglDisable(FGLContext* gl, uint32_t caps) { gl->enabled &= ~caps; gl->state_dirty = 1; }
-static inline void fglUseProgram(FGLContext* gl, uint32_t program) { gl->program = program; gl->state_dirty = 1; }
+// Selects a built-in program (and stops using a shader).
+static inline void fglUseProgram(FGLContext* gl, uint32_t program) {
+    gl->program = program;
+    gl->shader = NULL;
+    gl->state_dirty = 1;
+}
 static inline void fglSetModel(FGLContext* gl, FGLMat4 m) { gl->model = m; gl->uniforms_dirty = 1; }
 static inline void fglSetView(FGLContext* gl, FGLMat4 m) { gl->view = m; gl->uniforms_dirty = 1; }
 static inline void fglSetProjection(FGLContext* gl, FGLMat4 m) { gl->projection = m; gl->uniforms_dirty = 1; }
@@ -412,9 +481,30 @@ static inline void fgl__flush_state(FGLContext* gl) {
         if (gl->enabled & FGL_DEPTH_TEST) s |= FGPU_STATE_DEPTH_TEST | FGPU_STATE_DEPTH_WRITE;
         if (gl->enabled & FGL_CULL_FACE) s |= FGPU_STATE_CULL_BACK;
         if (gl->enabled & FGL_WIREFRAME) s |= FGPU_STATE_WIREFRAME;
+        if (gl->enabled & FGL_BLEND) s |= FGPU_STATE_BLEND;
         fgl__emit(gl, FGPU_OP_SET_STATE, &s, 4);
         fgl__emit(gl, FGPU_OP_SET_PROGRAM, &gl->program, 4);
+        uint32_t handle = gl->shader ? gl->shader->handle : 0;
+        fgl__emit(gl, FGPU_OP_SET_SHADER, &handle, 4);
         gl->state_dirty = 0;
+    }
+    if (gl->layout_dirty) {
+        if (gl->layout_stride) {
+            uint32_t w[2 + FGPU_MAX_ATTRIBS];
+            w[0] = gl->layout_stride;
+            w[1] = gl->layout_count;
+            for (uint32_t i = 0; i < gl->layout_count; i++) w[2 + i] = gl->layout[i];
+            fgl__emit(gl, FGPU_OP_SET_VERTEX_LAYOUT, w, (2 + gl->layout_count) * 4);
+        }
+        gl->layout_dirty = 0;
+    }
+    if (gl->textures_dirty) {
+        for (uint32_t i = 0; i < FGPU_MAX_TEXTURE_UNITS; i++) {
+            if (!gl->textures[i]) continue;
+            uint32_t w[3] = { i, gl->textures[i], gl->texture_flags[i] };
+            fgl__emit(gl, FGPU_OP_BIND_TEXTURE, w, sizeof(w));
+        }
+        gl->textures_dirty = 0;
     }
     if (gl->uniforms_dirty) {
         fgpu_uniforms_t u;
@@ -436,7 +526,28 @@ static inline void fgl__flush_state(FGLContext* gl) {
         u.material[0] = gl->specular;
         u.material[1] = gl->shininess;
         fgl__emit(gl, FGPU_OP_SET_UNIFORMS, &u, sizeof(u));
+        if (gl->shader) fgl__builtin_uniforms(gl, gl->shader, &u);
         gl->uniforms_dirty = 0;
+    }
+    FGLShader* sh = gl->shader;
+    if (sh && sh->registers && (sh->dirty || gl->uploaded != sh)) {
+        uint32_t head[2] = { 0, sh->registers };
+        uint32_t words = 1 + 2 + sh->registers * 4;
+        // Header and register values in one command.
+        if (gl->cmd_len + words > gl->cmd_cap) fgl__emit(gl, FGPU_OP_SET_CONSTANTS, 0, 0), gl->cmd_len--;
+        if (!gl->error) {
+            fgl__emit(gl, FGPU_OP_SET_CONSTANTS, head, sizeof(head));
+            gl->cmd_len -= 3;
+            uint32_t at = gl->cmd_len;
+            fgl__emit(gl, FGPU_OP_SET_CONSTANTS, 0, (2 + sh->registers * 4) * 4);
+            gl->cmd[at + 1] = head[0];
+            gl->cmd[at + 2] = head[1];
+            memcpy(gl->cmd + at + 3, sh->values, sh->registers * 16);
+        }
+        sh->dirty = 0;
+        gl->uploaded = sh;
+    } else if (sh && !sh->registers) {
+        gl->uploaded = sh;
     }
 }
 
