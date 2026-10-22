@@ -8,7 +8,8 @@ header. The same reference is on the website under Docs → SDK functions, and
 in Run Studio's docs panel.
 
 For window apps, `include/easyui.h` adds buttons, sliders, text inputs,
-radio buttons, toggles, dropdowns, lists and more in the MOSdesk theme -
+radio buttons, toggles, dropdowns, lists, file and folder pickers and more
+in the MOSdesk theme (Modern or 2000s Aero), each widget styleable -
 see [`docs/easyui.md`](docs/easyui.md) and `examples/easyui-demo.c`.
 Programs that draw their own pixels can use `include/font.h` for the same
 smooth text ([`docs/font.md`](docs/font.md)).
