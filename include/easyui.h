@@ -72,6 +72,7 @@ enum {
     EASYUI_ONFRAME,       /* window: once per frame, about 60 times a second */
     EASYUI_ONCLOSE,       /* window: the close button was clicked */
     EASYUI_ONRESIZE,      /* window: it changed size */
+    EASYUI_ONWHEEL,       /* canvas: mouse wheel over it; value: +1 up, -1 down */
     EASYUI_EVENT_COUNT
 };
 
@@ -89,6 +90,7 @@ enum {
 #define ONKEY     EASYUI_ONKEY
 #define ONDRAW    EASYUI_ONDRAW
 #define ONFRAME   EASYUI_ONFRAME
+#define ONWHEEL   EASYUI_ONWHEEL
 #define ONCLOSE   EASYUI_ONCLOSE
 #define ONRESIZE  EASYUI_ONRESIZE
 #endif
@@ -262,6 +264,9 @@ typedef struct {
     int  (*pickfolder)(const char* title, const char* folder, easyui_callback done);
     int  (*savefile)(const char* title, const char* folder, const char* name, easyui_callback done);
     const char* (*pickedpath)(void);
+    /* --- pointer: window coordinates, buttons bit 0 = left (-1, -1 when
+     * it is outside) --- */
+    void (*mouse)(int* x, int* y, int* buttons);
 } easyui_api_t;
 
 #ifdef __cplusplus
@@ -1242,6 +1247,7 @@ static void eui_wheel(int32_t delta) {
     int id = eui_open ? eui_open : eui_hover;
     if (!eui_valid(id)) return;
     eui_widget_t* e = &eui_w[id];
+    if (e->type == EASYUI_CANVAS) { eui_fire(id, EASYUI_ONWHEEL, delta > 0 ? 1 : -1); return; }
     int steps = delta > 0 ? 1 : -1;
     if (e->type == EASYUI_LISTBOX || (e->type == EASYUI_DROPDOWN && eui_open)) {
         int32_t rows = e->type == EASYUI_LISTBOX ? eui_list_rows(e) : 8;
@@ -2748,6 +2754,12 @@ static int eui_textwidthfont(const char* t, int font, int px) {
     return w;
 }
 
+static void eui_mouse_api(int* x, int* y, int* buttons) {
+    if (x) *x = eui_mx;
+    if (y) *y = eui_my;
+    if (buttons) *buttons = (int)eui_buttons;
+}
+
 static void eui_setlook(int look) {
     eui_look = look == EASYUI_LOOK_MODERN || look == EASYUI_LOOK_AERO ? look : EASYUI_LOOK_AUTO;
     eui_make_theme();
@@ -2774,7 +2786,8 @@ const easyui_api_t easyui = {
     eui_addfont, eui_setfont, eui_setfontsize, eui_settextcolor, eui_setbackground, eui_setborder,
     eui_setradius, eui_setpadding, eui_copystyle, eui_drawtextfont, eui_textwidthfont,
     eui_setlook, eui_getlook,
-    eui_pickfile, eui_pickfolder, eui_savefile, eui_pickedpath
+    eui_pickfile, eui_pickfolder, eui_savefile, eui_pickedpath,
+    eui_mouse_api
 };
 
 #endif /* EASYUI_NO_IMPLEMENTATION */
