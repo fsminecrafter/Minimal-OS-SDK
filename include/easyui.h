@@ -566,33 +566,141 @@ static int32_t eui_inset(int32_t dy, int32_t h, int32_t r) {
     return r - (t > 0 ? eui_isqrt(t) : 0);
 }
 
+/* Anti-aliasing: how much of each pixel of a corner square lies inside the
+ * rounded corner, 0-255, from 4x4 samples. eui_aa(r)[fy * r + fx] is the
+ * pixel fx columns and fy rows in from the corner's outer edges. Built once
+ * per radius; larger radii fall back to hard edges. */
+#define EUI_AA_MAX 32
+static uint8_t eui_aa_tab[EUI_AA_MAX + 1][EUI_AA_MAX * EUI_AA_MAX];
+static uint8_t eui_aa_done[EUI_AA_MAX + 1];
+
+static const uint8_t* eui_aa(int32_t r) {
+    if (r <= 0 || r > EUI_AA_MAX) return 0;
+    uint8_t* t = eui_aa_tab[r];
+    if (eui_aa_done[r]) return t;
+    int32_t limit = (8 * r) * (8 * r);
+    for (int32_t fy = 0; fy < r; fy++)
+        for (int32_t fx = 0; fx < r; fx++) {
+            uint32_t inside = 0;
+            for (int32_t j = 0; j < 4; j++) {
+                int32_t dy = 8 * r - (8 * fy + 2 * j + 1);
+                for (int32_t i = 0; i < 4; i++) {
+                    int32_t dx = 8 * r - (8 * fx + 2 * i + 1);
+                    if (dx * dx + dy * dy <= limit) inside++;
+                }
+            }
+            t[fy * r + fx] = (uint8_t)(inside * 255u / 16u);
+        }
+    eui_aa_done[r] = 1;
+    return t;
+}
+
+/* one pixel of `c` with its alpha scaled by coverage `cov` (0-255) */
+static void eui_aa_pixel(int32_t x, int32_t y, uint32_t c, uint32_t cov) {
+    if (!cov) return;
+    if (cov < 255u)
+        c = (c & 0x00FFFFFFu) | ((((c >> 24) * cov + 127u) / 255u) << 24);
+    eui_span(x, x + 1, y, c);
+}
+
+/* row `dy` of a filled rounded rectangle, edge pixels anti-aliased */
+static void eui_round_row(int x, int y, int w, int h, int r, int32_t dy,
+                          uint32_t c) {
+    int32_t fy = dy < r ? dy : (dy >= h - r ? h - 1 - dy : r);
+    const uint8_t* t = fy < r ? eui_aa(r) : 0;
+    if (!t) {
+        int32_t in = fy < r ? eui_inset(dy, h, r) : 0;
+        eui_span(x + in, x + w - in, y + dy, c);
+        return;
+    }
+    for (int32_t fx = 0; fx < r; fx++) {
+        eui_aa_pixel(x + fx, y + dy, c, t[fy * r + fx]);
+        eui_aa_pixel(x + w - 1 - fx, y + dy, c, t[fy * r + fx]);
+    }
+    eui_span(x + r, x + w - r, y + dy, c);
+}
+
 static void eui_fillroundrect(int x, int y, int w, int h, int r, uint32_t c) {
     if (w <= 0 || h <= 0) return;
     if (r * 2 > w) r = w / 2;
     if (r * 2 > h) r = h / 2;
-    for (int32_t dy = 0; dy < h; dy++) {
-        int32_t in = eui_inset(dy, h, r);
-        eui_span(x + in, x + w - in, y + dy, c);
-    }
+    for (int32_t dy = 0; dy < h; dy++) eui_round_row(x, y, w, h, r, dy, c);
 }
 
-/* a rounded rectangle `t` pixels thick */
+/* a rounded rectangle `t` pixels thick, its curves anti-aliased */
 static void eui_strokeround(int x, int y, int w, int h, int r, int t, uint32_t c) {
-    if (w <= 0 || h <= 0) return;
+    if (w <= 0 || h <= 0 || t <= 0) return;
     if (r * 2 > w) r = w / 2;
     if (r * 2 > h) r = h / 2;
     int ri = r > t ? r - t : 0;
+    const uint8_t* outer = eui_aa(r);
+    const uint8_t* inner = ri ? eui_aa(ri) : 0;
+    if (r > 0 && (!outer || (ri && !inner))) {
+        /* too large for the tables: hard edges */
+        for (int32_t dy = 0; dy < h; dy++) {
+            int32_t in = eui_inset(dy, h, r);
+            if (dy < t || dy >= h - t) { eui_span(x + in, x + w - in, y + dy, c); continue; }
+            int32_t edge = eui_inset(dy - t, h - 2 * t, ri) + t;
+            eui_span(x + in, x + edge, y + dy, c);
+            eui_span(x + w - edge, x + w - in, y + dy, c);
+        }
+        return;
+    }
     for (int32_t dy = 0; dy < h; dy++) {
-        int32_t in = eui_inset(dy, h, r);
-        if (dy < t || dy >= h - t) { eui_span(x + in, x + w - in, y + dy, c); continue; }
-        int32_t inner = eui_inset(dy - t, h - 2 * t, ri) + t;
-        eui_span(x + in, x + inner, y + dy, c);
-        eui_span(x + w - inner, x + w - in, y + dy, c);
+        int32_t band = dy < t || dy >= h - t;
+        if (dy < r || dy >= h - r) {
+            int32_t fy = dy < r ? dy : h - 1 - dy;
+            for (int32_t fx = 0; fx < r; fx++) {
+                int32_t cov = outer[fy * r + fx];
+                int32_t ix = fx - t, iy = fy - t, in = 0;
+                if (ix >= 0 && iy >= 0)
+                    in = (ix >= ri || iy >= ri || !inner) ? 255 : inner[iy * ri + ix];
+                cov -= in;
+                if (cov <= 0) continue;
+                eui_aa_pixel(x + fx, y + dy, c, (uint32_t)cov);
+                eui_aa_pixel(x + w - 1 - fx, y + dy, c, (uint32_t)cov);
+            }
+            if (band) eui_span(x + r, x + w - r, y + dy, c);
+        } else if (band) {
+            eui_span(x, x + w, y + dy, c);
+        } else {
+            eui_span(x, x + t, y + dy, c);
+            eui_span(x + w - t, x + w, y + dy, c);
+        }
     }
 }
 
+/* A disc centred on pixel (cx, cy), `r` pixels from the centre pixel to the
+ * edge, edge pixels anti-aliased (4x4 samples). */
 static void eui_fillcircle(int cx, int cy, int r, uint32_t c) {
-    eui_fillroundrect(cx - r, cy - r, r * 2 + 1, r * 2 + 1, r + 1, c);
+    if (r < 0) return;
+    /* radius r + 0.5 in units of 1/8 pixel, measured from the pixel centre */
+    int32_t R = 8 * r + 4, R2 = R * R;
+    for (int32_t dy = -r; dy <= r; dy++) {
+        int32_t ay = (dy < 0 ? -dy : dy) * 8;
+        int32_t solid = 0, solid_at = 0;
+        for (int32_t dx = -r; dx <= 0; dx++) {
+            int32_t ax = -dx * 8;
+            /* fully inside when the pixel's farthest corner is */
+            if ((ax + 4) * (ax + 4) + (ay + 4) * (ay + 4) <= R2) {
+                solid = 1;
+                solid_at = dx;
+                break;
+            }
+            uint32_t inside = 0;
+            for (int32_t j = 0; j < 4; j++) {
+                int32_t sy = ay - 3 + 2 * j;
+                for (int32_t i = 0; i < 4; i++) {
+                    int32_t sx = ax - 3 + 2 * i;
+                    if (sx * sx + sy * sy <= R2) inside++;
+                }
+            }
+            uint32_t cov = inside * 255u / 16u;
+            eui_aa_pixel(cx + dx, cy + dy, c, cov);
+            if (dx) eui_aa_pixel(cx - dx, cy + dy, c, cov);
+        }
+        if (solid) eui_span(cx + solid_at, cx - solid_at + 1, cy + dy, c);
+    }
 }
 
 static void eui_drawline(int x1, int y1, int x2, int y2, uint32_t c) {
@@ -1287,8 +1395,7 @@ static void eui_vgrad2(int x, int y, int w, int h, int r,
     for (int32_t dy = 0; dy < h; dy++) {
         uint32_t c = dy < half ? eui_mix(t0, t1, (uint32_t)(dy * 255 / half))
                                : eui_mix(b0, b1, (uint32_t)((dy - half) * 255 / rest));
-        int32_t in = eui_inset(dy, h, r);
-        eui_span(x + in, x + w - in, y + dy, c);
+        eui_round_row(x, y, w, h, r, dy, c);
     }
 }
 
