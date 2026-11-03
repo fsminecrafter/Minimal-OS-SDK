@@ -296,6 +296,50 @@ static inline long mos_tls_close(long handle) {
     return mos_net_call(&r);
 }
 
+// Real TLS 1.3 client transport for HTTPS. The kernel profile currently
+// defers certificate verification, so this does not authenticate the peer.
+static inline long mos_tls13_connect(uint32_t ip, uint16_t port,
+                                     const char* host, uint32_t timeout_ms) {
+    uint64_t handle = 0;
+    syscall_net_request_t r = {0};
+    r.op = SYS_NET_TLS13_CONNECT;
+    r.ip = ip;
+    r.port = port;
+    r.host = host;
+    r.timeout_ms = timeout_ms;
+    r.out_handle = &handle;
+    long rc = mos_net_call(&r);
+    if (rc != (long)SYS_SUCCESS) return rc;
+    return (long)handle;
+}
+
+static inline long mos_tls13_send(long handle, const void* buf, uint32_t len) {
+    syscall_net_request_t r = {0};
+    r.op = SYS_NET_TLS13_SEND;
+    r.handle = (uint64_t)handle;
+    r.buf = (void*)buf;
+    r.len = len;
+    return mos_net_call(&r);
+}
+
+static inline long mos_tls13_recv(long handle, void* buf, uint32_t len,
+                                  uint32_t timeout_ms) {
+    syscall_net_request_t r = {0};
+    r.op = SYS_NET_TLS13_RECV;
+    r.handle = (uint64_t)handle;
+    r.buf = buf;
+    r.len = len;
+    r.timeout_ms = timeout_ms;
+    return mos_net_call(&r);
+}
+
+static inline long mos_tls13_close(long handle) {
+    syscall_net_request_t r = {0};
+    r.op = SYS_NET_TLS13_CLOSE;
+    r.handle = (uint64_t)handle;
+    return mos_net_call(&r);
+}
+
 // Polls the handshake until it finishes or timeout_ms passes.
 static inline bool mos_tls_wait_established(long handle, uint32_t timeout_ms) {
     long start = mos_uptime();
