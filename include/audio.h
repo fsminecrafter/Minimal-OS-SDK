@@ -5,6 +5,7 @@
  * Playing .adi audio files (SYS_AUDIO).
  *
  *   mos_audio_open(path)    load a file and start playing it
+ *   mos_audio_open_at(path, offset)  the same for .adi data inside a file
  *   mos_audio_pause()       pause / mos_audio_resume() continue
  *   mos_audio_stop()        stop and unload
  *   mos_audio_seek(ms)      jump to a position
@@ -40,6 +41,10 @@ static inline long mos_audio__call(uint32_t op, uint32_t value, const char* path
 }
 
 static inline long mos_audio_open(const char* path) { return mos_audio__call(SYS_AUDIO_OPEN, 0, path, 0); }
+// Plays .adi data stored `offset` bytes into a file (a .vid soundtrack).
+static inline long mos_audio_open_at(const char* path, uint32_t offset) {
+    return mos_audio__call(SYS_AUDIO_OPEN, offset, path, 0);
+}
 static inline long mos_audio_pause(void)  { return mos_audio__call(SYS_AUDIO_PAUSE, 0, 0, 0); }
 static inline long mos_audio_resume(void) { return mos_audio__call(SYS_AUDIO_RESUME, 0, 0, 0); }
 static inline long mos_audio_stop(void)   { return mos_audio__call(SYS_AUDIO_STOP, 0, 0, 0); }
