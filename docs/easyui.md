@@ -1451,8 +1451,14 @@ void easyui.setlook(int look);
 ```
 
 `EASYUI_LOOK_AUTO` (the default) follows MOSdesk's window style;
-`EASYUI_LOOK_MODERN` or `EASYUI_LOOK_AERO` keeps one look whatever the user
-picks.
+`EASYUI_LOOK_MODERN`, `EASYUI_LOOK_AERO` or `EASYUI_LOOK_LIQUID` keeps one
+look whatever the user picks.
+
+The modern look is lightly tinted by the colour theme picked in Settings >
+Appearance. The Liquid Glass look is dark frosted glass: the window
+background is see-through and mosWM shows its blurred glass behind it, so
+draw your own backgrounds with some transparency if you want the glass to
+show through them too.
 
 ## `easyui.look`
 
@@ -1460,7 +1466,8 @@ picks.
 int easyui.look(void);
 ```
 
-**Returns** the look in use: `EASYUI_LOOK_MODERN` or `EASYUI_LOOK_AERO`.
+**Returns** the look in use: `EASYUI_LOOK_MODERN`, `EASYUI_LOOK_AERO` or
+`EASYUI_LOOK_LIQUID`.
 
 ## `easyui.pickfile`
 

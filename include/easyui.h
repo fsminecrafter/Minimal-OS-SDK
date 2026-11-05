@@ -117,8 +117,11 @@ enum {
     EASYUI_FONT_BITMAP, EASYUI_FONT_CUSTOM
 };
 
-/* Looks for setlook(): follow MOSdesk's window style, or force one. */
-enum { EASYUI_LOOK_AUTO = 0, EASYUI_LOOK_MODERN, EASYUI_LOOK_AERO };
+/* Looks for setlook(): follow MOSdesk's window style, or force one.
+ * LIQUID is dark glass: the window background is see-through, and mosWM
+ * shows its blurred glass behind it. */
+enum { EASYUI_LOOK_AUTO = 0, EASYUI_LOOK_MODERN, EASYUI_LOOK_AERO,
+       EASYUI_LOOK_LIQUID };
 
 /* Anchors for setanchor(): which window edges a widget keeps its distance
  * to when the window is resized. LEFT|RIGHT stretches it. */
@@ -437,7 +440,7 @@ static long eui_last_poll = -100000, eui_last_click_time;
 static int eui_hover, eui_pressed, eui_focus, eui_open, eui_cur, eui_last_click_item = -1;
 static int32_t eui_mx = -1, eui_my = -1;
 static uint32_t eui_buttons;
-static int eui_look, eui_aero, eui_settings_style;
+static int eui_look, eui_aero, eui_liquid, eui_settings_style;
 static int eui_caret_on;
 static long eui_caret_time;
 static int32_t eui_cx0, eui_cy0, eui_cx1, eui_cy1;   /* clip rectangle */
@@ -451,14 +454,50 @@ static uint32_t eui_mix(uint32_t a, uint32_t b, uint32_t t) {   /* t/255 of b */
     uint32_t r = (((a >> 16) & 255u) * (255u - t) + ((b >> 16) & 255u) * t) / 255u;
     uint32_t g = (((a >> 8) & 255u) * (255u - t) + ((b >> 8) & 255u) * t) / 255u;
     uint32_t bl = ((a & 255u) * (255u - t) + (b & 255u) * t) / 255u;
-    return 0xFF000000u | (r << 16) | (g << 8) | bl;
+    /* Alpha mixes too, so translucent (Liquid) colours stay translucent;
+     * two opaque colours give an opaque one, as before. */
+    uint32_t al = ((a >> 24) * (255u - t) + (b >> 24) * t) / 255u;
+    return (al << 24) | (r << 16) | (g << 8) | bl;
+}
+
+/* `c` drawn over the pixel `d`, either of which may be see-through. */
+static uint32_t eui_over(uint32_t d, uint32_t c, uint32_t a) {
+    uint32_t da = d >> 24;
+    if (da == 255u) return eui_mix(d, c | 0xFF000000u, a);
+    uint32_t inv = 255u - a;
+    uint32_t wd = (da * inv + 127u) / 255u;
+    uint32_t oa = a + wd;
+    if (!oa) return 0u;
+    uint32_t r = (((c >> 16) & 255u) * a + ((d >> 16) & 255u) * wd) / oa;
+    uint32_t g = (((c >> 8) & 255u) * a + ((d >> 8) & 255u) * wd) / oa;
+    uint32_t b = ((c & 255u) * a + (d & 255u) * wd) / oa;
+    return (oa << 24) | (r << 16) | (g << 8) | b;
+}
+
+/* An opaque stand-in for a see-through colour, for dialogs that must hide
+ * what is under them. */
+static uint32_t eui_solid(uint32_t c) {
+    uint32_t a = c >> 24;
+    return a == 255u ? c : eui_mix(0xFF101418u, c | 0xFF000000u, a);
 }
 
 static void eui_make_theme(void) {
     uint32_t a = 0xFF000000u | ((eui_accent_override ? eui_accent_override : eui_settings_accent) & 0x00FFFFFFu);
     eui_aero = eui_look == EASYUI_LOOK_AERO ||
                (eui_look == EASYUI_LOOK_AUTO && eui_settings_style == 1);
-    if (eui_aero && !eui_dark) {
+    eui_liquid = eui_look == EASYUI_LOOK_LIQUID ||
+                 (eui_look == EASYUI_LOOK_AUTO && eui_settings_style == 2);
+    if (eui_liquid) {
+        /* Liquid Glass: frosted panels over the glass mosWM draws behind
+         * the window; the accent tints the glass a little. */
+        eui_th.background = (eui_mix(0xFF12161Au, a, 26u) & 0x00FFFFFFu) | 0x78000000u;
+        eui_th.surface = 0x50000000u | (eui_mix(0xFF262C32u, a, 20u) & 0x00FFFFFFu);
+        eui_th.border = 0x48FFFFFFu;     eui_th.text = 0xFFF4F7FAu;
+        eui_th.muted = 0xFFA4B0BAu;      eui_th.button = 0x30FFFFFFu;
+        eui_th.button_hover = 0x4CFFFFFFu; eui_th.button_pressed = 0x22FFFFFFu;
+        eui_th.track = 0x40FFFFFFu;      eui_th.disabled = 0x18FFFFFFu;
+        eui_th.disabled_text = 0xFF7D8A94u;
+    } else if (eui_aero && !eui_dark) {
         /* Windows 7 era: light grey dialogs, black text, grey glass buttons */
         eui_th.background = 0xFFF0F0F0u; eui_th.surface = 0xFFFFFFFFu;
         eui_th.border = 0xFFABADB3u;     eui_th.text = 0xFF000000u;
@@ -475,12 +514,18 @@ static void eui_make_theme(void) {
         eui_th.track = 0xFF3A4249u;      eui_th.disabled = 0xFF2C3237u;
         eui_th.disabled_text = 0xFF6F7C86u;
     } else {
-        /* mosWM's dialogs and MOSdesk Settings */
-        eui_th.background = 0xFFF3F5F6u; eui_th.surface = 0xFFFFFFFFu;
-        eui_th.border = 0xFFBCC6CDu;     eui_th.text = 0xFF273640u;
-        eui_th.muted = 0xFF667680u;      eui_th.button = 0xFFDCE2E6u;
-        eui_th.button_hover = 0xFFD0D8DDu; eui_th.button_pressed = 0xFFC2CCD2u;
-        eui_th.track = 0xFFD5DCE0u;      eui_th.disabled = 0xFFE3E7EAu;
+        /* mosWM's dialogs and MOSdesk Settings, lightly tinted by the
+         * colour theme so each theme has its own feel. */
+        eui_th.background = eui_mix(0xFFF3F5F6u, a, 10u);
+        eui_th.surface = 0xFFFFFFFFu;
+        eui_th.border = eui_mix(0xFFBCC6CDu, a, 30u);
+        eui_th.text = 0xFF273640u;
+        eui_th.muted = 0xFF667680u;
+        eui_th.button = eui_mix(0xFFDCE2E6u, a, 22u);
+        eui_th.button_hover = eui_mix(0xFFD0D8DDu, a, 34u);
+        eui_th.button_pressed = eui_mix(0xFFC2CCD2u, a, 44u);
+        eui_th.track = eui_mix(0xFFD5DCE0u, a, 26u);
+        eui_th.disabled = 0xFFE3E7EAu;
         eui_th.disabled_text = 0xFF9AA6AEu;
     }
     eui_th.accent = a;
@@ -511,7 +556,10 @@ static void eui_poll_theme(void) {
         mos_read(fd, tail, sizeof tail) == (long)sizeof tail) {
         tail[31] = 0;
         for (int i = 0; i < 32; i++) eui_username[i] = (char)tail[i];
-        style = tail[32] == 1 && !tail[33] && !tail[34] && !tail[35];
+        /* 0 modern, 1 Aero, 2 Liquid Glass */
+        uint32_t value = (uint32_t)tail[32] | (uint32_t)tail[33] << 8 |
+                         (uint32_t)tail[34] << 16 | (uint32_t)tail[35] << 24;
+        style = value <= 2u ? (int)value : 0;
     }
     mos_close(fd);
     if (n != (long)sizeof head || head[0] != 0x4D445331u) return;
@@ -542,7 +590,7 @@ static void eui_span(int32_t x0, int32_t x1, int32_t y, uint32_t c) {
     uint32_t* row = eui_px + (size_t)y * (size_t)eui_W;
     uint32_t alpha = c >> 24;
     if (alpha == 255u) { for (int32_t x = x0; x < x1; x++) row[x] = c; }
-    else if (alpha) { for (int32_t x = x0; x < x1; x++) row[x] = eui_mix(row[x], c, alpha); }
+    else if (alpha) { for (int32_t x = x0; x < x1; x++) row[x] = eui_over(row[x], c, alpha); }
 }
 
 static void eui_fillrect(int x, int y, int w, int h, uint32_t c) {
@@ -1617,7 +1665,12 @@ static void eui_paint_widget(int id) {
                 eui_fillroundrect(bx, by, box, box, 4, on);
                 eui_check(bx, by, box, 0xFFFFFFFFu);
             } else {
-                eui_fillroundrect(bx, by, box, box, 4, hover ? acc : eui_th.border);
+                /* A see-through box gets only its border ring, so the
+                 * border colour does not show through the middle. */
+                if (eui_th.surface >> 24 == 255u)
+                    eui_fillroundrect(bx, by, box, box, 4, hover ? acc : eui_th.border);
+                else
+                    eui_strokeround(bx, by, box, box, 4, 2, hover ? acc : eui_th.border);
                 eui_fillroundrect(bx + 2, by + 2, box - 4, box - 4, 3, eui_th.surface);
             }
             if (focus) eui_focus_ring(e, bx, by, box, box, aero ? 0 : 4);
@@ -1635,7 +1688,10 @@ static void eui_paint_widget(int id) {
             eui_fillroundrect(x, y, w, h, r, focus ? 0xFF3D7BADu : hover ? 0xFF5794BFu : 0xFFABADB3u);
             eui_fillroundrect(x + 1, y + 1, w - 2, h - 2, r > 1 ? r - 1 : 0, surface);
         } else {
-            eui_fillroundrect(x, y, w, h, r, focus ? acc : eui_th.border);
+            if (surface >> 24 == 255u)
+                eui_fillroundrect(x, y, w, h, r, focus ? acc : eui_th.border);
+            else    /* see-through field: just the ring */
+                eui_strokeround(x, y, w, h, r, focus ? 2 : 1, focus ? acc : eui_th.border);
             eui_fillroundrect(x + (focus ? 2 : 1), y + (focus ? 2 : 1), w - (focus ? 4 : 2), h - (focus ? 4 : 2),
                               r > 1 ? r - 1 : 0, surface);
         }
@@ -1797,7 +1853,7 @@ static void eui_paint_dropdown(void) {
     } else {
         eui_fillroundrect(x - 1, y + 1, w + 2, h + 3, 8, 0x30000000u);
         eui_fillroundrect(x, y, w, h, 7, eui_th.border);
-        eui_fillroundrect(x + 1, y + 1, w - 2, h - 2, 6, e->background ? e->background : eui_th.surface);
+        eui_fillroundrect(x + 1, y + 1, w - 2, h - 2, 6, e->background ? e->background : eui_solid(eui_th.surface));
     }
     uint32_t text = eui_textcolor(e, eui_th.text);
     for (int32_t i = 0; i < 8 && i + e->scroll < e->count; i++) {
@@ -1837,7 +1893,7 @@ static void eui_paint_message(void) {
     }
     eui_fillroundrect(x - 3, y - 1, mw + 6, mh + 8, 14, 0x30000000u);
     eui_fillroundrect(x, y, mw, mh, 12, eui_th.border);
-    eui_fillroundrect(x + 1, y + 1, mw - 2, mh - 2, 11, eui_th.background);
+    eui_fillroundrect(x + 1, y + 1, mw - 2, mh - 2, 11, eui_solid(eui_th.background));
     eui_clip(x + 20, y, mw - 40, mh);
     eui_drawtext(x + 20, y + 18, eui_msg_title, eui_th.text, 2);
     eui_textbox(x + 20, y + 48, mw - 40, mh - 110, eui_msg_text, eui_th.muted, 1, EASYUI_ALIGN_LEFT);
@@ -2193,7 +2249,7 @@ static void eui_paint_picker(void) {
     eui_pick_layout_t L = eui_pk_layout();
     eui_rect_t b = L.box;
     int aero = eui_aero;
-    uint32_t panel = aero && !eui_dark ? 0xFFF0F0F0u : eui_th.background;
+    uint32_t panel = aero && !eui_dark ? 0xFFF0F0F0u : eui_solid(eui_th.background);
     uint32_t list_bg = eui_th.surface, text = eui_th.text;
     char paths[5][EASYUI_PATH_MAX];
     const char* names[5];
@@ -2358,7 +2414,9 @@ static const char* eui_pickedpath(void) { return eui_pk.result; }
 static void eui_paint(void) {
     if (!eui_px) return;
     eui_clip_all();
-    eui_fillrect(0, 0, eui_W, eui_H, eui_w[0].background ? eui_w[0].background : eui_th.background);
+    /* Set, not blended: a see-through background must replace last frame. */
+    uint32_t window_bg = eui_w[0].background ? eui_w[0].background : eui_th.background;
+    for (size_t i = 0; i < (size_t)eui_W * (size_t)eui_H; i++) eui_px[i] = window_bg;
     for (int id = 1; id <= EASYUI_MAX_WIDGETS; id++)
         if (eui_w[id].used && eui_w[id].visible) eui_paint_widget(id);
     if (eui_open) eui_paint_dropdown();
@@ -2761,11 +2819,15 @@ static void eui_mouse_api(int* x, int* y, int* buttons) {
 }
 
 static void eui_setlook(int look) {
-    eui_look = look == EASYUI_LOOK_MODERN || look == EASYUI_LOOK_AERO ? look : EASYUI_LOOK_AUTO;
+    eui_look = look == EASYUI_LOOK_MODERN || look == EASYUI_LOOK_AERO ||
+               look == EASYUI_LOOK_LIQUID ? look : EASYUI_LOOK_AUTO;
     eui_make_theme();
     eui_dirty = 1;
 }
-static int eui_getlook(void) { if (!eui_th.accent) eui_make_theme(); return eui_aero ? EASYUI_LOOK_AERO : EASYUI_LOOK_MODERN; }
+static int eui_getlook(void) {
+    if (!eui_th.accent) eui_make_theme();
+    return eui_liquid ? EASYUI_LOOK_LIQUID : eui_aero ? EASYUI_LOOK_AERO : EASYUI_LOOK_MODERN;
+}
 
 const easyui_api_t easyui = {
     eui_init, eui_run, eui_update, eui_quit, eui_settitle, eui_width, eui_height, eui_window, eui_redraw,
