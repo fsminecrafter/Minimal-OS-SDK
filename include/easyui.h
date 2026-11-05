@@ -441,6 +441,10 @@ static int eui_hover, eui_pressed, eui_focus, eui_open, eui_cur, eui_last_click_
 static int32_t eui_mx = -1, eui_my = -1;
 static uint32_t eui_buttons;
 static int eui_look, eui_aero, eui_liquid, eui_settings_style;
+/* MOSdesk Settings > Appearance > Window background: 0 what the style does,
+ * 1 solid, 2 glass (see-through, mosWM draws frosted glass behind). */
+static int eui_settings_window_bg;
+static int eui_glass;           /* the window background is see-through */
 static int eui_caret_on;
 static long eui_caret_time;
 static int32_t eui_cx0, eui_cy0, eui_cx1, eui_cy1;   /* clip rectangle */
@@ -528,6 +532,15 @@ static void eui_make_theme(void) {
         eui_th.disabled = 0xFFE3E7EAu;
         eui_th.disabled_text = 0xFF9AA6AEu;
     }
+    /* Window background: Liquid Glass is see-through unless "Solid" was
+     * chosen; the other styles are solid unless "Glass" was. */
+    eui_glass = eui_settings_window_bg == 2 || (eui_settings_window_bg == 0 && eui_liquid);
+    if (eui_liquid && !eui_glass) {
+        eui_th.background = eui_solid(eui_th.background);
+    } else if (!eui_liquid && eui_glass) {
+        /* frosted: the colour stays, mosWM's glass shows through a little */
+        eui_th.background = (eui_th.background & 0x00FFFFFFu) | 0xB4000000u;
+    }
     eui_th.accent = a;
     eui_th.accent_hover = eui_mix(a, 0xFFFFFFFFu, 36u);
     eui_th.accent_pressed = eui_mix(a, 0xFF000000u, 46u);
@@ -539,6 +552,7 @@ static void eui_make_theme(void) {
  * style (0 modern, 1 Aero); mosdesk/settings.h checks these offsets. */
 #define EUI_SETTINGS_USERNAME_OFFSET 828
 #define EUI_SETTINGS_STYLE_OFFSET 860
+#define EUI_SETTINGS_WINDOW_BG_OFFSET 1140
 static char eui_username[32];
 
 /* Reads the accent colour and window style MOSdesk Settings saved. Every
@@ -561,11 +575,20 @@ static void eui_poll_theme(void) {
                          (uint32_t)tail[34] << 16 | (uint32_t)tail[35] << 24;
         style = value <= 2u ? (int)value : 0;
     }
+    int window_bg = 0;
+    uint32_t bg_value = 0;
+    if (mos_size(fd) >= EUI_SETTINGS_WINDOW_BG_OFFSET + 4 &&
+        mos_seek(fd, EUI_SETTINGS_WINDOW_BG_OFFSET) >= 0 &&
+        mos_read(fd, &bg_value, sizeof bg_value) == (long)sizeof bg_value)
+        window_bg = bg_value <= 2u ? (int)bg_value : 0;
     mos_close(fd);
     if (n != (long)sizeof head || head[0] != 0x4D445331u) return;
-    if (head[2] == eui_settings_accent && style == eui_settings_style) return;
+    if (head[2] == eui_settings_accent && style == eui_settings_style &&
+        window_bg == eui_settings_window_bg)
+        return;
     eui_settings_accent = head[2];
     eui_settings_style = style;
+    eui_settings_window_bg = window_bg;
     eui_make_theme();
     eui_dirty = 1;
 }

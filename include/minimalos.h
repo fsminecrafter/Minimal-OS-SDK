@@ -89,4 +89,13 @@ static inline long mos_puts(const char* str) {
     return mos_write(1, str, len);
 }
 
+// The kernel log: serial and, on a netbooted machine, 'make netboot' on
+// the build PC. Not shown on screen. One call is one line.
+#define MOS_FD_LOG 3
+static inline long mos_log(const char* str) {
+    size_t len = 0;
+    while (str[len]) len++;
+    return mos_write(MOS_FD_LOG, str, len);
+}
+
 #endif // MINIMALOS_SDK_H
