@@ -16,10 +16,13 @@
  * screenshots) shrink to almost nothing, and the tiles are independent,
  * so they can be decoded in any order (or in parallel).
  *
- * .img keeps 8-bit RGB or RGBA (transparency, like a PNG). .vid stores
- * only the tiles that changed since the last frame, keyframes for
- * seeking, and an .adi soundtrack that SYS_AUDIO plays straight from the
- * file (mos_audio_open_at). The full layout is in docs/media.md.
+ * .img keeps 8-bit RGB or RGBA (transparency, like a PNG). A .vid uses
+ * one of two codecs: "tiles" (this one: only the tiles that changed since
+ * the last frame are stored; lossless, or near-lossless with `loss`) or
+ * "motion" (lossy and built like H.264, for camera footage; see
+ * mosmedia_motion.h). Both have keyframes for seeking and an .adi
+ * soundtrack that SYS_AUDIO plays straight from the file
+ * (mos_audio_open_at). The full layout is in docs/media.md.
  *
  * Pixels are 0xAARRGGBB, the format windows and EasyUI use. Everything
  * here is plain C without libc, so it also builds on a host (tools/media).
@@ -36,6 +39,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include "mosmedia_motion.h"
 
 #define MIMG_MAGIC "MIMG"
 #define MVID_MAGIC "MVID"
@@ -53,6 +57,11 @@
 #define MVID_HEADER_SIZE 64u
 #define MVID_INDEX_ENTRY 16u
 #define MVID_FRAME_KEY 1u
+/* .vid codecs. Tiles files are version 1 (readable by older players),
+ * motion files version 2 with the codec at offset 60. */
+#define MVID_CODEC_TILES  0u
+#define MVID_CODEC_MOTION 1u
+#define MVID_VERSION_CODEC 2u
 
 /* Row filters. */
 #define MMEDIA_FILTER_NONE 0u
@@ -96,6 +105,16 @@ static inline uint32_t mm_add(uint32_t a, uint32_t b) {
 /* The value a row is coded against with no filter: opaque black, so an
  * opaque picture's alpha residual is always 0. */
 #define MM_BASE 0xFF000000u
+
+/* Each colour of a and b within `loss` of each other, alpha the same. */
+static inline bool mm_close(uint32_t a, uint32_t b, uint32_t loss) {
+    if ((a >> 24) != (b >> 24)) return false;
+    for (int sh = 0; sh < 24; sh += 8) {
+        int d = (int)((a >> sh) & 255u) - (int)((b >> sh) & 255u);
+        if ((uint32_t)(d < 0 ? -d : d) > loss) return false;
+    }
+    return true;
+}
 
 static inline uint32_t mm_hash(uint32_t v) {
     return (((v >> 16) & 255u) * 3u + ((v >> 8) & 255u) * 5u + (v & 255u) * 7u + (v >> 24) * 11u) & 63u;
@@ -360,15 +379,18 @@ MM_FN bool mimg_decode(const uint8_t* d, size_t size, uint32_t* out, uint32_t st
 
 /* Header (64 bytes, little-endian):
  *    0  "MVID"
- *    4  u8 version (1)   5  u8 channels   6  u8 tile size log2   7  u8 flags (bit 0: audio)
+ *    4  u8 version (1 tiles, 2 codec at 60)   5  u8 channels (motion: 3)
+ *    6  u8 tile size log2   7  u8 flags (bit 0: audio)
  *    8  u32 width       12  u32 height
  *   16  u32 fps numerator   20  u32 fps denominator
  *   24  u32 frame count     28  u32 duration in ms
  *   32  u64 index offset    40  u64 audio offset   48  u64 audio size
- *   56  u32 keyframe interval   60  u32 reserved
- * Frames follow the header. A frame: u8 flags (bit 0 keyframe), 3 zero
- * bytes, a bitmap with one bit per tile (set = coded, clear = same as the
- * previous frame), a u32 size for each coded tile, then their data.
+ *   56  u32 keyframe interval   60  u32 version 2: codec (0 tiles, 1 motion)
+ * Frames follow the header. A tiles frame: u8 flags (bit 0 keyframe), 3
+ * zero bytes, a bitmap with one bit per tile (set = coded, clear = same as
+ * the previous frame), a u32 size for each coded tile, then their data.
+ * A motion frame: u8 flags (bit 0 keyframe), u8 QP, 2 zero bytes, then
+ * the range-coded frame (mmc_decode_frame).
  * The index has 16 bytes a frame: u64 offset, u32 size, u32 flags.
  * The soundtrack is an .adi file, stored unchanged. */
 
@@ -379,6 +401,7 @@ typedef void (*mvid_free_fn)(void* p);
 
 typedef struct {
     uint32_t width, height, fps_num, fps_den, frame_count, duration_ms, keyframe_interval;
+    uint32_t codec;             /* MVID_CODEC_TILES or MVID_CODEC_MOTION */
     bool alpha, has_audio;
     uint64_t index_offset, audio_offset, audio_size;
 } mvid_info_t;
@@ -396,6 +419,17 @@ typedef struct {
     size_t frame_cap;
     uint8_t* index;             /* MVID_INDEX_ENTRY a frame */
     uint32_t index_cap;
+    /* Settings, before the first frame (all optional): */
+    uint32_t codec;             /* MVID_CODEC_TILES (default) or MVID_CODEC_MOTION */
+    uint32_t qp;                /* motion: quality, 0 (best) to 51, default 26 */
+    uint32_t loss;              /* tiles: colours may move up to this (0 = lossless) */
+    /* motion: decides a frame's macroblocks (mmc_encode_mb for every one, a
+     * row at most two macroblocks ahead of the row below); NULL = in order */
+    void (*parallel)(void* ctx, mmc_t* m, const mmc_job_t* job);
+    void* parallel_ctx;
+    mmc_t mc;                   /* motion: the encoder (its reference frame) */
+    bool mc_ready;
+    uint32_t* work;             /* tiles with loss: the frame as stored */
 } mvid_writer_t;
 
 MM_FN size_t mvid_frame_bound(uint32_t w, uint32_t h) {
@@ -415,6 +449,7 @@ MM_FN bool mvid_writer_begin(mvid_writer_t* v, uint32_t w, uint32_t h, uint32_t 
     v->info.alpha = alpha;
     v->info.keyframe_interval = keyframe_interval ? keyframe_interval : 1u;
     v->write = write; v->ctx = ctx; v->alloc = alloc; v->free = free_fn; v->fast = fast;
+    v->qp = 26;
     v->at = MVID_HEADER_SIZE;
     v->frame_cap = mvid_frame_bound(w, h);
     v->prev = (uint32_t*)alloc((size_t)w * h * 4u);
@@ -423,6 +458,66 @@ MM_FN bool mvid_writer_begin(mvid_writer_t* v, uint32_t w, uint32_t h, uint32_t 
     v->index = (uint8_t*)alloc((size_t)v->index_cap * MVID_INDEX_ENTRY);
     if (!v->prev || !v->frame || !v->index) { v->failed = true; return false; }
     return true;
+}
+
+/* A motion frame: decided (maybe on several threads), then written; a
+ * frame that does not fit the buffer is coded again at a higher QP. */
+MM_FN size_t mvid_motion_frame(mvid_writer_t* v, const uint32_t* px, uint32_t stride, bool key) {
+    mmc_t* m = &v->mc;
+    if (!v->mc_ready) {
+        if (!mmc_init(m, v->info.width, v->info.height, true, v->alloc)) {
+            mmc_free(m, v->free);
+            return 0;
+        }
+        v->mc_ready = true;
+    }
+    mmc_load_frame(m, px, stride);
+    int qp = (int)(v->qp > MMC_MAX_QP ? MMC_MAX_QP : v->qp);
+    if (key) qp = qp >= 2 ? qp - 2 : 0;
+    mmc_job_t job;
+    for (;;) {
+        mmc_begin_frame(m, &job, key, qp, v->fast);
+        if (v->parallel) {
+            v->parallel(v->parallel_ctx, m, &job);
+        } else {
+            for (uint32_t my = 0; my < m->mbh; my++)
+                for (uint32_t mx = 0; mx < m->mbw; mx++) mmc_encode_mb(m, &job, mx, my);
+        }
+        size_t n = mmc_write_frame(m, &job, v->frame + 4, v->frame_cap - 4u);
+        if (n) {
+            mmc_finish_frame(m, job.qp);
+            v->frame[0] = key ? MVID_FRAME_KEY : 0;
+            v->frame[1] = (uint8_t)job.qp;
+            v->frame[2] = v->frame[3] = 0;
+            return n + 4u;
+        }
+        if (qp >= MMC_MAX_QP) return 0;
+        qp = qp + 6 > MMC_MAX_QP ? MMC_MAX_QP : qp + 6;
+        /* the vectors were overwritten: start the search from the last frame's */
+        size_t mbs = (size_t)m->mbw * m->mbh;
+        for (size_t i = 0; i < mbs * 2u; i++) m->mv[i] = m->prev_mv[i];
+    }
+}
+
+/* Near-lossless tiles: each pixel takes the colour of the last frame's,
+ * the left or the above pixel when that is within `loss` (its own alpha
+ * stays), so more tiles stay unchanged and residuals repeat. Returns the
+ * frame to store. */
+MM_FN const uint32_t* mvid_lossy_frame(mvid_writer_t* v, const uint32_t* px, uint32_t stride, bool first) {
+    uint32_t w = v->info.width, h = v->info.height, loss = v->loss;
+    uint32_t* o = v->work;
+    for (uint32_t y = 0; y < h; y++)
+        for (uint32_t x = 0; x < w; x++) {
+            uint32_t s = px[(size_t)y * stride + x];
+            if (!v->info.alpha) s |= 0xFF000000u;
+            size_t i = (size_t)y * w + x;
+            uint32_t a = s & 0xFF000000u, c = s;
+            if (!first && mm_close(s, a | (v->prev[i] & 0xFFFFFFu), loss)) c = v->prev[i];
+            else if (x > 0 && mm_close(s, a | (o[i - 1] & 0xFFFFFFu), loss)) c = o[i - 1];
+            else if (y > 0 && mm_close(s, a | (o[i - w] & 0xFFFFFFu), loss)) c = o[i - w];
+            o[i] = a | (c & 0xFFFFFFu);
+        }
+    return o;
 }
 
 /* Adds a frame (stride in pixels). */
@@ -438,6 +533,21 @@ MM_FN bool mvid_writer_frame(mvid_writer_t* v, const uint32_t* px, uint32_t stri
         v->free(v->index);
         v->index = bigger;
         v->index_cap *= 2u;
+    }
+    if (n == 0) v->info.codec = v->codec == MVID_CODEC_MOTION ? MVID_CODEC_MOTION : MVID_CODEC_TILES;
+    if (v->info.codec == MVID_CODEC_MOTION) {
+        size_t size = mvid_motion_frame(v, px, stride, key);
+        if (!size || !v->write(v->ctx, v->at, v->frame, size)) { v->failed = true; return false; }
+        uint8_t* e = v->index + (size_t)n * MVID_INDEX_ENTRY;
+        mm_put64(e, v->at); mm_put32(e + 8, (uint32_t)size); mm_put32(e + 12, key ? MVID_FRAME_KEY : 0);
+        v->at += size;
+        v->info.frame_count++;
+        return true;
+    }
+    if (v->loss) {
+        if (!v->work && !(v->work = (uint32_t*)v->alloc((size_t)w * h * 4u))) { v->failed = true; return false; }
+        px = mvid_lossy_frame(v, px, stride, n == 0);
+        stride = w;
     }
     uint32_t tiles = mm_tiles(w, h), across = mm_tiles_x(w);
     uint8_t* f = v->frame;
@@ -501,16 +611,23 @@ MM_FN bool mvid_writer_finish(mvid_writer_t* v, const void* adi, size_t adi_size
         for (uint32_t i = 0; i < MVID_HEADER_SIZE; i++) hd[i] = 0;
         mvid_info_t* in = &v->info;
         in->duration_ms = (uint32_t)((uint64_t)in->frame_count * 1000u * in->fps_den / in->fps_num);
+        bool motion = in->codec == MVID_CODEC_MOTION;
+        if (motion) in->alpha = false;
         mm_copy(hd, MVID_MAGIC, 4);
-        hd[4] = MMEDIA_VERSION; hd[5] = in->alpha ? 4 : 3; hd[6] = MMEDIA_TILE_LOG2;
+        hd[4] = motion ? MVID_VERSION_CODEC : MMEDIA_VERSION; hd[5] = in->alpha ? 4 : 3; hd[6] = MMEDIA_TILE_LOG2;
         hd[7] = in->has_audio ? 1 : 0;
         mm_put32(hd + 8, in->width); mm_put32(hd + 12, in->height);
         mm_put32(hd + 16, in->fps_num); mm_put32(hd + 20, in->fps_den);
         mm_put32(hd + 24, in->frame_count); mm_put32(hd + 28, in->duration_ms);
         mm_put64(hd + 32, in->index_offset); mm_put64(hd + 40, in->audio_offset);
         mm_put64(hd + 48, in->audio_size); mm_put32(hd + 56, in->keyframe_interval);
+        if (motion) mm_put32(hd + 60, MVID_CODEC_MOTION);
         ok = v->write(v->ctx, 0, hd, MVID_HEADER_SIZE);
     }
+    if (v->mc_ready) mmc_free(&v->mc, v->free);
+    v->mc_ready = false;
+    if (v->work) v->free(v->work);
+    v->work = NULL;
     if (v->prev) v->free(v->prev);
     if (v->frame) v->free(v->frame);
     if (v->index) v->free(v->index);
@@ -527,12 +644,16 @@ typedef struct {
     uint8_t* frame;             /* one encoded frame */
     size_t frame_cap;
     int64_t decoded;            /* frame in the output buffer, -1 = none */
+    mmc_t mc;                   /* motion: the decoder */
+    bool mc_ready;
 } mvid_reader_t;
 
 MM_FN bool mvid_parse_header(const uint8_t* hd, uint64_t file_size, mvid_info_t* in) {
-    if (!mm_same(hd, MVID_MAGIC, 4) || hd[4] != MMEDIA_VERSION || (hd[5] != 3 && hd[5] != 4) ||
-        hd[6] != MMEDIA_TILE_LOG2)
+    if (!mm_same(hd, MVID_MAGIC, 4) || (hd[4] != MMEDIA_VERSION && hd[4] != MVID_VERSION_CODEC) ||
+        (hd[5] != 3 && hd[5] != 4) || hd[6] != MMEDIA_TILE_LOG2)
         return false;
+    in->codec = hd[4] == MVID_VERSION_CODEC ? mm_get32(hd + 60) : MVID_CODEC_TILES;
+    if (in->codec > MVID_CODEC_MOTION || (in->codec == MVID_CODEC_MOTION && hd[5] != 3)) return false;
     in->alpha = hd[5] == 4;
     in->has_audio = (hd[7] & 1u) != 0;
     in->width = mm_get32(hd + 8); in->height = mm_get32(hd + 12);
@@ -568,13 +689,20 @@ MM_FN bool mvid_open(mvid_reader_t* r, mvid_read_fn read, void* ctx, uint64_t si
     }
     r->frame_cap = largest < bound ? largest : bound;
     r->frame = (uint8_t*)alloc(r->frame_cap ? r->frame_cap : 1);
-    return r->frame != NULL;
+    if (!r->frame) return false;
+    if (r->info.codec == MVID_CODEC_MOTION) {
+        r->mc_ready = true;   /* mmc_init clears it on failure; mmc_free copes */
+        if (!mmc_init(&r->mc, r->info.width, r->info.height, false, alloc)) return false;
+    }
+    return true;
 }
 
 MM_FN void mvid_close(mvid_reader_t* r, mvid_free_fn free_fn) {
     if (r->index) free_fn(r->index);
     if (r->frame) free_fn(r->frame);
     r->index = NULL; r->frame = NULL;
+    if (r->mc_ready) mmc_free(&r->mc, free_fn);
+    r->mc_ready = false;
 }
 
 /* The frame shown at `ms`. */
@@ -588,6 +716,16 @@ MM_FN bool mvid_decode_one(mvid_reader_t* r, uint32_t n, uint32_t* out) {
     uint64_t offset = mm_get64(e);
     uint32_t size = mm_get32(e + 8);
     uint32_t w = r->info.width, h = r->info.height;
+    if (r->info.codec == MVID_CODEC_MOTION) {
+        if (size < 5u || size > r->frame_cap || offset + size > r->size || !r->read(r->ctx, offset, r->frame, size))
+            return false;
+        bool key = (r->frame[0] & MVID_FRAME_KEY) != 0;
+        if (!key && r->decoded != (int64_t)n - 1) return false;
+        if (!mmc_decode_frame(&r->mc, r->frame + 4, size - 4u, key, r->frame[1])) return false;
+        mmc_to_argb(&r->mc, out, w, h, w);
+        r->decoded = n;
+        return true;
+    }
     uint32_t tiles = mm_tiles(w, h), across = mm_tiles_x(w), bitmap_bytes = (tiles + 7u) / 8u;
     if (size < 4u + bitmap_bytes || size > r->frame_cap || offset + size > r->size ||
         !r->read(r->ctx, offset, r->frame, size))
