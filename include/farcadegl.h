@@ -308,6 +308,17 @@ static inline int fglGetDeviceInfo(syscall_gpu_info_t* info) {
     return fgl__call(&r) == SYS_SUCCESS ? 0 : -1;
 }
 
+// FarcadeGL can auto-detect the 3D pipeline from the kernel's GPU info.
+static inline int fglHasHardware3D(void) {
+    syscall_gpu_info_t info;
+    return fglGetDeviceInfo(&info) == 0 && (info.caps & FGPU_CAP_HW_3D) != 0;
+}
+
+static inline int fglHasShaders(void) {
+    syscall_gpu_info_t info;
+    return fglGetDeviceInfo(&info) == 0 && (info.caps & FGPU_CAP_SHADERS) != 0;
+}
+
 static inline FGLSurface fgl__surface(uint32_t w, uint32_t h, uint32_t format, uint32_t flags) {
     syscall_gpu_request_t r;
     memset(&r, 0, sizeof(r));

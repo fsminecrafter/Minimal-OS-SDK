@@ -120,7 +120,9 @@ int main(int argc, char** argv) {
         printf("fglcube: this kernel has no GPU interface\n");
         return 1;
     }
-    printf("GPU: %s (%s), backend: %s\n", info.name, info.driver, info.backend);
+    printf("GPU: %s (%s), backend: %s, hw-3d: %s\n",
+           info.name, info.driver, info.backend,
+           (info.caps & FGPU_CAP_HW_3D) ? "yes" : "no");
 
     // A window manager owns the screen under MOSdesk: use a window.
     long owner = screen_owner();

@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include "fgpu_abi.h"   // SYS_GPU (FarcadeGL's kernel interface)
+#include "media_abi.h"  // SYS_MEDIA (parallel .vid tile decoding)
 
 #define SYS_WRITE   1
 #define SYS_EXIT    2

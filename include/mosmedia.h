@@ -40,6 +40,10 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include "mosmedia_motion.h"
+#if defined(MINIMALOS_TARGET)
+#include "minimalos.h"
+#include "media_abi.h"
+#endif
 
 #define MIMG_MAGIC "MIMG"
 #define MVID_MAGIC "MVID"
@@ -257,7 +261,7 @@ MM_FN bool mm_tile_decode(const uint8_t* in, size_t size, uint32_t* px, uint32_t
         if (f > 2u || (f == MMEDIA_FILTER_UP && y == 0) || (f == MMEDIA_FILTER_PREV && !has_prev))
             return false;
         uint32_t* dst = px + (size_t)(y0 + y) * stride + x0;
-        const uint32_t* up = dst - stride;
+        const uint32_t* up = y ? dst - stride : NULL;
         for (uint32_t x = 0; x < tw; x++) {
             if (run) {
                 run--;
@@ -740,6 +744,27 @@ MM_FN bool mvid_decode_one(mvid_reader_t* r, uint32_t n, uint32_t* out) {
     if (4u + bitmap_bytes + (uint64_t)coded * 4u > size) return false;
     const uint8_t* data = sizes + (size_t)coded * 4u;
     size_t avail = size - (size_t)(data - f), at = 0;
+#if defined(MINIMALOS_TARGET)
+    if (coded > 1u) {
+        syscall_media_request_t request = {
+            .size = sizeof(request),
+            .version = SYS_MEDIA_ABI_VERSION,
+            .op = SYS_MEDIA_DECODE_TILES,
+            .flags = key ? 0u : SYS_MEDIA_HAS_PREVIOUS_FRAME,
+            .width = w,
+            .height = h,
+            .frame_bytes = size,
+            .frame = f,
+            .pixels = out
+        };
+        long result = mos_syscall(SYS_MEDIA, (long)(uintptr_t)&request, 0, 0);
+        if (result == SYS_SUCCESS) {
+            r->decoded = n;
+            return true;
+        }
+        if (result != SYS_ERR_AGAIN && result != SYS_ERR_GENERIC) return false;
+    }
+#endif
     uint32_t k = 0;
     for (uint32_t t = 0; t < tiles; t++) {
         if (!((bitmap[t / 8u] >> (t % 8u)) & 1u)) {
