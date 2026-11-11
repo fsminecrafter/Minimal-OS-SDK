@@ -183,6 +183,20 @@ static inline uint64_t mos_window_set_resizable(uint32_t id, bool resizable) {
     return mos_window_set_flags(id, flags);
 }
 
+// Takes the mouse while the window is focused (games): the cursor is
+// hidden and the window gets SYSCALL_WINDOW_EVENT_MOUSE_RELATIVE events
+// (x, y = movement). Turn it off again to give the mouse back.
+static inline uint64_t mos_window_set_pointer_lock(uint32_t id, bool locked) {
+    syscall_window_info_t info;
+    uint64_t result = mos_window_get_info(id, &info);
+    if (result != SYS_SUCCESS) return result;
+    uint32_t flags = locked
+        ? info.flags | SYSCALL_WINDOW_POINTER_LOCK
+        : info.flags & ~SYSCALL_WINDOW_POINTER_LOCK;
+    // The focus bit belongs to the window manager.
+    return mos_window_set_flags(id, flags & ~SYSCALL_WINDOW_FOCUSED);
+}
+
 static inline uint64_t mos_window_set_visible(uint32_t id, bool visible) {
     syscall_window_info_t info;
     uint64_t result = mos_window_get_info(id, &info);

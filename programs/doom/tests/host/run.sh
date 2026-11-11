@@ -13,8 +13,8 @@ rm -rf "$WORK"
 mkdir -p "$WORK"
 FLAGS="-std=gnu11 -O1 -g -ffreestanding -fno-builtin -fno-stack-protector -fno-pie -no-pie -static -nostdlib
        -nostdinc -isystem $($CC -print-file-name=include) -I $ROOT/src -I $ROOT/include -I $HERE/sdk"
-$CC $FLAGS -o "$WORK/doom_host" "$HERE/platform.c" "$ROOT/libc/libc.c" "$ROOT"/src/*.c -lgcc
+$CC $FLAGS -o "$WORK/doom_host" "$HERE/platform.c" "$ROOT/sound.c" "$ROOT/libc/libc.c" "$ROOT"/src/*.c -lgcc
 "$WORK/doom_host" "$IWAD" "$WORK" > "$WORK/run1.log" 2>&1 || { tail -20 "$WORK/run1.log"; exit 1; }
 "$WORK/doom_host" "$IWAD" "$WORK" again > "$WORK/run2.log" 2>&1 || { tail -20 "$WORK/run2.log"; exit 1; }
-echo "run 1:"; grep -E "^(frame|exit|[0-9]+ frames)|Error" "$WORK/run1.log" || true
+echo "run 1:"; grep -E "^(frame|exit|sound|[0-9]+ frames)|Error" "$WORK/run1.log" || true
 echo "run 2:"; grep -E "^(exit|[0-9]+ frames)|Error" "$WORK/run2.log" || true

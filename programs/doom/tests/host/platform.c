@@ -80,7 +80,11 @@ void DG_SetWindowTitle(const char* t) { printf("title: %s\n", t); }
 static char g_dir[256];
 const char* doom_data_dir(void) { return g_dir; }
 void doom_console_text(const char* t, size_t n) { (void)t; (void)n; }
-void doom_platform_exit(int code) { printf("exit code %d after %ld simulated ms\n", code, g_now); }
+unsigned long test_audio_frames, test_audio_loud;
+void doom_platform_exit(int code) {
+    printf("sound: %lu frames mixed, %lu loud samples\n", test_audio_frames, test_audio_loud);
+    printf("exit code %d after %ld simulated ms\n", code, g_now);
+}
 
 static int g_again;
 typedef struct { long at; unsigned char key; int pressed; } step_t;

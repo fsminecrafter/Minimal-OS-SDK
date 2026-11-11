@@ -21,6 +21,16 @@
  * Keys: arrows move and turn, Ctrl fires, Space opens doors, Shift runs,
  * Alt strafes, 1-7 pick weapons, Escape is the menu, Tab the map.
  * Alt+Enter switches full screen.
+ *
+ * The mouse: while a level is being played (not in the menu, not paused)
+ * the window asks mosWM for pointer lock: the cursor is hidden and kept
+ * by the window, and mosWM sends how far the mouse moved
+ * (SYSCALL_WINDOW_EVENT_MOUSE_RELATIVE). As in 1993, sideways turns,
+ * forward and back walks, the left button fires, the right one strafes
+ * and the middle one walks forward. The menu (Escape), pausing or
+ * switching to another window gives the cursor back.
+ *
+ * Sound effects are in sound.c.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,6 +40,8 @@
 #include "minimalos.h"
 #include "src/doomgeneric.h"
 #include "src/doomkeys.h"
+#include "src/doomstat.h"
+#include "src/d_event.h"
 
 void I_Quit(void);
 
@@ -46,6 +58,11 @@ static int g_tex_loc = -1;
 static uint32_t g_width = START_W, g_height = START_H;
 static int g_fullscreen;
 static int g_alt_down;
+static int g_focused = 1;
+static int g_locked;                    /* pointer lock asked for */
+static int g_mouse_dx, g_mouse_dy;      /* motion since the last tic */
+static int g_mouse_buttons, g_mouse_sent_buttons;
+static int g_mouse_moved;
 static char g_data_dir[256] = "0:/programs/Doom/";
 
 /* --------------------------------------------------------- the picture */
@@ -206,6 +223,33 @@ static void release_all_keys(void) {
     g_alt_down = 0;
 }
 
+/* Pointer lock while a level is played; the cursor back otherwise. */
+static void update_pointer_lock(void) {
+    int want = g_window && g_focused && gamestate == GS_LEVEL && !menuactive && !paused && !demoplayback;
+    if (want == g_locked) return;
+    if (mos_window_set_pointer_lock(g_window, want != 0) != SYS_SUCCESS) return;
+    g_locked = want;
+    g_mouse_dx = g_mouse_dy = 0;
+    g_mouse_moved = 0;
+    g_mouse_buttons = 0;
+}
+
+/* Doom reads the mouse once per tic (G_Responder sets, not adds, the
+ * motion), so the motion of all events since the last tic goes in one. */
+static void post_mouse(void) {
+    if (!g_mouse_moved && g_mouse_buttons == g_mouse_sent_buttons) return;
+    event_t ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.type = ev_mouse;
+    ev.data1 = g_mouse_buttons;         /* bit 0 fire, 1 strafe, 2 forward: the same bits */
+    ev.data2 = g_mouse_dx;
+    ev.data3 = -g_mouse_dy;             /* away from you (up) walks forward */
+    D_PostEvent(&ev);
+    g_mouse_sent_buttons = g_mouse_buttons;
+    g_mouse_dx = g_mouse_dy = 0;
+    g_mouse_moved = 0;
+}
+
 static void pump_events(void) {
     syscall_window_event_t ev;
     while (mos_window_next_event(g_window, &ev) == SYS_SUCCESS) {
@@ -223,6 +267,24 @@ static void pump_events(void) {
                 break;
             case SYSCALL_WINDOW_EVENT_FOCUS_LOST:
                 release_all_keys();
+                g_focused = 0;
+                g_mouse_buttons = 0;
+                update_pointer_lock();
+                break;
+            case SYSCALL_WINDOW_EVENT_FOCUS_GAINED:
+                g_focused = 1;
+                break;
+            case SYSCALL_WINDOW_EVENT_MOUSE_RELATIVE:
+                if (!g_locked) break;
+                g_mouse_dx += ev.x;
+                g_mouse_dy += ev.y;
+                g_mouse_moved = 1;
+                g_mouse_buttons = ev.buttons & 7;
+                break;
+            case SYSCALL_WINDOW_EVENT_MOUSE:
+                // Clicks count only while locked: without the lock the
+                // cursor is free, and a click is just a click.
+                if (g_locked) g_mouse_buttons = ev.buttons & 7;
                 break;
             case SYSCALL_WINDOW_EVENT_KEY: {
                 int pressed = ev.buttons != 0;
@@ -239,7 +301,13 @@ static void pump_events(void) {
 
 int DG_GetKey(int* pressed, unsigned char* key) {
     if (g_key_head == g_key_tail) pump_events();
-    if (g_key_head == g_key_tail) return 0;
+    if (g_key_head == g_key_tail) {
+        // Keys first, then the mouse: I_GetEvent calls this until it
+        // returns 0, once per tic.
+        update_pointer_lock();
+        post_mouse();
+        return 0;
+    }
     *key = g_keys[g_key_head % KEY_QUEUE].key;
     *pressed = g_keys[g_key_head % KEY_QUEUE].pressed;
     g_key_head++;
@@ -310,6 +378,7 @@ void doom_platform_exit(int code) {
         }
     }
     destroy_gl();
+    if (g_window && g_locked) mos_window_set_pointer_lock(g_window, false);
     if (g_window) mos_window_close(g_window);
     g_window = 0;
 }
