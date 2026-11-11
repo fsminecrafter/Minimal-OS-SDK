@@ -498,7 +498,7 @@ struct doom_file {
     int flags;
     long pos;
     int unget;              /* a character pushed back, -1 = none */
-    char buf[256];          /* console output: one line at a time */
+    char buf[4096];         /* console: one line at a time; files: writes not yet made */
     size_t buf_len;
 };
 
@@ -533,8 +533,20 @@ FILE* fopen(const char* path, const char* mode) {
     return f;
 }
 
+/* File writes are gathered in f->buf and written in one go: each
+ * mos_fwrite is a disk write, and printf hands over one character at a
+ * time (saving the config on quit was thousands of writes). */
+static int flush_writes(FILE* f) {
+    if ((f->flags & F_CONSOLE) || !f->buf_len) return 0;
+    long n = mos_fwrite(f->fd, f->buf, f->buf_len);
+    f->buf_len = 0;
+    if (n < 0) { f->flags |= F_ERR; return EOF; }
+    return 0;
+}
+
 int fflush(FILE* f) {
     if (!f) { fflush(stdout); fflush(stderr); return 0; }
+    if (!(f->flags & F_CONSOLE)) return flush_writes(f);
     if ((f->flags & F_CONSOLE) && f->buf_len) {
         mos_write(f == stderr ? 2 : 1, f->buf, f->buf_len);
         doom_console_text(f->buf, f->buf_len);
@@ -547,15 +559,17 @@ int fclose(FILE* f) {
     if (!f) return EOF;
     fflush(f);
     if (f->flags & F_CONSOLE) return 0;
+    int r = flush_writes(f);
     mos_close(f->fd);
     free(f);
-    return 0;
+    return r;
 }
 
 size_t fread(void* buf, size_t size, size_t count, FILE* f) {
     size_t want = size * count, got = 0;
     if (!f || !want || !(f->flags & F_READ) || (f->flags & F_CONSOLE)) return 0;
     unsigned char* out = buf;
+    flush_writes(f);
     if (f->unget >= 0) { out[got++] = (unsigned char)f->unget; f->unget = -1; f->pos++; }
     while (got < want) {
         long n = mos_read(f->fd, out + got, want - got);
@@ -575,6 +589,14 @@ size_t fwrite(const void* buf, size_t size, size_t count, FILE* f) {
         for (size_t i = 0; i < want; i++) fputc(p[i], f);
         return count;
     }
+    if (f->buf_len + want <= sizeof(f->buf)) {
+        memcpy(f->buf + f->buf_len, buf, want);
+        f->buf_len += want;
+        f->pos += (long)want;
+        if (f->buf_len == sizeof(f->buf) && flush_writes(f) == EOF) return 0;
+        return count;
+    }
+    if (flush_writes(f) == EOF) return 0;
     long n = mos_fwrite(f->fd, buf, want);
     if (n < 0) { f->flags |= F_ERR; return 0; }
     f->pos += n;
@@ -583,6 +605,7 @@ size_t fwrite(const void* buf, size_t size, size_t count, FILE* f) {
 
 int fseek(FILE* f, long offset, int whence) {
     if (!f || (f->flags & F_CONSOLE)) return -1;
+    if (flush_writes(f) == EOF) return -1;     /* before SEEK_END reads the size */
     long target = offset;
     if (whence == SEEK_CUR) target = f->pos + offset;
     else if (whence == SEEK_END) target = mos_size(f->fd) + offset;

@@ -243,9 +243,14 @@ void I_BindVariables(void)
 // I_Quit
 //
 
+void doom_platform_quitting(void);     // main.c
+
 void I_Quit (void)
 {
     atexit_listentry_t *entry;
+
+    // Minimal-OS: the window goes away now; saving the settings follows.
+    doom_platform_quitting();
 
     // Run through all exit functions
  
