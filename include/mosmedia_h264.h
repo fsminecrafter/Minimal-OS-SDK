@@ -24,6 +24,12 @@
  *   if (h264_decode(&d, data, size)) h264_to_argb(&d, out, w, h, stride);
  *   h264_free(&d, free_fn);
  *
+ * A hardware decoder can do the pictures instead: every h264_decode also
+ * fills d->hw (a syscall_media_h264_t: parameter sets, reference pictures
+ * and the slices of the picture), which is what the graphics card's video
+ * decoder needs. With d->hw_only set, h264_decode stops there - headers
+ * and reference bookkeeping only, no pixels. mosmedia.h uses both.
+ *
  * The code tables (coefficient tokens, zero runs, deblocking thresholds)
  * are those of the standard, ITU-T H.264.
  */
@@ -33,6 +39,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include "media_abi.h"
 
 #ifndef H264_FN
 #define H264_FN static inline
@@ -51,7 +58,7 @@ typedef struct {
     bool valid;
     uint8_t profile, level;
     uint8_t log2_max_frame_num, poc_type, log2_max_poc_lsb;
-    bool delta_pic_order_always_zero;
+    bool delta_pic_order_always_zero, direct_8x8_inference;
     uint8_t max_refs;
     uint16_t mb_w, mb_h;
     uint16_t crop_l, crop_r, crop_t, crop_b;        /* pixels */
@@ -63,13 +70,14 @@ typedef struct {
     bool valid;
     uint8_t sps;
     bool pic_order_present, deblocking_control, constrained_intra, redundant_pic_cnt;
-    uint8_t num_ref_default;
+    uint8_t num_ref_default, num_ref_l1_default, weighted_bipred_idc;
     int8_t init_qp, chroma_qp_offset;
 } h264_pps_t;
 
 typedef struct {
     uint8_t* plane[3];
     int frame_num, pic_num, lt_idx;
+    int poc;                    /* picture order count */
     bool ref, long_term;
 } h264_pic_t;
 
@@ -129,6 +137,14 @@ typedef struct h264 {
     h264_pic_t* list[H264_MAX_REFS + 1];
     uint32_t list_len;
     uint32_t done;              /* 4x4 blocks of this macroblock that have their motion vector */
+
+    /* For a hardware decoder (see the top of this file). */
+    bool hw_only;               /* set by the caller: no pixels, headers only */
+    bool hw_valid;              /* hw describes the picture h264_decode just returned true for */
+    syscall_media_h264_t hw;
+    uint8_t* hw_data;           /* the picture's slice NAL units */
+    /* Picture order count: what carries over from picture to picture. */
+    int prev_poc_msb, prev_poc_lsb, prev_frame_num, frame_num_offset;
 } h264_t;
 
 /* ----------------------------------------------------------- tables */
@@ -283,17 +299,19 @@ H264_FN bool h264_init(h264_t* d, h264_alloc_fn alloc, size_t max_unit) {
     d->max_lt_idx = -1;
     d->rbsp_cap = max_unit + 8u;
     d->rbsp = (uint8_t*)alloc(d->rbsp_cap);
-    return d->rbsp != NULL;
+    d->hw_data = (uint8_t*)alloc(d->rbsp_cap);
+    return d->rbsp != NULL && d->hw_data != NULL;
 }
 
 H264_FN void h264_free(h264_t* d, h264_free_fn free_fn) {
     if (!free_fn) return;
-    void* all[] = { d->rbsp, d->mb_slice, d->mb_intra, d->mb_qp, d->mb_filter, d->i4mode, d->nz_y, d->mv,
+    void* all[] = { d->rbsp, d->hw_data, d->mb_slice, d->mb_intra, d->mb_qp, d->mb_filter, d->i4mode, d->nz_y, d->mv,
                     d->ref_idx, d->ref_pic, d->nz_c[0], d->nz_c[1] };
     for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++) if (all[i]) free_fn(all[i]);
     for (uint32_t i = 0; i < H264_MAX_PICS; i++)
         for (int p = 0; p < 3; p++) if (d->pics[i].plane[p]) free_fn(d->pics[i].plane[p]);
     d->rbsp = NULL;
+    d->hw_data = NULL;
     d->sized = false;
 }
 
@@ -371,7 +389,7 @@ H264_FN bool h264_parse_sps(h264_t* d, h264_bits_t* b) {
     s.max_refs = (uint8_t)refs;
     s.mb_w = (uint16_t)mw;
     s.mb_h = (uint16_t)mh;
-    h264_u(b, 1);
+    s.direct_8x8_inference = h264_u(b, 1);
     if (h264_u(b, 1)) {
         uint32_t l = h264_ue(b) * 2u, r = h264_ue(b) * 2u, t = h264_ue(b) * 2u, bo = h264_ue(b) * 2u;
         if (b->err || l + r >= mw * 16u || t + bo >= mh * 16u) return h264_fail(d, "bad cropping");
@@ -406,9 +424,10 @@ H264_FN bool h264_parse_pps(h264_t* d, h264_bits_t* b) {
     p.pic_order_present = h264_u(b, 1);
     if (h264_ue(b)) return h264_fail(d, "slice groups are not supported");
     uint32_t n0 = h264_ue(b) + 1u;
-    h264_ue(b);
+    uint32_t n1 = h264_ue(b);
     if (h264_u(b, 1)) return h264_fail(d, "weighted prediction is not supported");
-    h264_u(b, 2);
+    p.weighted_bipred_idc = (uint8_t)h264_u(b, 2);
+    p.num_ref_l1_default = (uint8_t)(n1 < 32u ? n1 : 31u);
     int qp = 26 + h264_se(b);
     h264_se(b);
     int cqp = h264_se(b);
@@ -1327,7 +1346,7 @@ H264_FN void h264_mark(h264_t* d, int frame_num) {
 
 H264_FN void h264_finish_picture(h264_t* d, int frame_num) {
     if (!d->cur) return;
-    h264_deblock(d);
+    if (!d->hw_only) h264_deblock(d);
     if (d->pic_is_ref) h264_mark(d, frame_num);
     d->out = d->cur;
     d->cur = NULL;
@@ -1346,8 +1365,9 @@ H264_FN bool h264_slice(h264_t* d, h264_bits_t* b, int nal_type, int nal_ref, in
     bool idr = nal_type == 5;
     int frame_num = (int)h264_u(b, sp->log2_max_frame_num);
     if (idr) h264_ue(b);
+    int poc_lsb = 0;
     if (sp->poc_type == 0) {
-        h264_u(b, sp->log2_max_poc_lsb);
+        poc_lsb = (int)h264_u(b, sp->log2_max_poc_lsb);
         if (pp->pic_order_present) h264_se(b);
     } else if (sp->poc_type == 1 && !sp->delta_pic_order_always_zero) {
         h264_se(b);
@@ -1377,8 +1397,69 @@ H264_FN bool h264_slice(h264_t* d, h264_bits_t* b, int nal_type, int nal_ref, in
         d->mmco_count = 0;
         size_t mbs = (size_t)d->mb_w * d->mb_h;
         for (size_t i = 0; i < mbs; i++) d->mb_slice[i] = 0;
+
+        /* The picture order count (8.2.1), for types 0 and 2. */
+        bool poc_known = true;
+        if (sp->poc_type == 0) {
+            int max_lsb = 1 << sp->log2_max_poc_lsb, msb;
+            if (idr) d->prev_poc_msb = d->prev_poc_lsb = 0;
+            if (poc_lsb < d->prev_poc_lsb && d->prev_poc_lsb - poc_lsb >= max_lsb / 2) msb = d->prev_poc_msb + max_lsb;
+            else if (poc_lsb > d->prev_poc_lsb && poc_lsb - d->prev_poc_lsb > max_lsb / 2) msb = d->prev_poc_msb - max_lsb;
+            else msb = d->prev_poc_msb;
+            pic->poc = msb + poc_lsb;
+            if (nal_ref) { d->prev_poc_msb = msb; d->prev_poc_lsb = poc_lsb; }
+        } else if (sp->poc_type == 2) {
+            if (idr) d->frame_num_offset = 0;
+            else if (d->prev_frame_num > frame_num) d->frame_num_offset += d->max_frame_num;
+            pic->poc = idr ? 0 : 2 * (d->frame_num_offset + frame_num) - (nal_ref ? 0 : 1);
+        } else {
+            poc_known = false;
+            pic->poc = 0;
+        }
+        d->prev_frame_num = frame_num;
+
+        /* What a hardware decoder needs to know about the picture. */
+        syscall_media_h264_t* hw = &d->hw;
+        hw->mb_w = sp->mb_w; hw->mb_h = sp->mb_h;
+        hw->log2_max_frame_num_minus4 = (uint8_t)(sp->log2_max_frame_num - 4);
+        hw->poc_type = sp->poc_type;
+        hw->log2_max_poc_lsb_minus4 = (uint8_t)(sp->poc_type == 0 ? sp->log2_max_poc_lsb - 4 : 0);
+        hw->delta_pic_order_always_zero = sp->delta_pic_order_always_zero;
+        hw->direct_8x8_inference = sp->direct_8x8_inference;
+        hw->max_refs = sp->max_refs;
+        hw->entropy_coding_mode = 0;
+        hw->pic_order_present = pp->pic_order_present;
+        hw->num_ref_l0_default_minus1 = (uint8_t)(pp->num_ref_default - 1u);
+        hw->num_ref_l1_default_minus1 = pp->num_ref_l1_default;
+        hw->deblocking_control = pp->deblocking_control;
+        hw->redundant_pic_cnt_present = pp->redundant_pic_cnt;
+        hw->transform_8x8 = 0;
+        hw->weighted_pred = 0;
+        hw->weighted_bipred_idc = pp->weighted_bipred_idc;
+        hw->constrained_intra = pp->constrained_intra;
+        hw->pic_init_qp_minus26 = (int8_t)(pp->init_qp - 26);
+        hw->chroma_qp_offset = pp->chroma_qp_offset;
+        hw->second_chroma_qp_offset = pp->chroma_qp_offset;
+        hw->is_reference = nal_ref != 0;
+        hw->frame_num = (uint32_t)frame_num;
+        hw->poc = pic->poc;
+        hw->cur_index = (uint8_t)(pic - d->pics);
+        hw->flags = idr ? SYS_MEDIA_H264_RESET : 0u;
+        hw->ref_count = 0;
+        for (uint32_t i = 0; i < d->pic_count && hw->ref_count < 16u; i++) {
+            const h264_pic_t* r = &d->pics[i];
+            if (r == pic || !r->ref) continue;
+            syscall_media_h264_ref_t* e = &hw->refs[hw->ref_count++];
+            e->index = (uint8_t)i;
+            e->long_term = r->long_term;
+            e->reserved = 0;
+            e->frame_num = (uint32_t)(r->long_term ? r->lt_idx : r->frame_num);
+            e->poc = r->poc;
+        }
+        d->hw_valid = poc_known;
+
         /* Macroblocks no slice covers keep the last picture's pixels. */
-        if (d->out && d->out != pic && !idr) {
+        if (!d->hw_only && d->out && d->out != pic && !idr) {
             for (int p = 0; p < 3; p++) {
                 size_t n = p ? (size_t)d->cw * d->ch : (size_t)d->w * d->h;
                 for (size_t i = 0; i < n; i++) pic->plane[p][i] = d->out->plane[p][i];
@@ -1467,6 +1548,8 @@ H264_FN bool h264_slice(h264_t* d, h264_bits_t* b, int nal_type, int nal_ref, in
     uint32_t total = d->mb_w * d->mb_h;
     if (b->err || d->qp < 0 || d->qp > 51 || first_mb >= total) return h264_fail(d, "damaged slice header");
 
+    if (d->hw_only) return !b->err || h264_fail(d, "damaged slice header");
+
     /* Where the data ends: the last 1 bit is the stop bit. */
     uint32_t end = b->bits;
     while (end > b->pos && !((b->p[(end - 1u) >> 3] >> (7u - ((end - 1u) & 7u))) & 1u)) end--;
@@ -1492,7 +1575,12 @@ H264_FN bool h264_slice(h264_t* d, h264_bits_t* b, int nal_type, int nal_ref, in
  * error (h264_error is ""). */
 H264_FN bool h264_decode(h264_t* d, const uint8_t* data, size_t size) {
     d->error = NULL;
-    if (!d->rbsp || size > d->rbsp_cap) return h264_fail(d, "access unit too large");
+    d->hw_valid = false;
+    d->hw.slice_count = 0;
+    d->hw.data = d->hw_data;
+    d->hw.data_bytes = 0;
+    bool hw_fits = true;
+    if (!d->rbsp || !d->hw_data || size > d->rbsp_cap) return h264_fail(d, "access unit too large");
     int frame_num = 0;
     bool ok = true, picture = false;
     size_t i = 0;
@@ -1520,6 +1608,17 @@ H264_FN bool h264_decode(h264_t* d, const uint8_t* data, size_t size) {
         else if (nal_type == 1 || nal_type == 5) {
             ok = h264_slice(d, &b, nal_type, nal_ref, &frame_num);
             picture = picture || d->cur != NULL;
+            /* The slice as it is, behind a start code, for a hardware decoder. */
+            size_t bytes = end - i;
+            if (ok && d->hw.slice_count < SYS_MEDIA_H264_MAX_SLICES && d->hw.data_bytes + 3u + bytes <= d->rbsp_cap) {
+                uint8_t* to = d->hw_data + d->hw.data_bytes;
+                d->hw.slice_offset[d->hw.slice_count++] = d->hw.data_bytes;
+                to[0] = 0; to[1] = 0; to[2] = 1;
+                for (size_t k = 0; k < bytes; k++) to[3 + k] = data[i + k];
+                d->hw.data_bytes += 3u + (uint32_t)bytes;
+            } else {
+                hw_fits = false;
+            }
         } else if (nal_type >= 2 && nal_type <= 4) {
             ok = h264_fail(d, "data partitioning is not supported");
         }
@@ -1532,6 +1631,7 @@ H264_FN bool h264_decode(h264_t* d, const uint8_t* data, size_t size) {
     }
     if (!picture || !d->cur) return false;
     h264_finish_picture(d, frame_num);
+    d->hw_valid = d->hw_valid && hw_fits && d->hw.slice_count > 0;
     return true;
 }
 

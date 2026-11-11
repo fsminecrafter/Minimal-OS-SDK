@@ -673,6 +673,24 @@ MM_FN bool mvid_writer_finish(mvid_writer_t* v, const void* adi, size_t adi_size
     return ok;
 }
 
+/* A hardware H.264 decoder: decodes the picture `pic` describes into
+ * w x h pixels (0xFFRRGGBB, rows of w). False = cannot, or not now. */
+typedef bool (*mvid_h264_hw_fn)(void* ctx, const syscall_media_h264_t* pic, uint32_t* out, uint32_t w, uint32_t h);
+/* Told when the hardware decoder's pictures differ from the CPU's. */
+typedef void (*mvid_h264_report_fn)(void* ctx);
+
+/* A file starts on the CPU decoder. From its first keyframe the hardware
+ * decoder decodes every picture too and the two are compared pixel for
+ * pixel; after MVID_HW_CHECK_FRAMES equal pictures it is trusted and
+ * takes over alone at the next keyframe. One different picture, or a
+ * refusal, and the file stays on the CPU. */
+#define MVID_HW_NEW      0u
+#define MVID_HW_CHECKING 1u
+#define MVID_HW_TRUSTED  2u
+#define MVID_HW_ONLY     3u
+#define MVID_HW_OFF      4u
+#define MVID_HW_CHECK_FRAMES 12u
+
 typedef struct {
     mvid_info_t info;
     mvid_read_fn read;
@@ -687,6 +705,13 @@ typedef struct {
     bool no_gpu;                /* motion, h264: colour conversion stays on the CPU */
     h264_t h264;                /* h264: the decoder */
     bool h264_ready;
+    /* h264 on a hardware decoder (see mvid_decode_one). */
+    mvid_h264_hw_fn hw_decode;  /* NULL = none; set by mvid_open on Minimal-OS */
+    mvid_h264_report_fn hw_mismatch;
+    void* hw_ctx;
+    uint32_t hw_state;          /* MVID_HW_* */
+    uint32_t hw_checked;        /* pictures that came out the same on both */
+    uint32_t* hw_check;         /* a picture from the hardware decoder, to compare */
 } mvid_reader_t;
 
 MM_FN bool mvid_parse_header(const uint8_t* hd, uint64_t file_size, mvid_info_t* in) {
@@ -709,6 +734,32 @@ MM_FN bool mvid_parse_header(const uint8_t* hd, uint64_t file_size, mvid_info_t*
     if (in->has_audio && in->audio_offset + in->audio_size > file_size) return false;
     return true;
 }
+
+#if defined(MINIMALOS_TARGET)
+/* The kernel's hardware H.264 decoder (the graphics card's NVDEC). */
+MM_FN bool mvid_h264_syscall(void* ctx, const syscall_media_h264_t* pic, uint32_t* out, uint32_t w, uint32_t h) {
+    (void)ctx;
+    syscall_media_request_t request = {
+        .size = sizeof(request),
+        .version = SYS_MEDIA_ABI_VERSION,
+        .op = SYS_MEDIA_DECODE_H264,
+        .width = w,
+        .height = h,
+        .frame_bytes = sizeof(*pic),
+        .frame = (const uint8_t*)pic,
+        .pixels = out
+    };
+    return mos_syscall(SYS_MEDIA, (long)(uintptr_t)&request, 0, 0) == SYS_SUCCESS;
+}
+
+MM_FN void mvid_h264_mismatch_syscall(void* ctx) {
+    (void)ctx;
+    syscall_media_request_t request = {
+        .size = sizeof(request), .version = SYS_MEDIA_ABI_VERSION, .op = SYS_MEDIA_H264_MISMATCH
+    };
+    mos_syscall(SYS_MEDIA, (long)(uintptr_t)&request, 0, 0);
+}
+#endif
 
 /* Opens a video: reads the header and the index. */
 MM_FN bool mvid_open(mvid_reader_t* r, mvid_read_fn read, void* ctx, uint64_t size,
@@ -740,6 +791,12 @@ MM_FN bool mvid_open(mvid_reader_t* r, mvid_read_fn read, void* ctx, uint64_t si
     if (r->info.codec == MVID_CODEC_H264) {
         r->h264_ready = true;
         if (!h264_init(&r->h264, alloc, r->frame_cap)) return false;
+        r->hw_check = (uint32_t*)alloc((size_t)r->info.width * r->info.height * 4u);
+        if (!r->hw_check) return false;
+#if defined(MINIMALOS_TARGET)
+        r->hw_decode = mvid_h264_syscall;
+        r->hw_mismatch = mvid_h264_mismatch_syscall;
+#endif
     }
     return true;
 }
@@ -752,6 +809,8 @@ MM_FN void mvid_close(mvid_reader_t* r, mvid_free_fn free_fn) {
     r->mc_ready = false;
     if (r->h264_ready) h264_free(&r->h264, free_fn);
     r->h264_ready = false;
+    if (r->hw_check) free_fn(r->hw_check);
+    r->hw_check = NULL;
 }
 
 /* The frame shown at `ms`. */
@@ -811,12 +870,52 @@ MM_FN bool mvid_decode_one(mvid_reader_t* r, uint32_t n, uint32_t* out) {
         bool key = (r->frame[0] & MVID_FRAME_KEY) != 0;
         if (!key && r->decoded != (int64_t)n - 1) return false;
         h264_t* d = &r->h264;
+        if (r->hw_state == MVID_HW_TRUSTED && key) r->hw_state = MVID_HW_ONLY;
+        d->hw_only = r->hw_state == MVID_HW_ONLY;
+        if (d->hw_only) {
+            /* The hardware decoder alone: here only the headers are read. */
+            if (h264_decode(d, r->frame + 4, size - 4u) && d->hw_valid && h264_width(d) >= w && h264_height(d) >= h &&
+                r->hw_decode(r->hw_ctx, &d->hw, out, w, h)) {
+                r->decoded = n;
+                return true;
+            }
+            /* It gave up: the file goes on with the CPU decoder, which
+             * has to start again from the last keyframe. */
+            r->hw_state = MVID_HW_OFF;
+            d->hw_only = false;
+            uint32_t from = n;
+            while (from > 0 && !(mm_get32(r->index + (size_t)from * MVID_INDEX_ENTRY + 12) & MVID_FRAME_KEY)) from--;
+            r->decoded = -1;
+            for (uint32_t k = from; k <= n; k++)
+                if (!mvid_decode_one(r, k, out)) return false;
+            return true;
+        }
         if (!h264_decode(d, r->frame + 4, size - 4u) || h264_width(d) < w || h264_height(d) < h) return false;
         const h264_sps_t* s = d->active;
         if (!(h264_is_full_601(d) && !s->crop_l && !s->crop_t &&
               mvid_gpu_convert(r, d->out->plane[0], d->out->plane[1], d->out->plane[2], d->w, d->h, d->cw, d->ch,
                                out, w, h)))
             h264_to_argb(d, out, w, h, w);
+        if (r->hw_decode && r->hw_state < MVID_HW_TRUSTED) {
+            /* The hardware decoder writes full-range BT.601 pictures
+             * from the top left corner; other streams stay here. */
+            bool can = h264_is_full_601(d) && !s->crop_l && !s->crop_t && d->hw_valid && r->hw_check;
+            if (r->hw_state == MVID_HW_NEW && key) r->hw_state = can ? MVID_HW_CHECKING : MVID_HW_OFF;
+            if (r->hw_state == MVID_HW_CHECKING) {
+                if (!can || !r->hw_decode(r->hw_ctx, &d->hw, r->hw_check, w, h)) {
+                    r->hw_state = MVID_HW_OFF;
+                } else {
+                    bool same = true;
+                    for (size_t i = 0; i < (size_t)w * h && same; i++) same = r->hw_check[i] == out[i];
+                    if (!same) {
+                        r->hw_state = MVID_HW_OFF;
+                        if (r->hw_mismatch) r->hw_mismatch(r->hw_ctx);
+                    } else if (++r->hw_checked >= MVID_HW_CHECK_FRAMES) {
+                        r->hw_state = MVID_HW_TRUSTED;
+                    }
+                }
+            }
+        }
         r->decoded = n;
         return true;
     }
