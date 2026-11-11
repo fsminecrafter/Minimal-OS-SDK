@@ -40,6 +40,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include "mosmedia_motion.h"
+#include "mosmedia_h264.h"
 #if defined(MINIMALOS_TARGET)
 #include "minimalos.h"
 #include "media_abi.h"
@@ -65,6 +66,10 @@
  * motion files version 2 with the codec at offset 60. */
 #define MVID_CODEC_TILES  0u
 #define MVID_CODEC_MOTION 1u
+/* H.264 (Constrained Baseline), decoded by mosmedia_h264.h. A frame is
+ * the 4-byte frame header and one access unit in Annex B form; a
+ * keyframe is an IDR picture with its parameter sets. */
+#define MVID_CODEC_H264   2u
 #define MVID_VERSION_CODEC 2u
 
 /* Row filters. */
@@ -405,7 +410,7 @@ typedef void (*mvid_free_fn)(void* p);
 
 typedef struct {
     uint32_t width, height, fps_num, fps_den, frame_count, duration_ms, keyframe_interval;
-    uint32_t codec;             /* MVID_CODEC_TILES or MVID_CODEC_MOTION */
+    uint32_t codec;             /* MVID_CODEC_TILES, MVID_CODEC_MOTION or MVID_CODEC_H264 */
     bool alpha, has_audio;
     uint64_t index_offset, audio_offset, audio_size;
 } mvid_info_t;
@@ -593,6 +598,35 @@ MM_FN bool mvid_writer_frame(mvid_writer_t* v, const uint32_t* px, uint32_t stri
     return true;
 }
 
+/* Adds a frame that is already encoded as H.264: one access unit in
+ * Annex B form (`key`: an IDR picture with its parameter sets). The
+ * writer has no H.264 encoder; tools/media/mosmedia.c gets these from
+ * ffmpeg. Do not mix with mvid_writer_frame. */
+MM_FN bool mvid_writer_h264_frame(mvid_writer_t* v, const uint8_t* unit, size_t size, bool key) {
+    if (v->failed) return false;
+    uint32_t n = v->info.frame_count;
+    if (n == 0) v->info.codec = MVID_CODEC_H264;
+    if (v->info.codec != MVID_CODEC_H264 || !size || size > (64u << 20) - 4u) { v->failed = true; return false; }
+    if (n == v->index_cap) {
+        uint8_t* bigger = (uint8_t*)v->alloc((size_t)v->index_cap * 2u * MVID_INDEX_ENTRY);
+        if (!bigger) { v->failed = true; return false; }
+        mm_copy(bigger, v->index, (size_t)v->index_cap * MVID_INDEX_ENTRY);
+        v->free(v->index);
+        v->index = bigger;
+        v->index_cap *= 2u;
+    }
+    uint8_t head[4] = { key ? MVID_FRAME_KEY : 0, 0, 0, 0 };
+    if (!v->write(v->ctx, v->at, head, 4) || !v->write(v->ctx, v->at + 4u, unit, size)) {
+        v->failed = true;
+        return false;
+    }
+    uint8_t* e = v->index + (size_t)n * MVID_INDEX_ENTRY;
+    mm_put64(e, v->at); mm_put32(e + 8, (uint32_t)size + 4u); mm_put32(e + 12, key ? MVID_FRAME_KEY : 0);
+    v->at += size + 4u;
+    v->info.frame_count++;
+    return true;
+}
+
 /* Writes the index, the soundtrack (an .adi file's bytes, or NULL) and
  * the header, and frees the writer's buffers. */
 MM_FN bool mvid_writer_finish(mvid_writer_t* v, const void* adi, size_t adi_size) {
@@ -615,7 +649,7 @@ MM_FN bool mvid_writer_finish(mvid_writer_t* v, const void* adi, size_t adi_size
         for (uint32_t i = 0; i < MVID_HEADER_SIZE; i++) hd[i] = 0;
         mvid_info_t* in = &v->info;
         in->duration_ms = (uint32_t)((uint64_t)in->frame_count * 1000u * in->fps_den / in->fps_num);
-        bool motion = in->codec == MVID_CODEC_MOTION;
+        bool motion = in->codec != MVID_CODEC_TILES;     /* a version 2 file: the codec is in the header */
         if (motion) in->alpha = false;
         mm_copy(hd, MVID_MAGIC, 4);
         hd[4] = motion ? MVID_VERSION_CODEC : MMEDIA_VERSION; hd[5] = in->alpha ? 4 : 3; hd[6] = MMEDIA_TILE_LOG2;
@@ -625,7 +659,7 @@ MM_FN bool mvid_writer_finish(mvid_writer_t* v, const void* adi, size_t adi_size
         mm_put32(hd + 24, in->frame_count); mm_put32(hd + 28, in->duration_ms);
         mm_put64(hd + 32, in->index_offset); mm_put64(hd + 40, in->audio_offset);
         mm_put64(hd + 48, in->audio_size); mm_put32(hd + 56, in->keyframe_interval);
-        if (motion) mm_put32(hd + 60, MVID_CODEC_MOTION);
+        if (motion) mm_put32(hd + 60, in->codec);
         ok = v->write(v->ctx, 0, hd, MVID_HEADER_SIZE);
     }
     if (v->mc_ready) mmc_free(&v->mc, v->free);
@@ -650,7 +684,9 @@ typedef struct {
     int64_t decoded;            /* frame in the output buffer, -1 = none */
     mmc_t mc;                   /* motion: the decoder */
     bool mc_ready;
-    bool no_gpu;                /* motion: colour conversion stays on the CPU */
+    bool no_gpu;                /* motion, h264: colour conversion stays on the CPU */
+    h264_t h264;                /* h264: the decoder */
+    bool h264_ready;
 } mvid_reader_t;
 
 MM_FN bool mvid_parse_header(const uint8_t* hd, uint64_t file_size, mvid_info_t* in) {
@@ -658,7 +694,7 @@ MM_FN bool mvid_parse_header(const uint8_t* hd, uint64_t file_size, mvid_info_t*
         (hd[5] != 3 && hd[5] != 4) || hd[6] != MMEDIA_TILE_LOG2)
         return false;
     in->codec = hd[4] == MVID_VERSION_CODEC ? mm_get32(hd + 60) : MVID_CODEC_TILES;
-    if (in->codec > MVID_CODEC_MOTION || (in->codec == MVID_CODEC_MOTION && hd[5] != 3)) return false;
+    if (in->codec > MVID_CODEC_H264 || (in->codec != MVID_CODEC_TILES && hd[5] != 3)) return false;
     in->alpha = hd[5] == 4;
     in->has_audio = (hd[7] & 1u) != 0;
     in->width = mm_get32(hd + 8); in->height = mm_get32(hd + 12);
@@ -693,11 +729,17 @@ MM_FN bool mvid_open(mvid_reader_t* r, mvid_read_fn read, void* ctx, uint64_t si
         if (n > largest) largest = n;
     }
     r->frame_cap = largest < bound ? largest : bound;
+    /* An H.264 frame has no bound from the picture size alone. */
+    if (r->info.codec == MVID_CODEC_H264) r->frame_cap = largest < (64u << 20) ? largest : (64u << 20);
     r->frame = (uint8_t*)alloc(r->frame_cap ? r->frame_cap : 1);
     if (!r->frame) return false;
     if (r->info.codec == MVID_CODEC_MOTION) {
         r->mc_ready = true;   /* mmc_init clears it on failure; mmc_free copes */
         if (!mmc_init(&r->mc, r->info.width, r->info.height, false, alloc)) return false;
+    }
+    if (r->info.codec == MVID_CODEC_H264) {
+        r->h264_ready = true;
+        if (!h264_init(&r->h264, alloc, r->frame_cap)) return false;
     }
     return true;
 }
@@ -708,12 +750,42 @@ MM_FN void mvid_close(mvid_reader_t* r, mvid_free_fn free_fn) {
     r->index = NULL; r->frame = NULL;
     if (r->mc_ready) mmc_free(&r->mc, free_fn);
     r->mc_ready = false;
+    if (r->h264_ready) h264_free(&r->h264, free_fn);
+    r->h264_ready = false;
 }
 
 /* The frame shown at `ms`. */
 MM_FN uint32_t mvid_frame_at(const mvid_info_t* in, uint32_t ms) {
     uint64_t f = (uint64_t)ms * in->fps_num / (1000u * (uint64_t)in->fps_den);
     return f >= in->frame_count ? in->frame_count - 1u : (uint32_t)f;
+}
+
+/* Colour conversion (4:2:0 full-range BT.601 planes to pixels) on the
+ * graphics card, when the kernel's GPU backend offers it: the same pixels
+ * as mmc_to_argb. False = convert here. */
+MM_FN bool mvid_gpu_convert(mvid_reader_t* r, const uint8_t* y, const uint8_t* cb, const uint8_t* cr, uint32_t pw,
+                            uint32_t ph, uint32_t cw, uint32_t ch, uint32_t* out, uint32_t w, uint32_t h) {
+#if defined(MINIMALOS_TARGET)
+    if (!r->no_gpu) {
+        syscall_media_planes_t planes = { .y = y, .cb = cb, .cr = cr, .w = pw, .h = ph, .cw = cw, .ch = ch };
+        syscall_media_request_t request = {
+            .size = sizeof(request),
+            .version = SYS_MEDIA_ABI_VERSION,
+            .op = SYS_MEDIA_CONVERT_YCBCR,
+            .width = w,
+            .height = h,
+            .frame_bytes = sizeof(planes),
+            .frame = (const uint8_t*)&planes,
+            .pixels = out
+        };
+        if (mos_syscall(SYS_MEDIA, (long)(uintptr_t)&request, 0, 0) == SYS_SUCCESS) return true;
+        /* No GPU for it (or an older kernel): stop asking for this file. */
+        r->no_gpu = true;
+    }
+#else
+    (void)r; (void)y; (void)cb; (void)cr; (void)pw; (void)ph; (void)cw; (void)ch; (void)out; (void)w; (void)h;
+#endif
+    return false;
 }
 
 MM_FN bool mvid_decode_one(mvid_reader_t* r, uint32_t n, uint32_t* out) {
@@ -727,32 +799,24 @@ MM_FN bool mvid_decode_one(mvid_reader_t* r, uint32_t n, uint32_t* out) {
         bool key = (r->frame[0] & MVID_FRAME_KEY) != 0;
         if (!key && r->decoded != (int64_t)n - 1) return false;
         if (!mmc_decode_frame(&r->mc, r->frame + 4, size - 4u, key, r->frame[1])) return false;
-        /* Colour conversion: on the graphics card when the kernel's GPU
-         * backend offers it (the same pixels), otherwise here. */
-        bool converted = false;
-#if defined(MINIMALOS_TARGET)
-        if (!r->no_gpu) {
-            syscall_media_planes_t planes = {
-                .y = r->mc.ref[0], .cb = r->mc.ref[1], .cr = r->mc.ref[2],
-                .w = r->mc.w, .h = r->mc.h, .cw = r->mc.cw, .ch = r->mc.ch
-            };
-            syscall_media_request_t request = {
-                .size = sizeof(request),
-                .version = SYS_MEDIA_ABI_VERSION,
-                .op = SYS_MEDIA_CONVERT_YCBCR,
-                .width = w,
-                .height = h,
-                .frame_bytes = sizeof(planes),
-                .frame = (const uint8_t*)&planes,
-                .pixels = out
-            };
-            long result = mos_syscall(SYS_MEDIA, (long)(uintptr_t)&request, 0, 0);
-            converted = result == SYS_SUCCESS;
-            /* No GPU for it (or an older kernel): stop asking for this file. */
-            if (!converted) r->no_gpu = true;
-        }
-#endif
-        if (!converted) mmc_to_argb(&r->mc, out, w, h, w);
+        if (!mvid_gpu_convert(r, r->mc.ref[0], r->mc.ref[1], r->mc.ref[2], r->mc.w, r->mc.h, r->mc.cw, r->mc.ch,
+                              out, w, h))
+            mmc_to_argb(&r->mc, out, w, h, w);
+        r->decoded = n;
+        return true;
+    }
+    if (r->info.codec == MVID_CODEC_H264) {
+        if (size < 5u || size > r->frame_cap || offset + size > r->size || !r->read(r->ctx, offset, r->frame, size))
+            return false;
+        bool key = (r->frame[0] & MVID_FRAME_KEY) != 0;
+        if (!key && r->decoded != (int64_t)n - 1) return false;
+        h264_t* d = &r->h264;
+        if (!h264_decode(d, r->frame + 4, size - 4u) || h264_width(d) < w || h264_height(d) < h) return false;
+        const h264_sps_t* s = d->active;
+        if (!(h264_is_full_601(d) && !s->crop_l && !s->crop_t &&
+              mvid_gpu_convert(r, d->out->plane[0], d->out->plane[1], d->out->plane[2], d->w, d->h, d->cw, d->ch,
+                               out, w, h)))
+            h264_to_argb(d, out, w, h, w);
         r->decoded = n;
         return true;
     }
