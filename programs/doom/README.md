@@ -21,7 +21,7 @@ its data in `0:/programs/Doom/`).
 | Tab | automap |
 | Escape | menu (new game, save, load, options, quit) |
 | F2 / F3 | save / load |
-| Alt + Enter | full screen on / off |
+| F11 or Alt + Enter | full screen on / off (the whole screen, no taskbar) |
 
 | Mouse | Action |
 | --- | --- |

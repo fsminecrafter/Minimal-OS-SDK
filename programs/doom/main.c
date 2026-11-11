@@ -20,7 +20,7 @@
  *
  * Keys: arrows move and turn, Ctrl fires, Space opens doors, Shift runs,
  * Alt strafes, 1-7 pick weapons, Escape is the menu, Tab the map.
- * Alt+Enter switches full screen.
+ * F11 or Alt+Enter switches full screen (borderless: the whole display).
  *
  * The mouse: while a level is being played (not in the menu, not paused)
  * the window asks mosWM for pointer lock: the cursor is hidden and kept
@@ -271,6 +271,10 @@ static void pump_events(void) {
                 g_mouse_buttons = 0;
                 update_pointer_lock();
                 break;
+            case SYSCALL_WINDOW_EVENT_RESTORED:
+            case SYSCALL_WINDOW_EVENT_MAXIMIZED:
+                g_fullscreen = 0;           // left full screen some other way
+                break;
             case SYSCALL_WINDOW_EVENT_FOCUS_GAINED:
                 g_focused = 1;
                 break;
@@ -290,6 +294,10 @@ static void pump_events(void) {
                 int pressed = ev.buttons != 0;
                 if (ev.key == 0xE2 || ev.key == 0xE6) g_alt_down = pressed;
                 if (pressed && ev.key == 0x28 && g_alt_down) { toggle_fullscreen(); break; }
+                if (ev.key == 0x44) {                   // F11: full screen
+                    if (pressed) toggle_fullscreen();
+                    break;
+                }
                 queue_key(doom_key(ev.key), pressed);
                 break;
             }
@@ -358,6 +366,15 @@ void doom_console_text(const char* text, size_t len) {
         g_console[g_console_len++] = text[i];
     }
     g_console[g_console_len] = '\0';
+}
+
+/* Quit chosen (menu or close button): hide the window at once. Doom then
+ * saves its settings and exits, which can take a moment on a slow disk. */
+void doom_platform_quitting(void) {
+    if (!g_window) return;
+    if (g_locked) mos_window_set_pointer_lock(g_window, false);
+    g_locked = 0;
+    mos_window_set_visible(g_window, false);
 }
 
 void doom_platform_exit(int code) {
