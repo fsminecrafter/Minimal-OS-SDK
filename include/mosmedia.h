@@ -650,6 +650,7 @@ typedef struct {
     int64_t decoded;            /* frame in the output buffer, -1 = none */
     mmc_t mc;                   /* motion: the decoder */
     bool mc_ready;
+    bool no_gpu;                /* motion: colour conversion stays on the CPU */
 } mvid_reader_t;
 
 MM_FN bool mvid_parse_header(const uint8_t* hd, uint64_t file_size, mvid_info_t* in) {
@@ -726,7 +727,32 @@ MM_FN bool mvid_decode_one(mvid_reader_t* r, uint32_t n, uint32_t* out) {
         bool key = (r->frame[0] & MVID_FRAME_KEY) != 0;
         if (!key && r->decoded != (int64_t)n - 1) return false;
         if (!mmc_decode_frame(&r->mc, r->frame + 4, size - 4u, key, r->frame[1])) return false;
-        mmc_to_argb(&r->mc, out, w, h, w);
+        /* Colour conversion: on the graphics card when the kernel's GPU
+         * backend offers it (the same pixels), otherwise here. */
+        bool converted = false;
+#if defined(MINIMALOS_TARGET)
+        if (!r->no_gpu) {
+            syscall_media_planes_t planes = {
+                .y = r->mc.ref[0], .cb = r->mc.ref[1], .cr = r->mc.ref[2],
+                .w = r->mc.w, .h = r->mc.h, .cw = r->mc.cw, .ch = r->mc.ch
+            };
+            syscall_media_request_t request = {
+                .size = sizeof(request),
+                .version = SYS_MEDIA_ABI_VERSION,
+                .op = SYS_MEDIA_CONVERT_YCBCR,
+                .width = w,
+                .height = h,
+                .frame_bytes = sizeof(planes),
+                .frame = (const uint8_t*)&planes,
+                .pixels = out
+            };
+            long result = mos_syscall(SYS_MEDIA, (long)(uintptr_t)&request, 0, 0);
+            converted = result == SYS_SUCCESS;
+            /* No GPU for it (or an older kernel): stop asking for this file. */
+            if (!converted) r->no_gpu = true;
+        }
+#endif
+        if (!converted) mmc_to_argb(&r->mc, out, w, h, w);
         r->decoded = n;
         return true;
     }
