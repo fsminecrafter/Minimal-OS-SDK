@@ -15,6 +15,18 @@
  * There is one player for the whole system: opening a file replaces
  * whatever was playing. The kernel picks the sound card (Intel HD Audio
  * or AC97); status.driver is "" when there is none.
+ *
+ * Streams - sound a program makes itself, mixed with the player and with
+ * other programs' streams (up to SYSCALL_AUDIO_STREAMS at once):
+ *
+ *   int h = mos_audio_stream_open(22050, 2);      // rate, channels
+ *   long n = mos_audio_stream_write(h, samples, frames);  // frames taken
+ *   mos_audio_stream_queued(h)                    // frames still waiting
+ *   mos_audio_stream_set_volume(h, 0-100)
+ *   mos_audio_stream_close(h)                     // also on exit
+ *
+ * Samples are signed 16-bit, interleaved L, R for stereo. Write a little
+ * ahead of what plays (50-100 ms) and top it up as `queued` falls.
  */
 
 #include <stdint.h>
@@ -54,4 +66,62 @@ static inline long mos_audio_status(syscall_audio_status_t* status) {
     return mos_audio__call(SYS_AUDIO_STATUS, 0, 0, status);
 }
 
+
+static inline long mos_audio_stream__call(syscall_audio_stream_t* r) {
+    r->size = sizeof(*r);
+    r->version = SYS_AUDIO_STREAM_ABI_VERSION;
+    return (long)mos_syscall1(SYS_AUDIO_STREAM, (uint64_t)(uintptr_t)r);
+}
+
+// A handle (1 and up), or a negative SYS_ERR_* value.
+static inline int mos_audio_stream_open(uint32_t rate, uint32_t channels) {
+    syscall_audio_stream_t r;
+    memset(&r, 0, sizeof(r));
+    r.op = SYS_AUDIO_STREAM_OPEN;
+    r.rate = rate;
+    r.channels = channels;
+    return (int)mos_audio_stream__call(&r);
+}
+
+// Frames taken (0 when the stream's buffer is full), or a negative SYS_ERR_*.
+static inline long mos_audio_stream_write(int handle, const int16_t* samples, uint32_t frames) {
+    syscall_audio_stream_t r;
+    memset(&r, 0, sizeof(r));
+    r.op = SYS_AUDIO_STREAM_WRITE;
+    r.handle = (uint32_t)handle;
+    r.samples = samples;
+    r.frames = frames;
+    return mos_audio_stream__call(&r);
+}
+
+// Frames waiting to be played, or a negative SYS_ERR_*. `info` (may be
+// NULL) gets the rest: capacity, the mix rate, underruns.
+static inline long mos_audio_stream_query(int handle, syscall_audio_stream_t* info) {
+    syscall_audio_stream_t r;
+    memset(&r, 0, sizeof(r));
+    r.op = SYS_AUDIO_STREAM_QUERY;
+    r.handle = (uint32_t)handle;
+    long res = mos_audio_stream__call(&r);
+    if (info) *info = r;
+    return res < 0 ? res : (long)r.queued;
+}
+
+static inline long mos_audio_stream_queued(int handle) { return mos_audio_stream_query(handle, 0); }
+
+static inline long mos_audio_stream_set_volume(int handle, uint32_t volume) {
+    syscall_audio_stream_t r;
+    memset(&r, 0, sizeof(r));
+    r.op = SYS_AUDIO_STREAM_VOLUME;
+    r.handle = (uint32_t)handle;
+    r.volume = volume;
+    return mos_audio_stream__call(&r);
+}
+
+static inline long mos_audio_stream_close(int handle) {
+    syscall_audio_stream_t r;
+    memset(&r, 0, sizeof(r));
+    r.op = SYS_AUDIO_STREAM_CLOSE;
+    r.handle = (uint32_t)handle;
+    return mos_audio_stream__call(&r);
+}
 #endif

@@ -18,7 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#if defined(FEATURE_SOUND) && !defined(__DJGPP__)
+#if defined(FEATURE_SOUND) && defined(ORIGCODE)    // Minimal-OS: no SDL; see ../sound.c
 #include <SDL_mixer.h>
 #endif
 

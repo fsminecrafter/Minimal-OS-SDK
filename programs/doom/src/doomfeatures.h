@@ -35,6 +35,9 @@
 
 //#undef FEATURE_SOUND
 
+// Minimal-OS: sound effects through an audio stream (../sound.c).
+#define FEATURE_SOUND
+
 #endif /* #ifndef DOOM_FEATURES_H */
 
 
