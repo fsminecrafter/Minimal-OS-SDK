@@ -13,6 +13,7 @@ Every wrapper ends in one `int 0x80`:
 | `rdi` | first argument | |
 | `rsi` | second argument | |
 | `rdx` | third argument | |
+| `r10` | fourth argument (only `SYS_FUTEX_WAIT`'s timeout; see [`mos_syscall4`](process.md#mos_syscall4)) | |
 
 Calls with more data than three registers (graphics, windows, network,
 packages, input) pass one pointer to a request structure in `rdi`. Keep
@@ -36,7 +37,9 @@ numbers, which as unsigned values sit at the very top of the range:
 | `SYS_ERR_INVAL` | `-4` | Invalid argument: NULL pointer, out-of-range value, bad structure size or version |
 | `SYS_ERR_PERM` | `-5` | The calling process may not do this (see [privilege](#privilege)) |
 | `SYS_ERR_BUSY` | `-6` | A shared subsystem (the network stack, a full event queue) is in use: retry |
-| `SYS_ERR_AGAIN` | `-7` | Non-blocking call with nothing to report yet: call again later |
+| `SYS_ERR_AGAIN` | `-7` | Non-blocking call with nothing to report yet: call again later. `SYS_FUTEX_WAIT` returns it when the word no longer has the expected value |
+| `SYS_ERR_NOMEM` | `-8` | Out of kernel memory (heap or video memory) |
+| `SYS_ERR_TIMEDOUT` | `-9` | A timed wait ran out (`SYS_FUTEX_WAIT` with a timeout) |
 
 The constants are defined as `((uint64_t)-N)`. Compare against them
 directly, or cast to `long` and test for a negative value:
@@ -76,6 +79,8 @@ reconfiguring shared hardware through the syscall gate.
 | Include | You get |
 | --- | --- |
 | `minimalos.h` | Core calls: terminal output, exit, time, files, packages, exec, process list, framebuffer ownership and blit |
+| `process.h` | `mos_spawn`, `mos_waitpid`, `mos_getenv`, `environ`, clock helpers (includes `minimalos.h`; see [Spawning](spawn.md)) |
+| `thread.h` | Threads, mutexes, futexes, thread-local storage base (see [Threads](threads.md)) |
 | `stdio.h` | `printf` (includes `minimalos.h`) |
 | `stdlib.h` | `malloc` and friends, random bytes, `atoi` (includes `minimalos.h`) |
 | `string.h` | String and memory helpers (no syscalls) |
@@ -95,20 +100,24 @@ together.
 ## Units
 
 - Time: milliseconds. `mos_uptime()` and `mos_sleep()` both use
-  milliseconds; so do every `timeout_ms` argument.
+  milliseconds; so do every `timeout_ms` argument. The exceptions are the
+  `mos_clock_*` functions (nanoseconds) and the futex timeout
+  (nanoseconds, rounded up to whole milliseconds).
 - Colours: `window.h` and `mos_graphics_blit_surface` take ARGB8888
   pixels, `0xAARRGGBB`. Use `0xFF` alpha for opaque pixels. The
   `mos_graphics_*` primitives take separate `r`, `g`, `b` bytes.
 - IPv4 addresses and ports in `net.h` are host order: `192.168.1.10` is
   `0xC0A8010A`.
-- Paths are MinimaFS paths such as `0:/programs/app.run`. Relative paths
-  are resolved against the terminal's current directory.
+- Paths are MinimaFS paths such as `0:/programs/app.run`. `/dir/file` is
+  the root of the working directory's drive; any other path is relative to
+  the program's working directory (the terminal's until the program calls
+  [`mos_chdir`](process.md#mos_chdir)).
 
 ## Memory
 
 There is no libc and no dynamic linker. Everything a program uses is
 either an inline wrapper from these headers or code compiled into the
 program. `crt0.c` supplies `_start`, runs global constructors
-(`.init_array`), calls `main(argc, argv)` and then `mos_exit()` with its
+(`.init_array`), calls `main(argc, argv, envp)` (programs declared `main(int, char**)` just ignore the third argument), keeps `envp` in `environ` and then `mos_exit()` with its
 return value. It also defines out-of-line `memcpy`, `memmove`, `memset`
 and `memcmp`, which the compiler may call on its own.

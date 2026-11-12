@@ -1,6 +1,14 @@
 #include "minimalos.h"
 
-extern int main(int argc, char** argv);
+/* The entry point gets RDI = argc, RSI = argv, RDX = envp. main is called
+ * with all three: a program defined as main(int, char**) ignores the
+ * third (SysV: extra register arguments are harmless). */
+extern int main(int argc, char** argv, char** envp);
+
+/* The environment ("NAME=value" strings, NULL-terminated); see process.h.
+ * Never NULL: an empty array when the kernel passed none. */
+static char* g_empty_environ[1] = { 0 };
+char** environ = g_empty_environ;
 
 /*
  * Compiler-emitted memory primitives.
@@ -78,8 +86,9 @@ static void run_init_array(void) {
     }
 }
 
-void _start(long argc, char** argv) {
+void _start(long argc, char** argv, char** envp) {
+    if (envp) environ = envp;
     run_init_array();
-    int rc = main((int)argc, argv);
+    int rc = main((int)argc, argv, environ);
     mos_exit(rc);
 }

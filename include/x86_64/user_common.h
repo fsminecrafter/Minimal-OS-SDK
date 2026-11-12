@@ -32,6 +32,20 @@ static inline long mos_syscall(long num, long a1, long a2, long a3) {
     return ret;
 }
 
+// Four-argument form: a4 goes in r10 (SYS_FUTEX_WAIT's timeout). The
+// kernel restores every register but rax, so r10 needs no clobber.
+static inline long mos_syscall4(long num, long a1, long a2, long a3, long a4) {
+    register long r10 __asm__("r10") = a4;
+    long ret;
+    __asm__ volatile(
+        "int $0x80"
+        : "=a"(ret)
+        : "a"(num), "D"(a1), "S"(a2), "d"(a3), "r"(r10)
+        : "rcx", "r11", "memory", "cc"
+    );
+    return ret;
+}
+
 // --- Terminal output and process control ---
 
 static inline long mos_write_fd(int fd, const void* buf, size_t len) {

@@ -24,6 +24,16 @@
  *
  * malloc()/free() are system calls and safe from any thread. Anything
  * else two threads use at once needs a mos_mutex_t.
+ *
+ * Futexes and TLS (SYS_FUTEX, SYS_THREAD_SET_FS/GET_FS/CREATE_EX):
+ *
+ *   mos_futex_wait()/mos_futex_wake()   sleep on / wake a 32-bit word
+ *   mos_thread_create_ex()              a thread with its own FS base (TLS
+ *                                       block) that mos_thread_join() waits
+ *                                       for with a futex instead of polling
+ *   mos_thread_set_fs()/get_fs()        the calling thread's FS base
+ *
+ * mos_thread_create() is unchanged and joins by polling every 1 ms.
  */
 
 #include <stddef.h>
@@ -38,7 +48,49 @@ typedef struct {
     void* stack;
     void (*fn)(void*);
     void* arg;
+    /* Exit futex, used by mos_thread_create_ex(): 1 while the thread
+     * runs, set to 0 (and its waiters woken) by the kernel when it ends.
+     * Unused (0) for mos_thread_create(); joining then polls. */
+    volatile uint32_t exit_word;
+    uint32_t futex_join;        /* nonzero: created by mos_thread_create_ex() */
 } mos_thread_t;
+
+/* ------------------------------------------------------------- futex */
+
+/* Sleeps while *addr == expected (checked atomically against a wake).
+ * `addr` is 4-byte aligned memory of the program. timeout_ns 0 waits
+ * without limit; otherwise the wait is rounded up to whole milliseconds.
+ * Returns SYS_SUCCESS once woken (possibly spuriously: look at the word
+ * again), SYS_ERR_AGAIN when *addr != expected at once, SYS_ERR_TIMEDOUT
+ * when the time ran out, SYS_ERR_INVAL for a bad address. */
+static inline long mos_futex_wait(volatile uint32_t* addr, uint32_t expected,
+                                  uint64_t timeout_ns) {
+    return mos_syscall4(SYS_FUTEX, SYS_FUTEX_WAIT, (long)(uintptr_t)addr,
+                        (long)expected, (long)timeout_ns);
+}
+
+/* Wakes at most `count` threads sleeping on `addr` (all of them for
+ * UINT32_MAX). Returns how many it woke, or a negative SYS_ERR_* value. */
+static inline long mos_futex_wake(volatile uint32_t* addr, uint32_t count) {
+    return mos_syscall(SYS_FUTEX, SYS_FUTEX_WAKE, (long)(uintptr_t)addr, (long)count);
+}
+
+/* --------------------------------------------------------- FS base (TLS) */
+
+/* Sets the calling thread's FS base: the address of its thread-local
+ * block, below 0x0000800000000000 (0 clears it). Every thread has its own;
+ * the kernel keeps it across switches. A new thread starts with the value
+ * given to mos_thread_create_ex() (0 for mos_thread_create()). Reading
+ * through it is up to the program (e.g. `mov %fs:0, %rax` when the block's
+ * first word points to itself). Returns SYS_SUCCESS or SYS_ERR_INVAL. */
+static inline long mos_thread_set_fs(const void* base) {
+    return mos_syscall(SYS_THREAD, SYS_THREAD_SET_FS, (long)(uintptr_t)base, 0);
+}
+
+/* The calling thread's FS base. */
+static inline void* mos_thread_get_fs(void) {
+    return (void*)(uintptr_t)mos_syscall(SYS_THREAD, SYS_THREAD_GET_FS, 0, 0);
+}
 
 __attribute__((noreturn)) static inline void mos_thread_exit(void) {
     mos_syscall(SYS_EXIT, 0, 0, 0);
@@ -62,6 +114,8 @@ static inline int mos_thread_create(mos_thread_t* t, void (*fn)(void*), void* ar
     t->id = 0;
     t->fn = fn;
     t->arg = arg;
+    t->exit_word = 0;
+    t->futex_join = 0;
     t->stack = malloc(stack_size);
     if (!t->stack) return -1;
     syscall_thread_t request;
@@ -78,16 +132,54 @@ static inline int mos_thread_create(mos_thread_t* t, void (*fn)(void*), void* ar
     return 0;
 }
 
+/* Like mos_thread_create(), plus the thread's FS base `tls` (NULL for none;
+ * see mos_thread_set_fs()) and a futex join: mos_thread_join() then sleeps
+ * until the kernel reports the thread's end instead of polling. `t` must
+ * stay valid (and not move) until mos_thread_join(). Returns 0, or -1. */
+static inline int mos_thread_create_ex(mos_thread_t* t, void (*fn)(void*), void* arg,
+                                       size_t stack_size, void* tls) {
+    if (!t || !fn) return -1;
+    if (!stack_size) stack_size = MOS_THREAD_STACK_DEFAULT;
+    t->id = 0;
+    t->fn = fn;
+    t->arg = arg;
+    t->futex_join = 1;
+    t->exit_word = 1;
+    t->stack = malloc(stack_size);
+    if (!t->stack) return -1;
+    syscall_thread_ex_t request;
+    request.entry = (uint64_t)(uintptr_t)mos_thread_start_;
+    request.stack_top = ((uint64_t)(uintptr_t)t->stack + stack_size) & ~(uint64_t)15;
+    request.arg = (uint64_t)(uintptr_t)t;
+    request.fs_base = (uint64_t)(uintptr_t)tls;
+    request.exit_futex = (uint64_t)(uintptr_t)&t->exit_word;
+    long id = mos_syscall(SYS_THREAD, SYS_THREAD_CREATE_EX, (long)(uintptr_t)&request, 0);
+    if (id <= 0) {
+        free(t->stack);
+        t->stack = NULL;
+        return -1;
+    }
+    t->id = id;
+    return 0;
+}
+
 /* Nonzero while the thread runs. */
 static inline int mos_thread_running(const mos_thread_t* t) {
     return t && t->id &&
            (uint64_t)mos_syscall(SYS_THREAD, SYS_THREAD_ALIVE, t->id, 0) == SYS_SUCCESS;
 }
 
-/* Waits for the thread to end, then frees its stack. */
+/* Waits for the thread to end, then frees its stack. A thread made by
+ * mos_thread_create_ex() is waited for with a futex, any other by polling. */
 static inline void mos_thread_join(mos_thread_t* t) {
     if (!t || !t->id) return;
-    while (mos_thread_running(t)) mos_sleep(1);
+    if (t->futex_join) {
+        uint32_t word;
+        while ((word = __atomic_load_n(&t->exit_word, __ATOMIC_ACQUIRE)) != 0)
+            mos_futex_wait(&t->exit_word, word, 0);
+    } else {
+        while (mos_thread_running(t)) mos_sleep(1);
+    }
     free(t->stack);
     t->stack = NULL;
     t->id = 0;
