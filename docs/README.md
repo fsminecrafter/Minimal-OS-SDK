@@ -11,6 +11,7 @@ truth; these pages describe them as of SDK v1.1 and the kernel's
 | [Conventions and errors](conventions.md) | `syscall.h` | Calling convention, result codes, privilege rules, which header to include |
 | [Process and terminal](process.md) | `minimalos.h` | Output to the terminal, exit, sleep, time, PIDs, launching programs, cleanup on Ctrl+C |
 | [Files](files.md) | `minimalos.h` | MinimaFS: open, create, read, write, seek, list, delete, metadata |
+| [Threads](threads.md) | `thread.h` | Threads in one program, `mos_mutex_t` locks |
 | [Memory and randomness](memory.md) | `stdlib.h` | `malloc`, `calloc`, `realloc`, `free`, random bytes, `atoi` |
 | [Strings and memory](strings.md) | `string.h` | `strlen`, `strcmp`, `strstr`, `memcpy`, constant-time compare … |
 | [Formatted output](output.md) | `stdio.h`, `iostream` | `printf` and `std::cout` |
