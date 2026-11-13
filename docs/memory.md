@@ -3,9 +3,32 @@
 Heap allocation over `SYS_HEAP`, random bytes over `SYS_RANDOM`, and
 `atoi`. Include `stdlib.h`.
 
+For big blocks, memory that must be given back, reserved address space or
+code you generate, see [Virtual memory](vm.md) (`vm.h`).
+
 Heap blocks come from the kernel allocator and are tracked per process:
 `free` and `realloc` only accept blocks this process allocated, and any
 block still allocated when the process ends is reclaimed.
+
+## `malloc` or `SYS_VM`?
+
+| | `malloc` (`SYS_HEAP`) | `mos_vm_map` (`SYS_VM`) |
+| --- | --- | --- |
+| Granularity | Any size | Whole 4 KiB pages |
+| Address | Below 4 GiB | 2 TiB and up |
+| Contents | Not cleared | Reads as zero |
+| Physical memory | Taken when allocated | Taken on first use, can be given back (`mos_vm_decommit`) |
+| Guard pages | None | An unmapped page on each side |
+| Executable | Never | Only with `MOS_VM_PROT_EXEC` |
+| Cost of a call | Cheap, fine for small objects | A system call and a kernel area per mapping |
+
+Use `malloc` for ordinary objects, strings and buffers up to some
+megabytes. Use `mos_vm_map` for large blocks (images, arenas, caches), for a
+buffer that should grow in place (reserve, then commit), for memory you
+want to return to the system while keeping the address range, for stacks
+and anything that benefits from a guard page, and for code you write at run
+time. Do not use it for many small allocations: each mapping takes at least
+one page and two guard pages of address space.
 
 ## `malloc`
 

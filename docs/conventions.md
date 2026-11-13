@@ -80,6 +80,7 @@ reconfiguring shared hardware through the syscall gate.
 | --- | --- |
 | `minimalos.h` | Core calls: terminal output, exit, time, files, packages, exec, process list, framebuffer ownership and blit |
 | `process.h` | `mos_spawn`, `mos_waitpid`, `mos_getenv`, `environ`, clock helpers (includes `minimalos.h`; see [Spawning](spawn.md)) |
+| `vm.h` | `mos_vm_map`, `mos_vm_unmap`, `mos_vm_protect`, `mos_vm_decommit`, `mos_vm_reserve` (includes `minimalos.h`; see [Virtual memory](vm.md)) |
 | `thread.h` | Threads, mutexes, futexes, thread-local storage base (see [Threads](threads.md)) |
 | `stdio.h` | `printf` (includes `minimalos.h`) |
 | `stdlib.h` | `malloc` and friends, random bytes, `atoi` (includes `minimalos.h`) |

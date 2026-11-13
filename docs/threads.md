@@ -68,7 +68,7 @@ kernel refused.
 
 **Notes**
 
-- `main` has a fixed 64 KiB stack; a thread gets the stack you ask for.
+- `main` has an 8 MiB stack by default (a spawning program can choose another size with `stack_size`, see [Spawning](spawn.md#mos_spawn_ex)); a thread gets the stack you ask for, here from `malloc`. See [`mos_thread_create_vm`](#mos_thread_create_vm) for a thread stack that is demand-paged and guarded.
 
 ## `mos_thread_create_ex`
 
@@ -99,13 +99,33 @@ millisecond.
   [`mos_futex_wait`](#futexes) on it when the thread has ended. It is 1
   while the thread runs, so you can also wait on it yourself.
 
+## `mos_thread_create_vm`
+
+```c
+int mos_thread_create_vm(mos_thread_t* t, void (*fn)(void*), void* arg,
+                         size_t stack_size, void* tls);
+```
+
+[`mos_thread_create_ex`](#mos_thread_create_ex) with a stack that is a
+[`SYS_VM`](vm.md) mapping instead of `malloc` memory. `stack_size` is
+rounded up to whole pages (`0`: `MOS_THREAD_STACK_DEFAULT`). The stack takes
+physical memory only as the thread uses it, so a big one is cheap, and it
+has an unmapped page on each side: running off its low end is a page fault
+(the whole program ends, as for any crash) rather than corruption of other
+memory. [`mos_thread_join`](#mos_thread_join) unmaps it.
+
+**Returns** `0`, or `-1` (no address space or memory, or the kernel refused).
+
+**Notes** `mos_thread_t` has two more fields for this (`stack_size`,
+`stack_vm`); the other creators set them, so existing code is unaffected.
+
 ## `mos_thread_join`
 
 ```c
 void mos_thread_join(mos_thread_t* t);
 ```
 
-Waits until the thread has ended, then frees its stack. Returns at once
+Waits until the thread has ended, then frees its stack (`free`, or unmaps it for a thread made by `mos_thread_create_vm`). Returns at once
 for a thread that never started. A thread made by
 [`mos_thread_create_ex`](#mos_thread_create_ex) is waited for with a
 futex; one made by `mos_thread_create` by polling every millisecond.
@@ -234,8 +254,10 @@ upper half (the CPU would fault on it). The value is unchanged then.
 `syscall_thread_t*` (`entry`, `stack_top`, `arg`), returning the thread's
 id; or `SYS_THREAD_ALIVE` with `rsi` = a thread id, returning
 `SYS_SUCCESS` while that thread of the calling program runs and
-`SYS_ERR_NOTFOUND` after. `entry` must be in the program and `stack_top`
-in memory it owns. `thread.h` wraps this; programs should use that.
+`SYS_ERR_NOTFOUND` after. `entry` must be in executable memory of the
+program (its image, or a [`SYS_VM`](vm.md) mapping with
+`SYS_VM_PROT_EXEC`; not `malloc` memory or a stack) and `stack_top` in
+memory it owns. `thread.h` wraps this; programs should use that.
 
 More operations of `SYS_THREAD`: `SYS_THREAD_SET_FS` (`rsi` = FS base) and
 `SYS_THREAD_GET_FS` (returns it); `SYS_THREAD_CREATE_EX` with `rsi` = a

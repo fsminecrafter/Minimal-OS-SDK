@@ -13,7 +13,8 @@ it builds on (`mos_spawn_raw`, `mos_wait_raw`, `mos_stat`, `mos_rename`,
 int main(void) {
     const char* const argv[] = { "0:/programs/tool.run", "--fast", NULL };
     mos_spawn_opts_t o = { "0:/programs/tool.run", argv, NULL, "0:/work",
-                           "0:/work/out.txt", "0:/work/out.txt" };
+                           "0:/work/out.txt", "0:/work/out.txt",
+                           0 /* stack_size: the 8 MiB default */ };
     long pid = mos_spawn_ex(&o);
     if (pid < 0) { printf("spawn failed (%ld)\n", pid); return 1; }
 
@@ -62,6 +63,7 @@ typedef struct {
     const char* cwd;                  /* NULL: the caller's working directory */
     const char* stdout_path;          /* NULL: the caller's output; else a file */
     const char* stderr_path;          /* (replaced) receiving it; may be the same */
+    size_t stack_size;                /* main stack in bytes; 0: 8 MiB */
 } mos_spawn_opts_t;
 
 long mos_spawn_ex(const mos_spawn_opts_t* o);
@@ -77,6 +79,7 @@ Starts a program as a child of the caller and returns at once.
 | `cwd` | The child's working directory; it must be an existing directory. NULL: the caller's current one |
 | `stdout_path` | NULL: the child writes where the caller's output goes (the terminal, or the caller's own redirection). Otherwise a file that is created, replacing an existing one, and receives everything the child writes to stdout |
 | `stderr_path` | The same for stderr. May name the same file as `stdout_path`; the two streams are then one, in order |
+| `stack_size` | Bytes of main stack for the child. 0: the default, 8 MiB. Values outside 64 KiB..1 GiB are clamped to that range (no error); the size is rounded up to whole pages. Stack pages take memory only once they are used, so a large stack is cheap. Running off the end of it is a page fault: the child crashes with `crash_vector == 14` |
 
 **Returns** the child's pid (greater than 0), or `SYS_ERR_NOTFOUND` (no such
 program or it is a directory; `cwd` is not a directory), `SYS_ERR_INVAL` (a
@@ -86,6 +89,10 @@ not be created, or the program could not be loaded), `SYS_ERR_NOMEM`.
 
 **Notes**
 
+- The struct has grown at the end (`stack_size`). A positional initializer
+  such as `{ path, argv, NULL, NULL, NULL, NULL }` leaves it 0, which is the
+  default. If you fill a `mos_spawn_opts_t` field by field, set `stack_size`
+  too (or `memset` the struct first): it is read by the call.
 - Output redirected to a file is buffered by the kernel and written when the
   buffer fills and when the child ends. The file is complete once
   [`mos_waitpid`](#mos_waitpid) has returned for that child, also after a

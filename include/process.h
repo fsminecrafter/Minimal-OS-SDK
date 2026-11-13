@@ -58,6 +58,11 @@ typedef struct {
     const char* cwd;                  /* NULL: the caller's working directory */
     const char* stdout_path;          /* NULL: the caller's output; else a file */
     const char* stderr_path;          /* (replaced) receiving it; may be the same */
+    size_t stack_size;                /* the child's main stack in bytes; 0: 8 MiB.
+                                       * 64 KiB..1 GiB (other values are
+                                       * clamped to that range; there is no error). Pages
+                                       * take memory only once used. Set it to 0 when the
+                                       * struct is not zero-initialised. */
 } mos_spawn_opts_t;
 
 /* Starts a program as a child of the caller. argv[0] is what the child
@@ -80,12 +85,13 @@ static inline long mos_spawn_ex(const mos_spawn_opts_t* o) {
     r.stdout_path = o->stdout_path;
     r.stderr_path = o->stderr_path;
     r.flags = 0;
+    r.stack_size = o->stack_size;
     return mos_spawn_raw(&r);
 }
 
 /* mos_spawn_ex() with only a path and argv (NULL-terminated, or NULL). */
 static inline long mos_spawn(const char* path, const char* const* argv) {
-    mos_spawn_opts_t o = { path, argv, NULL, NULL, NULL, NULL };
+    mos_spawn_opts_t o = { path, argv, NULL, NULL, NULL, NULL, 0 };
     return mos_spawn_ex(&o);
 }
 

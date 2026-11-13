@@ -118,6 +118,27 @@ static inline long mos_wait_raw(long pid, long flags, syscall_wait_t* out) {
     return mos_syscall(SYS_WAIT, pid, flags, (long)(uintptr_t)out);
 }
 
+// SYS_VM, the raw calls (vm.h has the friendlier layer). Each returns a
+// negative SYS_ERR_* value on failure.
+//   mos_vm_map_raw: the mapping's address (>= 2 TiB unless FIXED).
+//   the others:     SYS_SUCCESS.
+static inline long mos_vm_map_raw(const syscall_vm_map_t* request) {
+    return mos_syscall(SYS_VM, SYS_VM_MAP, (long)(uintptr_t)request, 0);
+}
+
+static inline long mos_vm_unmap_raw(void* address, size_t length) {
+    return mos_syscall(SYS_VM, SYS_VM_UNMAP, (long)(uintptr_t)address, (long)length);
+}
+
+static inline long mos_vm_protect_raw(void* address, size_t length, unsigned prot) {
+    return mos_syscall4(SYS_VM, SYS_VM_PROTECT, (long)(uintptr_t)address,
+                        (long)length, (long)prot);
+}
+
+static inline long mos_vm_decommit_raw(void* address, size_t length) {
+    return mos_syscall(SYS_VM, SYS_VM_DECOMMIT, (long)(uintptr_t)address, (long)length);
+}
+
 static inline long mos_mouse_call(uint64_t operation, uint64_t arg1,
                                   uint64_t arg2) {
     return mos_syscall(SYS_MOUSE, (long)operation, (long)arg1, (long)arg2);

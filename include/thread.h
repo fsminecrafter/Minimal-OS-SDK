@@ -40,6 +40,7 @@
 #include <stdint.h>
 #include "stdlib.h"
 #include "x86_64/user_common.h"
+#include "vm.h"
 
 #define MOS_THREAD_STACK_DEFAULT (128u * 1024u)
 
@@ -53,6 +54,8 @@ typedef struct {
      * Unused (0) for mos_thread_create(); joining then polls. */
     volatile uint32_t exit_word;
     uint32_t futex_join;        /* nonzero: created by mos_thread_create_ex() */
+    size_t stack_size;          /* mos_thread_create_vm(): the mapping's length */
+    uint32_t stack_vm;          /* nonzero: `stack` is a SYS_VM mapping */
 } mos_thread_t;
 
 /* ------------------------------------------------------------- futex */
@@ -116,6 +119,7 @@ static inline int mos_thread_create(mos_thread_t* t, void (*fn)(void*), void* ar
     t->arg = arg;
     t->exit_word = 0;
     t->futex_join = 0;
+    t->stack_vm = 0;
     t->stack = malloc(stack_size);
     if (!t->stack) return -1;
     syscall_thread_t request;
@@ -144,6 +148,7 @@ static inline int mos_thread_create_ex(mos_thread_t* t, void (*fn)(void*), void*
     t->fn = fn;
     t->arg = arg;
     t->futex_join = 1;
+    t->stack_vm = 0;
     t->exit_word = 1;
     t->stack = malloc(stack_size);
     if (!t->stack) return -1;
@@ -163,14 +168,52 @@ static inline int mos_thread_create_ex(mos_thread_t* t, void (*fn)(void*), void*
     return 0;
 }
 
+/* Like mos_thread_create_ex() (futex join, optional `tls`), but the stack
+ * is a SYS_VM mapping of stack_size bytes (0: MOS_THREAD_STACK_DEFAULT;
+ * rounded up to pages) instead of malloc memory: it takes physical memory
+ * only as it is used, so a large one is cheap, and it has an unmapped page
+ * on both sides, so running off its low end is a crash (exception 14)
+ * rather than corrupting other memory. mos_thread_join() unmaps it.
+ * Returns 0, or -1. */
+static inline int mos_thread_create_vm(mos_thread_t* t, void (*fn)(void*), void* arg,
+                                       size_t stack_size, void* tls) {
+    if (!t || !fn) return -1;
+    if (!stack_size) stack_size = MOS_THREAD_STACK_DEFAULT;
+    stack_size = mos_vm_round_up(stack_size);
+    t->id = 0;
+    t->fn = fn;
+    t->arg = arg;
+    t->futex_join = 1;
+    t->exit_word = 1;
+    t->stack = mos_vm_map(NULL, stack_size, MOS_VM_PROT_RW, 0);
+    t->stack_size = stack_size;
+    t->stack_vm = 1;
+    if (!t->stack) return -1;
+    syscall_thread_ex_t request;
+    request.entry = (uint64_t)(uintptr_t)mos_thread_start_;
+    request.stack_top = ((uint64_t)(uintptr_t)t->stack + stack_size) & ~(uint64_t)15;
+    request.arg = (uint64_t)(uintptr_t)t;
+    request.fs_base = (uint64_t)(uintptr_t)tls;
+    request.exit_futex = (uint64_t)(uintptr_t)&t->exit_word;
+    long id = mos_syscall(SYS_THREAD, SYS_THREAD_CREATE_EX, (long)(uintptr_t)&request, 0);
+    if (id <= 0) {
+        mos_vm_unmap(t->stack, stack_size);
+        t->stack = NULL;
+        return -1;
+    }
+    t->id = id;
+    return 0;
+}
+
 /* Nonzero while the thread runs. */
 static inline int mos_thread_running(const mos_thread_t* t) {
     return t && t->id &&
            (uint64_t)mos_syscall(SYS_THREAD, SYS_THREAD_ALIVE, t->id, 0) == SYS_SUCCESS;
 }
 
-/* Waits for the thread to end, then frees its stack. A thread made by
- * mos_thread_create_ex() is waited for with a futex, any other by polling. */
+/* Waits for the thread to end, then frees its stack (unmaps it, for
+ * mos_thread_create_vm()). A thread made by mos_thread_create_ex() or
+ * mos_thread_create_vm() is waited for with a futex, any other by polling. */
 static inline void mos_thread_join(mos_thread_t* t) {
     if (!t || !t->id) return;
     if (t->futex_join) {
@@ -180,8 +223,10 @@ static inline void mos_thread_join(mos_thread_t* t) {
     } else {
         while (mos_thread_running(t)) mos_sleep(1);
     }
-    free(t->stack);
+    if (t->stack_vm) mos_vm_unmap(t->stack, t->stack_size);
+    else free(t->stack);
     t->stack = NULL;
+    t->stack_vm = 0;
     t->id = 0;
 }
 
