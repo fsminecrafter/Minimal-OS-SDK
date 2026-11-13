@@ -2,8 +2,11 @@
  * fglcube - a rotating, lit cube drawn with FarcadeGL.
  *
  *     ./build.sh programs/fglcube        -> fglcube.run
- *     fglcube [seconds] [--gouraud|--flat|--wire|--shader]
+ *     fglcube [seconds] [--gouraud|--flat|--wire|--shader] [--still]
  *
+ * --still freezes the animation at one fixed time and prints "FGLCUBE READY"
+ * once the first frame is shown (tools/debug/ci_fglcube.sh takes a screenshot
+ * then and compares renderings between CPU rasterizer modes).
  * --shader draws the scene with FGSL shaders instead of the built-in
  * programs: a textured cube with per-pixel lighting and a pulsing rim
  * glow, on a floor with a checker pattern computed per pixel.
@@ -106,12 +109,13 @@ static void number(char* out, long v) {
 int main(int argc, char** argv) {
     long seconds = 0;
     uint32_t program = FGL_PROGRAM_PHONG;
-    int wire = 0, shaded = 0;
+    int wire = 0, shaded = 0, still = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--gouraud") == 0) program = FGL_PROGRAM_GOURAUD;
         else if (strcmp(argv[i], "--flat") == 0) program = FGL_PROGRAM_COLOR;
         else if (strcmp(argv[i], "--wire") == 0) wire = 1;
         else if (strcmp(argv[i], "--shader") == 0) shaded = 1;
+        else if (strcmp(argv[i], "--still") == 0) still = 1;
         else seconds = atoi(argv[i]);
     }
 
@@ -199,7 +203,7 @@ int main(int argc, char** argv) {
     long frames = 0, fps_frames = 0;
     while (!g_quit) {
         long now = mos_uptime();
-        float t = (float)(now - start) / 1000.0f;
+        float t = still ? 1.2f : (float)(now - start) / 1000.0f;
 
         fglClearColor(gl, 0.06f, 0.08f, 0.13f);
         fglClear(gl, FGL_COLOR_BUFFER_BIT | FGL_DEPTH_BUFFER_BIT);
@@ -234,6 +238,7 @@ int main(int argc, char** argv) {
         }
         frames++;
         fps_frames++;
+        if (still && frames == 3) printf("FGLCUBE READY\n");
 
         if (now - last_title >= 1000) {
             char text[64] = "FarcadeGL cube - ";
