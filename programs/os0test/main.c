@@ -7,7 +7,9 @@
  * Covers SYS_CLOCK, SYS_THREAD (FS base / TLS, exit futex), SYS_FUTEX,
  * SYS_STAT, SYS_RENAME, SYS_CHDIR/SYS_GETCWD, the environment (envp ->
  * environ), SYS_SPAWN and SYS_WAIT, and SYS_VM / the user address-space
- * layout (vm.h): mappings, protection, guard pages, NX, stack sizes, and
+ * layout (vm.h): mappings, protection, guard pages, NX, stack sizes, the
+ * multicore thread tests (parallelism, stress, TLB shootdown, affinity,
+ * priority, group exit and crash across CPUs; see test_smp_threads), and
  * SIMD: the CPU feature report (SYS_SYSINFO) and a torture test that keeps
  * xmm/ymm/x87/MXCSR state intact across context switches, syscalls and page
  * faults (the AVX half runs only when the kernel reports AVX usable;
@@ -620,6 +622,7 @@ static int child_vm(const char* mode, long arg) {
 
 static int child_torture(int wide, long ms);
 static int child_avx_probe(int wide512);
+static int child_smp(const char* mode);
 
 /* os0test.run --child <mode> [arg] */
 static int child_main(int argc, char** argv, char** envp) {
@@ -634,6 +637,7 @@ static int child_main(int argc, char** argv, char** envp) {
     if (streq(mode, "tsc")) return child_tsc();
     if (sstarts(mode, "vm_")) return child_vm(mode, arg);
     if (sstarts(mode, "torture_")) return child_torture(streq(mode, "torture_avx"), arg);
+    if (sstarts(mode, "smp_")) return child_smp(mode + 4);
     if (streq(mode, "avx_probe")) return child_avx_probe(0);
     if (streq(mode, "avx512_probe")) return child_avx_probe(1);
     if (streq(mode, "streams")) {
@@ -3226,6 +3230,602 @@ static void test_simd(void) {
                "pid=%ld crashed=%d vector=%u exit=%d", pid, r.crashed, r.crash_vector, r.exit_code);
 }
 
+/* ===================================================== multicore threads
+ * OS-3: threads of one program run on different CPUs. Parallelism checks
+ * need more than one CPU and a kernel without 'threads1cpu'; everything else
+ * (stress, stale-TLB, group exit, priority) also runs on one CPU. Anything
+ * that may crash or hang runs in a child (`--child smp_...`). */
+
+#define SMP_MAXT 8
+
+static unsigned g_cpus_online;
+static int g_multi;                      /* threads run on different CPUs */
+
+static unsigned popcount32(uint32_t v) { unsigned n = 0; while (v) { n += v & 1; v >>= 1; } return n; }
+
+static uint64_t now_ms(void) { return mos_clock_monotonic_ns() / 1000000ull; }
+
+typedef struct { volatile uint32_t arrived; } spin_barrier_t;
+
+/* Spins (never sleeps) until n threads arrived; false after 20 s. */
+static int barrier_wait(spin_barrier_t* b, uint32_t n) {
+    __atomic_add_fetch(&b->arrived, 1, __ATOMIC_SEQ_CST);
+    uint64_t t0 = now_ms();
+    while (__atomic_load_n(&b->arrived, __ATOMIC_SEQ_CST) < n) {
+        __asm__ volatile("pause");
+        if (now_ms() - t0 > 20000) return 0;
+    }
+    return 1;
+}
+
+static void (*volatile g_worker)(unsigned);
+static void worker_tramp(void* a) { g_worker((unsigned)(uintptr_t)a); }
+
+/* Runs fn(0..n-1) on n threads and joins them; returns how many started. */
+static unsigned run_workers(unsigned n, void (*fn)(unsigned)) {
+    mos_thread_t t[SMP_MAXT];
+    unsigned started = 0;
+    if (n > SMP_MAXT) n = SMP_MAXT;
+    g_worker = fn;
+    for (unsigned i = 0; i < n; i++) {
+        if (mos_thread_create_ex(&t[i], worker_tramp, (void*)(uintptr_t)i, 64 * 1024, NULL) != 0) break;
+        started++;
+    }
+    for (unsigned i = 0; i < started; i++) mos_thread_join(&t[i]);
+    return started;
+}
+
+static volatile uint64_t g_sink;
+static void busy_work(uint64_t iters) {
+    uint64_t x = 0x1234567;
+    for (uint64_t i = 0; i < iters; i++) x = x * 6364136223846793005ull + 1442695040888963407ull;
+    g_sink = x;
+}
+
+/* ---- parallelism ---- */
+
+static spin_barrier_t g_par_bar;
+static volatile uint32_t g_par_seen;       /* bit per CPU a worker ran on */
+static volatile uint32_t g_par_arrive_ok;
+static uint64_t g_par_iters;
+
+static void w_cpu_ids(unsigned idx) {
+    (void)idx;
+    if (barrier_wait(&g_par_bar, g_par_arrive_ok)) {
+        for (int i = 0; i < 300; i++) {
+            __atomic_or_fetch(&g_par_seen, 1u << (mos_cpu_current() & 31), __ATOMIC_SEQ_CST);
+            busy_work(20000);
+        }
+    }
+}
+
+static void w_busy(unsigned idx) { (void)idx; busy_work(g_par_iters); }
+
+static uint64_t time_workers(unsigned n) {
+    uint64_t t0 = now_ms();
+    run_workers(n, w_busy);
+    return now_ms() - t0;
+}
+
+static void test_smp_parallel(void) {
+    stage("smp_parallel");
+    g_cpus_online = mos_cpu_count();
+    g_multi = mos_threads_multicore();
+    emit_fd(1, "OS0TEST info cpus=%u multicore_threads=%d", g_cpus_online, g_multi);
+    EXPECT(g_cpus_online >= 1 && g_cpus_online <= 16, "smp_cpu_count_sane", "count %u", g_cpus_online);
+    EXPECT(mos_cpu_current() < g_cpus_online, "smp_cpu_current_below_count", "cpu %u of %u", mos_cpu_current(), g_cpus_online);
+    if (g_cpus_online < 2 || !g_multi) {
+        check_pass("smp_parallel_skipped_single_cpu_or_pinned");
+        return;
+    }
+    unsigned n = g_cpus_online > 4 ? 4 : g_cpus_online;
+
+    /* Distinct CPUs, seen while every worker is running at once. */
+    g_par_bar.arrived = 0;
+    g_par_seen = 0;
+    g_par_arrive_ok = n;
+    unsigned started = run_workers(n, w_cpu_ids);
+    unsigned distinct = popcount32(g_par_seen);
+    EXPECT(started == n, "smp_parallel_workers_started", "started %u of %u", started, n);
+    EXPECT(distinct >= 2, "smp_threads_run_on_different_cpus", "workers ran on %u CPU(s), mask 0x%x", distinct, g_par_seen);
+
+    /* Work done in less wall time than serially. */
+    g_par_iters = 1u << 18;
+    uint64_t t;
+    while ((t = time_workers(1)) < 40 && g_par_iters < (1ull << 30)) g_par_iters *= 2;
+    int ok = 0;
+    uint64_t t1 = 0, tn = 0;
+    for (int attempt = 0; attempt < 4 && !ok; attempt++) {
+        /* best of three each: another VM on the host can steal a CPU for a while */
+        t1 = time_workers(1);
+        for (int k = 0; k < 2; k++) { uint64_t x = time_workers(1); if (x < t1) t1 = x; }
+        tn = time_workers(n);
+        for (int k = 0; k < 2; k++) { uint64_t x = time_workers(n); if (x < tn) tn = x; }
+        /* n workers took less than 80% of n serial runs */
+        if (tn * 10 < 8 * n * t1) ok = 1;
+    }
+    EXPECT(ok, "smp_parallel_speedup", "1 worker %lu ms, %u workers %lu ms (serial would be %lu ms)",
+           (unsigned long)t1, n, (unsigned long)tn, (unsigned long)(n * t1));
+}
+
+/* ---- stress ---- */
+
+static volatile uint32_t g_errs;
+static void err_note(void) { __atomic_add_fetch(&g_errs, 1, __ATOMIC_SEQ_CST); }
+
+static void w_malloc(unsigned idx) {
+    uint32_t seed = idx * 7919u + 1;
+    uint8_t* ring[8];
+    size_t ring_len[8];
+    uint8_t ring_pat[8];
+    memset(ring, 0, sizeof(ring));
+    for (int i = 0; i < 400; i++) {
+        seed = seed * 1103515245u + 12345u;
+        size_t sz = 16 + (seed >> 8) % 6000;
+        uint8_t* p = (uint8_t*)malloc(sz);
+        if (!p) { err_note(); continue; }
+        uint8_t pat = (uint8_t)(idx * 31 + i);
+        memset(p, pat, sz);
+        int slot = i & 7;
+        if (ring[slot]) {
+            for (size_t k = 0; k < ring_len[slot]; k += 61)
+                if (ring[slot][k] != ring_pat[slot]) { err_note(); break; }
+            free(ring[slot]);
+        }
+        ring[slot] = p; ring_len[slot] = sz; ring_pat[slot] = pat;
+    }
+    for (int s = 0; s < 8; s++) {
+        if (!ring[s]) continue;
+        for (size_t k = 0; k < ring_len[s]; k += 61)
+            if (ring[s][k] != ring_pat[s]) { err_note(); break; }
+        free(ring[s]);
+    }
+}
+
+static void w_vm_private(unsigned idx) {
+    for (int i = 0; i < 40; i++) {
+        uint8_t* p = (uint8_t*)mos_vm_map(NULL, 8 * VM_PAGE, VM_RW, 0);
+        if (!p) { err_note(); continue; }
+        for (unsigned pg = 0; pg < 8; pg++) p[pg * VM_PAGE + 8] = (uint8_t)(idx + i + pg);
+        if (mos_vm_protect(p, 8 * VM_PAGE, MOS_VM_PROT_READ) != SYS_SUCCESS) err_note();
+        for (unsigned pg = 0; pg < 8; pg++)
+            if (p[pg * VM_PAGE + 8] != (uint8_t)(idx + i + pg)) err_note();
+        if (mos_vm_protect(p, 8 * VM_PAGE, VM_RW) != SYS_SUCCESS) err_note();
+        p[3 * VM_PAGE + 9] = 77;
+        if (mos_vm_decommit(p + 2 * VM_PAGE, 2 * VM_PAGE) != SYS_SUCCESS) err_note();
+        if (p[2 * VM_PAGE + 8] != 0 || p[3 * VM_PAGE + 9] != 0) err_note();      /* read as zero again */
+        if (p[4 * VM_PAGE + 8] != (uint8_t)(idx + i + 4)) err_note();
+        if (mos_vm_unmap(p, 8 * VM_PAGE) != SYS_SUCCESS) err_note();
+    }
+}
+
+#define SHARED_PAGES 48
+static uint8_t* volatile g_shared;
+
+static void w_vm_shared(unsigned idx) {
+    /* Everyone touches every page (first touches race on the same pages),
+     * each in its own word, in an order of its own. */
+    for (unsigned k = 0; k < SHARED_PAGES; k++) {
+        static const unsigned stride[SMP_MAXT] = { 1, 5, 7, 11, 13, 17, 19, 23 };   /* coprime to 48 */
+        unsigned pg = (k * stride[idx % SMP_MAXT] + idx) % SHARED_PAGES;
+        volatile uint64_t* w = (volatile uint64_t*)(g_shared + pg * VM_PAGE) + idx;
+        *w = 0xA5A50000u + idx * 256 + pg;
+    }
+    for (unsigned pg = 0; pg < SHARED_PAGES; pg++) {
+        volatile uint64_t* w = (volatile uint64_t*)(g_shared + pg * VM_PAGE) + idx;
+        if (*w != 0xA5A50000u + idx * 256 + pg) err_note();
+    }
+}
+
+static mos_mutex_t g_mx = MOS_MUTEX_INIT;
+static volatile uint64_t g_plain_counter;
+static volatile uint64_t g_atomic_counter;
+static volatile uint32_t g_mx_inside;
+#define MX_ITERS 4000
+
+static void w_mutex(unsigned idx) {
+    (void)idx;
+    for (int i = 0; i < MX_ITERS; i++) {
+        mos_mutex_lock(&g_mx);
+        if (__atomic_add_fetch(&g_mx_inside, 1, __ATOMIC_SEQ_CST) != 1) err_note();
+        uint64_t v = g_plain_counter;
+        if ((i & 255) == 0) mos_thread_yield();         /* hold it across a reschedule now and then */
+        g_plain_counter = v + 1;
+        __atomic_sub_fetch(&g_mx_inside, 1, __ATOMIC_SEQ_CST);
+        mos_mutex_unlock(&g_mx);
+        __atomic_add_fetch(&g_atomic_counter, 1, __ATOMIC_SEQ_CST);
+    }
+}
+
+static volatile uint32_t g_pp_word;
+static volatile uint32_t g_pp_count;
+static volatile uint32_t g_pp_bad;
+#define PP_ROUNDS 600
+
+/* Thread `idx` runs when the word equals idx: waits (futex) for its turn,
+ * counts, passes the turn on and wakes the other. */
+static void w_pingpong(unsigned idx) {
+    for (int i = 0; i < PP_ROUNDS; i++) {
+        uint64_t t0 = now_ms();
+        while (__atomic_load_n(&g_pp_word, __ATOMIC_ACQUIRE) != idx) {
+            mos_futex_wait(&g_pp_word, 1 - idx, 2000ull * 1000000ull);
+            if (now_ms() - t0 > 15000) { g_pp_bad++; return; }
+        }
+        if (g_pp_count != (uint32_t)(2 * i + idx)) g_pp_bad++;
+        g_pp_count++;
+        __atomic_store_n(&g_pp_word, 1 - idx, __ATOMIC_RELEASE);
+        mos_futex_wake(&g_pp_word, 1);
+    }
+}
+
+static volatile uint32_t g_churn_count;
+static void w_churn_leaf(unsigned idx) { (void)idx; __atomic_add_fetch(&g_churn_count, 1, __ATOMIC_SEQ_CST); }
+static void leaf_tramp(void* a) { w_churn_leaf((unsigned)(uintptr_t)a); }
+
+static void test_smp_stress(void) {
+    unsigned n = g_cpus_online > 4 ? 4 : (g_cpus_online < 2 ? 2 : g_cpus_online);
+    if (n < 3) n = 3;     /* more threads than CPUs is fine: they preempt each other */
+
+    stage("smp_stress_malloc");
+    g_errs = 0;
+    unsigned started = run_workers(n, w_malloc);
+    EXPECT(started == n && g_errs == 0, "smp_stress_malloc_free", "started %u of %u, %u errors", started, n, g_errs);
+
+    stage("smp_stress_vm_private");
+    g_errs = 0;
+    started = run_workers(n, w_vm_private);
+    EXPECT(started == n && g_errs == 0, "smp_stress_vm_map_protect_decommit_unmap_private", "started %u of %u, %u errors", started, n, g_errs);
+
+    stage("smp_stress_vm_shared");
+    g_errs = 0;
+    g_shared = (uint8_t*)mos_vm_map(NULL, SHARED_PAGES * VM_PAGE, VM_RW, 0);
+    EXPECT(g_shared != NULL, "smp_stress_shared_range_mapped", "map failed: %ld", mos_vm_last_error());
+    if (g_shared) {
+        started = run_workers(n, w_vm_shared);
+        int words_ok = 1;
+        for (unsigned idx = 0; idx < started; idx++)
+            for (unsigned pg = 0; pg < SHARED_PAGES; pg++)
+                if (((volatile uint64_t*)(g_shared + pg * VM_PAGE))[idx] != 0xA5A50000u + idx * 256 + pg) words_ok = 0;
+        EXPECT(started == n && g_errs == 0 && words_ok, "smp_stress_vm_shared_first_touch_races",
+               "started %u of %u, %u errors, all words ok=%d", started, n, g_errs, words_ok);
+        EXPECT_RET(mos_vm_unmap(g_shared, SHARED_PAGES * VM_PAGE), SYS_SUCCESS, "smp_stress_shared_range_unmapped");
+    }
+
+    stage("smp_stress_mutex");
+    g_plain_counter = g_atomic_counter = 0;
+    g_errs = 0;
+    started = run_workers(n, w_mutex);
+    EXPECT(started == n && g_plain_counter == (uint64_t)n * MX_ITERS && g_errs == 0, "smp_stress_mutex_no_lost_updates",
+           "started %u of %u, counter %lu expected %lu, exclusion violations %u", started, n,
+           (unsigned long)g_plain_counter, (unsigned long)n * MX_ITERS, g_errs);
+    EXPECT(g_atomic_counter == (uint64_t)n * MX_ITERS, "smp_stress_atomic_counter", "counter %lu expected %lu",
+           (unsigned long)g_atomic_counter, (unsigned long)n * MX_ITERS);
+
+    stage("smp_stress_futex_pingpong");
+    g_pp_word = 0; g_pp_count = 0; g_pp_bad = 0;
+    uint64_t t0 = now_ms();
+    started = run_workers(2, w_pingpong);
+    EXPECT(started == 2 && g_pp_bad == 0 && g_pp_count == 2 * PP_ROUNDS, "smp_stress_futex_pingpong",
+           "started %u, count %u of %u, %u order errors, %lu ms", started, g_pp_count, 2 * PP_ROUNDS, g_pp_bad,
+           (unsigned long)(now_ms() - t0));
+
+    stage("smp_stress_create_join_churn");
+    g_churn_count = 0;
+    unsigned created = 0, failed = 0;
+    for (int wave = 0; wave < 60; wave++) {
+        mos_thread_t t[5];
+        unsigned s = 0;
+        for (int i = 0; i < 5; i++) {
+            int r = (i & 1) ? mos_thread_create_vm(&t[i], leaf_tramp, (void*)(uintptr_t)i, 16 * 1024, NULL)
+                            : mos_thread_create_ex(&t[i], leaf_tramp, (void*)(uintptr_t)i, 16 * 1024, NULL);
+            if (r == 0) s++; else { failed++; break; }
+        }
+        for (unsigned i = 0; i < s; i++) mos_thread_join(&t[i]);
+        created += s;
+    }
+    EXPECT(failed == 0 && created == 300 && g_churn_count == 300, "smp_stress_thread_create_join_churn",
+           "created %u, ran %u, create failures %u", created, g_churn_count, failed);
+}
+
+/* ---- affinity and priority ---- */
+
+static volatile uint32_t g_aff_bad;
+static void w_affinity(unsigned idx) {
+    if (mos_thread_set_affinity(NULL, 1ull << idx) != 0) { g_aff_bad++; return; }
+    for (int i = 0; i < 30; i++) {
+        if (mos_cpu_current() != idx) g_aff_bad++;
+        if (i & 1) mos_sleep(1); else busy_work(5000);
+    }
+    if (mos_thread_get_affinity(NULL) != (long)(1ull << idx)) g_aff_bad++;
+}
+
+static volatile uint32_t g_mv_cpu = 0xFFFF;
+static volatile uint32_t g_mv_stop;
+static void w_mover(void* arg) {
+    (void)arg;
+    while (!__atomic_load_n(&g_mv_stop, __ATOMIC_ACQUIRE)) {
+        __atomic_store_n(&g_mv_cpu, mos_cpu_current(), __ATOMIC_RELEASE);
+        busy_work(2000);
+    }
+}
+
+static volatile uint32_t g_prio_go;
+static void w_low_prio(void* arg) {
+    (void)arg;
+    while (!__atomic_load_n(&g_prio_go, __ATOMIC_ACQUIRE)) mos_sleep(1);
+    busy_work(1u << 16);
+    __atomic_add_fetch(&g_churn_count, 1, __ATOMIC_SEQ_CST);
+}
+
+static void test_smp_affinity_priority(void) {
+    stage("smp_affinity");
+    if (!g_multi) {
+        EXPECT_RET(mos_thread_set_affinity(NULL, 1), ERR(SYS_ERR_PERM), "smp_affinity_refused_when_pinned");
+    } else {
+        uint64_t all = (g_cpus_online >= 64) ? ~0ull : ((1ull << g_cpus_online) - 1);
+        EXPECT_RET(mos_thread_set_affinity(NULL, 1ull << 40), ERR(SYS_ERR_INVAL), "smp_affinity_offline_cpu_inval");
+        EXPECT(mos_thread_get_affinity(NULL) == (long)all, "smp_affinity_default_is_all_cpus", "mask 0x%lx expected 0x%lx",
+               (unsigned long)mos_thread_get_affinity(NULL), (unsigned long)all);
+        unsigned n = g_cpus_online > SMP_MAXT ? SMP_MAXT : g_cpus_online;
+        g_aff_bad = 0;
+        unsigned started = run_workers(n, w_affinity);
+        EXPECT(started == n && g_aff_bad == 0, "smp_thread_pinned_to_cpu_k_reports_k",
+               "started %u of %u, %u wrong readings", started, n, g_aff_bad);
+
+        /* Moving a running thread from outside. */
+        mos_thread_t t;
+        g_mv_stop = 0;
+        g_mv_cpu = 0xFFFF;
+        int c = mos_thread_create_ex(&t, w_mover, NULL, 32 * 1024, NULL);
+        EXPECT(c == 0, "smp_mover_thread_created", "create %d", c);
+        if (c == 0) {
+            int moved_all = 1;
+            for (unsigned k = 0; k < g_cpus_online && k < 4; k++) {
+                unsigned target = (g_cpus_online - 1 - k);
+                long r = mos_thread_set_affinity(&t, 1ull << target);
+                int got = 0;
+                uint64_t t0 = now_ms();
+                while (r == 0 && now_ms() - t0 < 3000) {
+                    if (__atomic_load_n(&g_mv_cpu, __ATOMIC_ACQUIRE) == target) { got = 1; break; }
+                    mos_sleep(2);
+                }
+                if (!got) {
+                    moved_all = 0;
+                    emit_fd(1, "OS0TEST info mover: target %u, last cpu %u, set returned %ld", target, g_mv_cpu, r);
+                }
+            }
+            EXPECT(moved_all, "smp_affinity_moves_a_running_thread", "the thread did not reach the CPU asked for");
+            EXPECT(mos_thread_get_affinity(&t) > 0, "smp_affinity_get_of_other_thread", "got %ld", mos_thread_get_affinity(&t));
+            g_mv_stop = 1;
+            mos_thread_join(&t);
+        }
+    }
+
+    stage("smp_priority");
+    /* The calling thread keeps its priority: a lowered main would wait
+     * behind every busy higher level (up to the scheduler's boost interval)
+     * for each blocking call. The threads below are the ones lowered. */
+    EXPECT_RET(mos_thread_get_priority(NULL), ERR(MOS_PRIO_HIGH), "smp_priority_default_high");
+    EXPECT_RET(mos_thread_set_priority(NULL, 9), ERR(SYS_ERR_INVAL), "smp_priority_invalid_inval");
+    EXPECT_RET(mos_thread_set_priority(NULL, MOS_PRIO_HIGH), SYS_SUCCESS, "smp_priority_set_high_on_self");
+    mos_thread_t lt;
+    g_churn_count = 0;
+    g_prio_go = 0;
+    int lc = mos_thread_create_ex(&lt, w_low_prio, NULL, 32 * 1024, NULL);
+    EXPECT(lc == 0, "smp_priority_thread_created", "create %d", lc);
+    if (lc == 0) {
+        EXPECT_RET(mos_thread_get_priority(&lt), ERR(MOS_PRIO_HIGH), "smp_priority_new_thread_inherits_high");
+        EXPECT_RET(mos_thread_set_priority(&lt, MOS_PRIO_NORMAL), SYS_SUCCESS, "smp_priority_set_normal_on_thread");
+        EXPECT_RET(mos_thread_get_priority(&lt), ERR(MOS_PRIO_NORMAL), "smp_priority_get_normal_on_thread");
+        EXPECT_RET(mos_thread_set_priority(&lt, MOS_PRIO_LOW), SYS_SUCCESS, "smp_priority_set_low_on_thread");
+        EXPECT_RET(mos_thread_get_priority(&lt), ERR(MOS_PRIO_LOW), "smp_priority_get_low_on_thread");
+        EXPECT_RET(mos_thread_set_priority(&lt, 3), ERR(SYS_ERR_INVAL), "smp_priority_invalid_on_thread_inval");
+        __atomic_store_n(&g_prio_go, 1, __ATOMIC_RELEASE);
+        /* With a CPU to spare the low-priority thread runs at once; on one
+         * CPU it may wait behind busier levels, so only wait there as long
+         * as a boost needs. */
+        uint64_t t0 = now_ms();
+        uint64_t limit = (g_cpus_online > 1 && g_multi) ? 20000 : 3000;
+        while (g_churn_count == 0 && now_ms() - t0 < limit) mos_sleep(5);
+        int done = g_churn_count == 1;
+        if (g_cpus_online > 1 && g_multi)
+            EXPECT(done, "smp_low_priority_thread_completes", "not finished after %lu ms", (unsigned long)(now_ms() - t0));
+        else
+            check_pass("smp_low_priority_completion_not_required_on_one_cpu");
+        mos_thread_join(&lt);
+    }
+    mos_thread_t nt;
+    g_prio_go = 0;
+    mos_thread_set_priority(NULL, MOS_PRIO_NORMAL);
+    int nc = mos_thread_create_ex(&nt, w_low_prio, NULL, 32 * 1024, NULL);
+    long inherited = nc == 0 ? mos_thread_get_priority(&nt) : -99;
+    mos_thread_set_priority(NULL, MOS_PRIO_HIGH);
+    if (nc == 0) {
+        mos_thread_set_priority(&nt, MOS_PRIO_HIGH);       /* so that the join does not wait behind busy levels */
+        __atomic_store_n(&g_prio_go, 1, __ATOMIC_RELEASE);
+        mos_thread_join(&nt);
+    }
+    EXPECT(inherited == (long)MOS_PRIO_NORMAL, "smp_priority_inherited_by_new_thread", "inherited %ld", inherited);
+    EXPECT(mos_thread_set_priority((const mos_thread_t*)&(mos_thread_t){ .id = 1 }, MOS_PRIO_LOW) < 0,
+           "smp_priority_of_foreign_thread_refused", "accepted");
+}
+
+/* ---- children: stale TLB entries, group exit and crash ---- */
+
+static uint8_t* volatile g_st_page;
+static volatile uint32_t g_st_flag;
+static volatile uint32_t g_st_ready;
+static volatile int g_st_write;
+
+static void st_reader(void* arg) {
+    (void)arg;
+    if (g_cpus_online > 1 && g_multi) mos_thread_set_affinity(NULL, 1ull << 1);
+    volatile uint8_t* p = g_st_page;
+    for (;;) {
+        uint32_t f = __atomic_load_n(&g_st_flag, __ATOMIC_ACQUIRE);
+        if (g_st_write) *p = 1; else (void)*p;       /* faults when the access was taken away */
+        if (f) {
+            /* the flag was set before this access, and the access worked */
+            emit_fd(1, "smp stale child: access succeeded after the change returned");
+            mos_exit(7);
+        }
+        __atomic_store_n(&g_st_ready, 1, __ATOMIC_RELEASE);
+    }
+}
+
+/* mode: unmap, prot_none, prot_ro (the reader writes), heap (free()) */
+static int child_smp_stale(const char* mode) {
+    g_cpus_online = mos_cpu_count();
+    g_multi = mos_threads_multicore();
+    if (g_cpus_online > 1 && g_multi) mos_thread_set_affinity(NULL, 1ull << 0);
+    uint8_t* region;
+    int heap = streq(mode, "heap");
+    if (heap) {
+        region = (uint8_t*)malloc(6 * VM_PAGE);
+        if (!region) return 5;
+        memset(region, 1, 6 * VM_PAGE);
+        g_st_page = region + 3 * VM_PAGE;              /* a page wholly inside the block */
+    } else {
+        region = (uint8_t*)mos_vm_map(NULL, 4 * VM_PAGE, VM_RW, MOS_VM_MAP_POPULATE);
+        if (!region) return 5;
+        g_st_page = region + VM_PAGE;
+    }
+    g_st_write = streq(mode, "prot_ro");
+    g_st_flag = 0;
+    g_st_ready = 0;
+    mos_thread_t t;
+    if (mos_thread_create_ex(&t, st_reader, NULL, 32 * 1024, NULL) != 0) return 6;
+    uint64_t t0 = now_ms();
+    while (!__atomic_load_n(&g_st_ready, __ATOMIC_ACQUIRE) && now_ms() - t0 < 5000) mos_sleep(1);
+    mos_sleep(5);                                      /* let it cache the translation */
+    long r = SYS_SUCCESS;
+    if (streq(mode, "unmap")) r = mos_vm_unmap(region, 4 * VM_PAGE);
+    else if (streq(mode, "prot_none")) r = mos_vm_protect(region, 4 * VM_PAGE, MOS_VM_PROT_NONE);
+    else if (streq(mode, "prot_ro")) r = mos_vm_protect(region, 4 * VM_PAGE, MOS_VM_PROT_READ);
+    else if (heap) free(region);
+    if (r != SYS_SUCCESS) return 9;
+    __atomic_store_n(&g_st_flag, 1, __ATOMIC_RELEASE);
+    mos_sleep(3000);                                   /* the reader must have crashed the program */
+    emit_fd(1, "smp stale child: the reader did not fault");
+    return 8;
+}
+
+static spin_barrier_t g_grp_bar;
+
+static void grp_spinner(void* arg) {
+    uintptr_t kind = (uintptr_t)arg;
+    for (;;) {
+        if (kind & 1) {                               /* in the kernel all the time */
+            (void)mos_uptime();
+            void* p = malloc(64);
+            free(p);
+        } else {
+            __asm__ volatile("pause");                /* in user mode */
+        }
+    }
+}
+
+static void grp_crasher(void* arg) {
+    (void)arg;
+    barrier_wait(&g_grp_bar, 3);
+    __asm__ volatile("ud2");
+}
+
+static int child_smp_group(const char* mode) {
+    mos_thread_t sp[4];
+    int nsp = 0;
+    int crash = streq(mode, "crash");
+    if (streq(mode, "two_crash")) {
+        mos_thread_t c[3];
+        for (int i = 0; i < 3; i++) mos_thread_create_ex(&c[i], grp_crasher, NULL, 32 * 1024, NULL);
+        mos_sleep(2000);
+        return 42;                                    /* not reached: the program ends in a crash */
+    }
+    for (int i = 0; i < 4; i++)
+        if (mos_thread_create_ex(&sp[i], grp_spinner, (void*)(uintptr_t)(streq(mode, "exit_syscalls") ? 1 : i & 1), 32 * 1024, NULL) == 0) nsp++;
+    if (nsp != 4) return 6;
+    mos_sleep(60);
+    if (crash) {
+        mos_thread_t c;
+        __atomic_add_fetch(&g_grp_bar.arrived, 2, __ATOMIC_SEQ_CST);   /* the crasher alone completes it */
+        mos_thread_create_ex(&c, grp_crasher, NULL, 32 * 1024, NULL);
+        mos_sleep(2000);
+        return 42;
+    }
+    if (streq(mode, "return")) return 44;
+    mos_exit(33);
+    return 0;
+}
+
+static int child_smp(const char* mode) {
+    if (sstarts(mode, "stale_")) return child_smp_stale(mode + 6);
+    if (sstarts(mode, "grp_")) return child_smp_group(mode + 4);
+    return 99;
+}
+
+static void expect_stale_faults(const char* mode, const char* name) {
+    int ok = 0, tries = 4;
+    long bad_pid = 0;
+    mos_wait_result_t last;
+    memset(&last, 0, sizeof(last));
+    for (int i = 0; i < tries; i++) {
+        mos_wait_result_t r;
+        char child[32];
+        kfmt(child, sizeof(child), "smp_stale_%s", mode);
+        long pid = spawn_wait(child, NULL, NULL, NULL, NULL, NULL, &r);
+        if (pid > 0 && r.crashed && r.crash_vector == 14) ok++;
+        else { bad_pid = pid; last = r; }
+    }
+    EXPECT(ok == tries, name, "%d of %d children faulted cleanly; last bad: pid=%ld crashed=%d vector=%u exit=%d",
+           ok, tries, bad_pid, last.crashed, last.crash_vector, last.exit_code);
+}
+
+static void test_smp_stale_and_exit(void) {
+    stage("smp_stale_tlb");
+    expect_stale_faults("unmap", "smp_no_stale_access_after_unmap_returns");
+    expect_stale_faults("prot_none", "smp_no_stale_access_after_protect_none_returns");
+    expect_stale_faults("prot_ro", "smp_no_stale_write_after_protect_readonly_returns");
+    expect_stale_faults("heap", "smp_no_stale_access_after_free_returns");
+
+    stage("smp_group_exit");
+    mos_wait_result_t r;
+    long pid = spawn_wait("smp_grp_exit", NULL, NULL, NULL, NULL, NULL, &r);
+    EXPECT(pid > 0 && !r.crashed && r.exit_code == 33, "smp_exit_with_threads_spinning_on_other_cpus",
+           "pid=%ld crashed=%d exit=%d", pid, r.crashed, r.exit_code);
+    pid = spawn_wait("smp_grp_exit_syscalls", NULL, NULL, NULL, NULL, NULL, &r);
+    EXPECT(pid > 0 && !r.crashed && r.exit_code == 33, "smp_exit_with_threads_inside_system_calls",
+           "pid=%ld crashed=%d exit=%d", pid, r.crashed, r.exit_code);
+    pid = spawn_wait("smp_grp_return", NULL, NULL, NULL, NULL, NULL, &r);
+    EXPECT(pid > 0 && !r.crashed && r.exit_code == 44, "smp_main_return_with_threads_spinning",
+           "pid=%ld crashed=%d exit=%d", pid, r.crashed, r.exit_code);
+    pid = spawn_wait("smp_grp_crash", NULL, NULL, NULL, NULL, NULL, &r);
+    EXPECT(pid > 0 && r.crashed && r.crash_vector == 6, "smp_thread_crash_with_others_spinning",
+           "pid=%ld crashed=%d vector=%u exit=%d", pid, r.crashed, r.crash_vector, r.exit_code);
+    pid = spawn_wait("smp_grp_two_crash", NULL, NULL, NULL, NULL, NULL, &r);
+    EXPECT(pid > 0 && r.crashed && r.crash_vector == 6, "smp_two_threads_crash_together",
+           "pid=%ld crashed=%d vector=%u exit=%d", pid, r.crashed, r.crash_vector, r.exit_code);
+    /* repeated, so that the timing of the kill versus the CPUs varies */
+    int good = 0;
+    for (int i = 0; i < 6; i++) {
+        pid = spawn_wait(i & 1 ? "smp_grp_exit" : "smp_grp_crash", NULL, NULL, NULL, NULL, NULL, &r);
+        if (pid > 0 && ((i & 1) ? (!r.crashed && r.exit_code == 33) : (r.crashed && r.crash_vector == 6))) good++;
+        else emit_fd(1, "OS0TEST info group end %d (%s): pid=%ld crashed=%d vector=%u exit=%d", i,
+                     i & 1 ? "exit" : "crash", pid, r.crashed, r.crash_vector, r.exit_code);
+    }
+    EXPECT(good == 6, "smp_group_end_repeated", "%d of 6 correct", good);
+
+    /* the system is still healthy: CPUs free, children run, work still parallel */
+    pid = spawn_wait("exit", "0", NULL, NULL, NULL, NULL, &r);
+    EXPECT(pid > 0 && !r.crashed && r.exit_code == 0, "smp_system_healthy_after_group_ends", "pid=%ld crashed=%d exit=%d", pid, r.crashed, r.exit_code);
+}
+
+static void test_smp_threads(void) {
+    test_smp_parallel();
+    test_smp_stress();
+    test_smp_affinity_priority();
+    test_smp_stale_and_exit();
+}
+
 /* ================================================================== main */
 
 int main(int argc, char** argv, char** envp) {
@@ -3275,6 +3875,7 @@ int main(int argc, char** argv, char** envp) {
     test_spawn_failure_cleanup();
     test_exec_relative();
     test_vm();
+    test_smp_threads();
     test_simd();
 
     stage("cleanup");

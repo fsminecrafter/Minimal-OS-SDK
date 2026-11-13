@@ -4,11 +4,15 @@ Running several parts of a program at once, and locking what they share.
 Include `thread.h`.
 
 A thread shares everything with the rest of its program: globals, the
-heap, anything a pointer reaches. All of a program's threads run on the
-same CPU, so threads do not make a computation faster. What they do is
-keep a program responsive: while one thread waits (on the network, a
-file, a timer), the others carry on. Several threads waiting on the
-network wait at the same time.
+heap, anything a pointer reaches. Threads of one program run in parallel
+on different CPUs: N busy threads on N cores do N times the work in the
+same time, and a thread that waits (on the network, a file, a timer)
+leaves its CPU to the others. Two threads really do run at the same
+instant, so everything they share needs a mutex or atomics. A new thread
+goes to the least loaded CPU, and the scheduler may move it later; see
+[CPUs, affinity and priority](#cpus-affinity-and-priority). On a single
+CPU machine, or when the kernel was booted with `threads1cpu`, all
+threads share one CPU (`mos_threads_multicore()` tells).
 
 - `malloc`, `calloc`, `realloc` and `free` are system calls and are safe
   from any thread.
@@ -16,6 +20,9 @@ network wait at the same time.
 - A thread ends when its function returns. `mos_exit()` from any thread,
   or `main()` returning, ends the whole program, threads included.
 - A crash in any thread ends the whole program, like a crash in `main`.
+- `mos_vm_unmap`, `mos_vm_protect`, `mos_vm_decommit` and `free` take
+  effect on every CPU before they return: a thread that uses the memory
+  afterwards faults (and ends the program) instead of reading stale data.
 - Windows belong to the thread that created them: keep all window and
   drawing calls on one thread (usually `main`'s).
 - A network connection or open file belongs to the thread that opened it.
@@ -268,3 +275,51 @@ the thread has ended).
 `SYS_FUTEX` (48): `rdi` = `SYS_FUTEX_WAIT` with `rsi` = address, `rdx` =
 expected value, `r10` = timeout in nanoseconds; or `SYS_FUTEX_WAKE` with
 `rsi` = address, `rdx` = count.
+
+## CPUs, affinity and priority
+
+```c
+unsigned mos_cpu_count(void);
+int      mos_threads_multicore(void);
+unsigned mos_cpu_current(void);
+long     mos_thread_set_affinity(const mos_thread_t* t, uint64_t mask);
+long     mos_thread_get_affinity(const mos_thread_t* t);
+long     mos_thread_set_priority(const mos_thread_t* t, unsigned priority);
+long     mos_thread_get_priority(const mos_thread_t* t);
+```
+
+| Function | Description |
+| --- | --- |
+| `mos_cpu_count` | Online CPUs (`SYS_SYSINFO_CORE_COUNT`) |
+| `mos_threads_multicore` | Nonzero when threads run on different CPUs (the default); 0 with the boot flag `threads1cpu` |
+| `mos_cpu_current` | The CPU the calling thread runs on now, `0 .. count-1` |
+| `mos_thread_set_affinity` | Restricts a thread to the CPUs in `mask` (bit n = CPU n; `0` = any). `t` = `NULL` is the calling thread. Takes effect before it returns |
+| `mos_thread_get_affinity` | The mask (all online CPUs while unrestricted) or a negative error |
+| `mos_thread_set_priority` | `MOS_PRIO_HIGH` (default), `MOS_PRIO_NORMAL` or `MOS_PRIO_LOW` |
+| `mos_thread_get_priority` | The priority set |
+
+**Priority** maps onto the scheduler's three levels. A thread normally
+starts at the interactive level and drops a level whenever it uses its
+whole time slice; a blocking call brings it back. The priority is the
+highest level it may be at: `HIGH` (default) is unrestricted, `NORMAL`
+never sits above the normal level, `LOW` stays at the background level, so
+it only runs on its CPU while nothing at a better level there waits (a
+periodic boost keeps it from starving). It does not change time slices.
+New threads inherit priority and affinity from the thread that creates
+them.
+
+**Affinity** errors: `SYS_ERR_INVAL` when the mask names no online CPU or
+the thread belongs to another program, `SYS_ERR_PERM` when the kernel pins
+threads (`threads1cpu`). Moving between CPUs is the scheduler's job; use
+affinity only when it matters (cache locality, a dedicated worker).
+
+**What the kernel guarantees across CPUs**
+
+- Memory unmapped, made less accessible (`mos_vm_unmap`,
+  `mos_vm_protect`, `mos_vm_decommit`, `free`) is flushed from every CPU's
+  TLB before the call returns and before the physical pages are reused.
+- A thread that ends the program (`mos_exit`, `main` returning, a crash)
+  stops all other threads, even ones running on other CPUs, before the
+  program's memory is released. If two threads crash at the same time, the
+  first one's crash is the program's exit status.
+- Futex wake-ups reach a waiter on any CPU.

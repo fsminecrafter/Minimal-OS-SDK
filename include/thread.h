@@ -5,10 +5,14 @@
  * Threads for Minimal-OS programs (SYS_THREAD).
  *
  * A thread shares the program's memory: globals, heap and everything a
- * pointer reaches. It runs on the same CPU as the rest of the program, so
- * threads do not make computation faster; they keep a program responsive
- * while one thread waits (on the network, a file, a timer) and the others
- * go on. Several threads waiting on the network wait at the same time.
+ * pointer reaches. Threads of one program run in parallel on different
+ * CPUs (a new thread goes to the least loaded CPU; the scheduler may move
+ * it): N busy threads on N cores finish N times the work in the same time,
+ * and a thread that waits (on the network, a file, a timer) leaves its CPU
+ * to the others. Shared data needs a mos_mutex_t or atomics: two threads
+ * really do run at the same instant. Boot flag 'threads1cpu' keeps the old
+ * behaviour (all threads on one CPU); mos_threads_multicore() tells which
+ * one is in force. See docs/threads.md.
  *
  *   static void work(void* arg) { ... }
  *
@@ -230,6 +234,58 @@ static inline void mos_thread_join(mos_thread_t* t) {
     t->id = 0;
 }
 
+/* ------------------------------------------- CPUs, affinity, priority */
+
+/* Number of online CPUs. */
+static inline unsigned mos_cpu_count(void) {
+    long n = mos_syscall(SYS_SYSINFO, SYS_SYSINFO_CORE_COUNT, 0, 0);
+    return n > 0 ? (unsigned)n : 1u;
+}
+
+/* Nonzero when threads of one program run on different CPUs (the default;
+ * 0 with the kernel boot flag 'threads1cpu', where affinity is refused). */
+static inline int mos_threads_multicore(void) {
+    return (mos_syscall(SYS_THREAD, SYS_THREAD_INFO, 0, 0) & SYS_THREAD_INFO_MULTICORE) != 0;
+}
+
+/* The CPU the calling thread is running on right now (0 .. count-1). It may
+ * differ a moment later unless the thread has an affinity of one CPU. */
+static inline unsigned mos_cpu_current(void) {
+    return (unsigned)mos_syscall(SYS_THREAD, SYS_THREAD_GET_CPU, 0, 0);
+}
+
+/* Restricts a thread of this program to the CPUs in `mask` (bit n = CPU n;
+ * 0 = any CPU). `t` NULL = the calling thread. It runs only on those CPUs
+ * from here on (the caller is off a disallowed CPU when this returns).
+ * Returns 0, or a negative SYS_ERR_* value: SYS_ERR_INVAL when the mask
+ * names no online CPU, SYS_ERR_PERM when threads are pinned ('threads1cpu'). */
+static inline long mos_thread_set_affinity(const mos_thread_t* t, uint64_t mask) {
+    return mos_syscall(SYS_THREAD, SYS_THREAD_SET_AFFINITY, t ? t->id : 0, (long)mask);
+}
+
+/* The CPU mask of a thread (all online CPUs while unrestricted), or a
+ * negative SYS_ERR_* value. */
+static inline long mos_thread_get_affinity(const mos_thread_t* t) {
+    return mos_syscall(SYS_THREAD, SYS_THREAD_GET_AFFINITY, t ? t->id : 0, 0);
+}
+
+/* Priority: MOS_PRIO_HIGH (default), MOS_PRIO_NORMAL, MOS_PRIO_LOW. A lower
+ * priority thread only runs on its CPU while higher ones there wait (the
+ * scheduler's MLFQ levels: it never sits above its level). New threads
+ * inherit the creating thread's priority and affinity. Returns 0 or a
+ * negative SYS_ERR_* value. */
+#define MOS_PRIO_HIGH   SYS_THREAD_PRIO_HIGH
+#define MOS_PRIO_NORMAL SYS_THREAD_PRIO_NORMAL
+#define MOS_PRIO_LOW    SYS_THREAD_PRIO_LOW
+
+static inline long mos_thread_set_priority(const mos_thread_t* t, unsigned priority) {
+    return mos_syscall(SYS_THREAD, SYS_THREAD_SET_PRIORITY, t ? t->id : 0, (long)priority);
+}
+
+static inline long mos_thread_get_priority(const mos_thread_t* t) {
+    return mos_syscall(SYS_THREAD, SYS_THREAD_GET_PRIORITY, t ? t->id : 0, 0);
+}
+
 /* Gives the CPU to the program's other threads (and everyone else). */
 static inline void mos_thread_yield(void) { mos_sleep(1); }
 
@@ -244,9 +300,10 @@ static inline int mos_mutex_trylock(mos_mutex_t* m) {
 }
 
 static inline void mos_mutex_lock(mos_mutex_t* m) {
-    /* The holder runs on this same CPU: spinning only delays it. */
+    /* The holder may run on another CPU (spin a little) or have been
+     * preempted on this one (then sleeping lets it finish). */
     for (int tries = 0; !mos_mutex_trylock(m); tries++) {
-        if (tries < 4) __asm__ volatile("pause");
+        if (tries < 2000) __asm__ volatile("pause");
         else mos_sleep(1);
     }
 }
