@@ -666,10 +666,13 @@ static void watchdog(void* arg) {
     for (;;) {
         mos_sleep(100);
         if (g_finished) return;
+        /* The main thread may start a new stage on another CPU between the
+         * two reads: read the start first and never let the difference wrap. */
+        uint64_t start = g_stage_start_ms;
         uint64_t now = (uint64_t)mos_uptime();
-        if (now - g_stage_start_ms > STAGE_LIMIT_MS) {
+        if (now > start && now - start > STAGE_LIMIT_MS) {
             emit_fd(1, "OS0TEST FAIL watchdog: stuck for %lu ms in stage '%s'",
-                    (unsigned long)(now - g_stage_start_ms), g_stage);
+                    (unsigned long)(now - start), g_stage);
             emit_fd(1, "OS0TEST FAIL");
             mos_log("OS0TEST FAIL");
             mos_exit(1);
