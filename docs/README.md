@@ -22,7 +22,7 @@ truth; these pages describe them as of SDK v1.1 and the kernel's
 | [Graphics](graphics.md) | `graphics.h`, `x86_64/user_graphics.h` | Full-screen framebuffer: acquire, blit, present, primitives |
 | [Input](input.md) | `x86_64/user_syscalls.h`, `user_mouse.h`, `user_usb.h` | Raw keyboard and mouse events for full-screen programs |
 | [Networking](network.md) | `net.h` | DNS, TCP client and server, UDP, the ktls transport |
-| [System information](sysinfo.md) | `user_sysinfo.h` | CPU, RAM, heap, cores, uptime, processes |
+| [System information](sysinfo.md) | `user_sysinfo.h` | CPU usage and features (AVX), RAM, heap, cores, uptime, processes |
 | [Packages](packages.md) | `minimalos.h` | `.mpkg` archives: unzip, zip, inspect |
 | [Device managers](managers.md) | `x86_64/user_managers.h` | GPU, audio, storage and USB manager calls |
 | [Text in your own pixels](font.md) | `font.h` | `draw_text` / `text_width`: smooth Inter text (bitmap fallback) in any pixel buffer |

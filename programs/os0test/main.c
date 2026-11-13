@@ -7,7 +7,11 @@
  * Covers SYS_CLOCK, SYS_THREAD (FS base / TLS, exit futex), SYS_FUTEX,
  * SYS_STAT, SYS_RENAME, SYS_CHDIR/SYS_GETCWD, the environment (envp ->
  * environ), SYS_SPAWN and SYS_WAIT, and SYS_VM / the user address-space
- * layout (vm.h): mappings, protection, guard pages, NX, stack sizes.
+ * layout (vm.h): mappings, protection, guard pages, NX, stack sizes, and
+ * SIMD: the CPU feature report (SYS_SYSINFO) and a torture test that keeps
+ * xmm/ymm/x87/MXCSR state intact across context switches, syscalls and page
+ * faults (the AVX half runs only when the kernel reports AVX usable;
+ * otherwise an AVX instruction must die with #UD).
  *
  * Output: one line per check,
  *
@@ -614,6 +618,9 @@ static int child_vm(const char* mode, long arg) {
     return 99;
 }
 
+static int child_torture(int wide, long ms);
+static int child_avx_probe(int wide512);
+
 /* os0test.run --child <mode> [arg] */
 static int child_main(int argc, char** argv, char** envp) {
     const char* mode = argc > 2 ? argv[2] : "";
@@ -626,6 +633,9 @@ static int child_main(int argc, char** argv, char** envp) {
     if (streq(mode, "tls_hw")) return child_tls_hw();
     if (streq(mode, "tsc")) return child_tsc();
     if (sstarts(mode, "vm_")) return child_vm(mode, arg);
+    if (sstarts(mode, "torture_")) return child_torture(streq(mode, "torture_avx"), arg);
+    if (streq(mode, "avx_probe")) return child_avx_probe(0);
+    if (streq(mode, "avx512_probe")) return child_avx_probe(1);
     if (streq(mode, "streams")) {
         emit_fd(1, "out1");
         emit_fd(2, "err1");
@@ -2475,6 +2485,230 @@ static void test_vm(void) {
     test_vm_stacks();
 }
 
+/* ================================================================== SIMD
+ * Register state across context switches. Each worker loads a pattern of its
+ * own into the vector registers (and x87 / MXCSR), lets the kernel do things
+ * to it (a sleep that switches to another thread, a page fault on a fresh
+ * SYS_VM page, a plain syscall) and stores everything back for comparison.
+ * The load, the disturbance and the store are one assembly routine: C code
+ * in between would use xmm registers itself. The AVX routine is assembly
+ * too, so the rest of the program stays SSE-only. */
+
+#define SIMD_BUF 640     /* [0,512) vector regs, [512,576) 8 doubles, 576 mxcsr, 580 fcw */
+
+/* torture_*(in, out, page, mode): mode bit0 = sleep 1 tick (switches), bit1 =
+ * write to `page` (page fault when it is fresh), bit2 = three getpid calls. */
+extern void torture_avx(const uint8_t* in, uint8_t* out, uint8_t* page, uint64_t mode);
+extern void torture_sse(const uint8_t* in, uint8_t* out, uint8_t* page, uint64_t mode);
+
+#define TORTURE_BODY(LOAD, STORE) \
+    "mov r8, rdi\n" "mov r9, rsi\n" "mov r10, rdx\n" "mov r11, rcx\n" \
+    "fldcw word ptr [r8+580]\n" "ldmxcsr dword ptr [r8+576]\n" \
+    ".irp i,0,1,2,3,4,5,6,7\n" "fld qword ptr [r8+512+8*\\i]\n" ".endr\n" \
+    LOAD \
+    "test r11, 1\n" "jz 1f\n" "mov eax, 5\n" "mov edi, 1\n" "int 0x80\n" "1:\n" \
+    "test r11, 2\n" "jz 2f\n" "mov byte ptr [r10], 0x5a\n" "mov al, byte ptr [r10+64]\n" "2:\n" \
+    "test r11, 4\n" "jz 3f\n" "mov eax, 3\n" "int 0x80\n" "mov eax, 3\n" "int 0x80\n" \
+    "mov eax, 3\n" "int 0x80\n" "3:\n" \
+    STORE \
+    ".irp i,7,6,5,4,3,2,1,0\n" "fstp qword ptr [r9+512+8*\\i]\n" ".endr\n" \
+    "stmxcsr dword ptr [r9+576]\n" "fnstcw word ptr [r9+580]\n" \
+    "sub rsp, 8\n" "mov dword ptr [rsp], 0x1f80\n" "ldmxcsr dword ptr [rsp]\n" \
+    "mov word ptr [rsp], 0x37f\n" "fldcw word ptr [rsp]\n" "add rsp, 8\n" "ret\n"
+
+__asm__(".pushsection .text\n.intel_syntax noprefix\n"
+        ".globl torture_avx\n.type torture_avx,@function\ntorture_avx:\n"
+        TORTURE_BODY(".irp i,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15\n" "vmovdqu ymm\\i, ymmword ptr [r8+32*\\i]\n" ".endr\n",
+                     ".irp i,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15\n" "vmovdqu ymmword ptr [r9+32*\\i], ymm\\i\n" ".endr\n")
+        ".size torture_avx,.-torture_avx\n"
+        ".globl torture_sse\n.type torture_sse,@function\ntorture_sse:\n"
+        TORTURE_BODY(".irp i,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15\n" "movdqu xmm\\i, xmmword ptr [r8+16*\\i]\n" ".endr\n",
+                     ".irp i,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15\n" "movdqu xmmword ptr [r9+16*\\i], xmm\\i\n" ".endr\n")
+        ".size torture_sse,.-torture_sse\n"
+        ".att_syntax prefix\n.popsection\n");
+
+typedef struct {
+    int id;                      /* distinct per worker: seeds the patterns */
+    int wide;                    /* 1: ymm0-15 (AVX), 0: xmm0-15 */
+    uint64_t end_ms;
+    unsigned long rounds, errors;
+    char first_error[160];
+} torture_t;
+
+static void torture_fill(uint8_t* in, int id, unsigned long round, int wide) {
+    unsigned n = wide ? 512 : 256;
+    for (unsigned i = 0; i < n; i++)
+        in[i] = (uint8_t)(id * 37 + i * 11 + (i >> 4) * 29 + (unsigned)round * 5 + 1);
+    double v[8];
+    for (int k = 0; k < 8; k++) v[k] = (double)(id * 1000 + (long)(round % 997) + k) + 0.25 * k;
+    memcpy(in + 512, v, sizeof(v));
+    uint32_t mxcsr = 0x1F80u | (uint32_t)((id + round) & 3) << 13 | ((id & 1) ? 0x8000u : 0);
+    uint16_t fcw = (uint16_t)((0x037F & ~0xF00) | ((id + round) % 3 == 0 ? 0x000 : (id + round) % 3 == 1 ? 0x200 : 0x300)
+                              | (((id + round) & 3) << 10));
+    memcpy(in + 576, &mxcsr, 4);
+    memcpy(in + 580, &fcw, 2);
+}
+
+static void torture_one(torture_t* t, unsigned long round, uint8_t* in, uint8_t* out, uint8_t* scratch) {
+    torture_fill(in, t->id, round, t->wide);
+    memset(out, 0, SIMD_BUF);
+    unsigned mode = (unsigned)(round % 8);
+    uint8_t* page = scratch;
+    if (mode & 2) {
+        page = (uint8_t*)mos_vm_map(NULL, VM_PAGE, VM_RW, 0);    /* fresh: the first write faults */
+        if (!page) page = scratch;
+    }
+    if (t->wide) torture_avx(in, out, page, mode);
+    else torture_sse(in, out, page, mode);
+    if (page != scratch) mos_vm_unmap(page, VM_PAGE);
+    unsigned n = t->wide ? 512 : 256;
+    for (unsigned i = 0; i < n + 70; i++) {
+        unsigned off = i < n ? i : 512 + (i - n);
+        if (in[off] == out[off]) continue;
+        t->errors++;
+        if (!t->first_error[0])
+            kfmt(t->first_error, sizeof(t->first_error), "worker %d round %lu mode %u: %s byte %u got %x want %x",
+                 t->id, round, mode, off < 512 ? (t->wide ? "ymm" : "xmm") : "x87/mxcsr/fcw",
+                 off, out[off], in[off]);
+        break;
+    }
+}
+
+static void torture_loop(torture_t* t) {
+    static uint8_t scratch_pages[4][VM_PAGE];
+    uint8_t in[SIMD_BUF] __attribute__((aligned(32)));
+    uint8_t out[SIMD_BUF] __attribute__((aligned(32)));
+    uint8_t* scratch = scratch_pages[t->id & 3];
+    unsigned long round = 0;
+    while ((uint64_t)mos_uptime() < t->end_ms) torture_one(t, round++, in, out, scratch);
+    t->rounds = round;
+}
+
+static void torture_thread(void* arg) { torture_loop((torture_t*)arg); }
+
+#define TORTURE_THREADS 3
+#define TORTURE_MS      3000
+
+/* os0test.run --child torture_avx|torture_sse <ms>: one more process doing the same. */
+static int child_torture(int wide, long ms) {
+    torture_t t;
+    memset(&t, 0, sizeof(t));
+    t.id = 9;
+    t.wide = wide;
+    t.end_ms = (uint64_t)mos_uptime() + (uint64_t)ms;
+    torture_loop(&t);
+    emit_fd(1, "torture child: %lu rounds, %lu errors %s", t.rounds, t.errors, t.first_error);
+    return t.errors ? 1 : (t.rounds ? 0 : 2);
+}
+
+static void run_torture(int wide, const char* name) {
+    char nm[96];
+    torture_t main_t, th[TORTURE_THREADS];
+    mos_thread_t ts[TORTURE_THREADS];
+    uint64_t end = (uint64_t)mos_uptime() + TORTURE_MS;
+    memset(&main_t, 0, sizeof(main_t));
+    main_t.id = 0; main_t.wide = wide; main_t.end_ms = end;
+    int started = 0;
+    for (int i = 0; i < TORTURE_THREADS; i++) {
+        memset(&th[i], 0, sizeof(th[i]));
+        th[i].id = i + 1; th[i].wide = wide; th[i].end_ms = end;
+        if (mos_thread_create_vm(&ts[i], torture_thread, &th[i], 64 * 1024, NULL) == 0) started++;
+        else ts[i].id = 0;
+    }
+    char ms[16];
+    kfmt(ms, sizeof(ms), "%d", TORTURE_MS);
+    mos_wait_result_t r;
+    memset(&r, 0, sizeof(r));
+    long pid = spawn_child(wide ? "torture_avx" : "torture_sse", ms, TMP "/torture.txt", NULL, NULL, NULL);
+    torture_loop(&main_t);
+    for (int i = 0; i < TORTURE_THREADS; i++) if (ts[i].id) mos_thread_join(&ts[i]);
+    long w = pid > 0 ? mos_waitpid(pid, 0, &r) : -1;
+    static char out[256];
+    read_text(TMP "/torture.txt", out, sizeof(out));
+
+    kfmt(nm, sizeof(nm), "%s_torture_threads_started", name);
+    EXPECT(started == TORTURE_THREADS, nm, "started %d of %d", started, TORTURE_THREADS);
+    kfmt(nm, sizeof(nm), "%s_torture_main_thread_state_intact", name);
+    EXPECT(main_t.errors == 0 && main_t.rounds > 0, nm, "%lu rounds, %lu errors: %s", main_t.rounds, main_t.errors, main_t.first_error);
+    unsigned long errs = 0, rounds = 0;
+    const char* first = "";
+    for (int i = 0; i < TORTURE_THREADS; i++) {
+        errs += th[i].errors; rounds += th[i].rounds;
+        if (th[i].errors && !first[0]) first = th[i].first_error;
+    }
+    kfmt(nm, sizeof(nm), "%s_torture_worker_threads_state_intact", name);
+    EXPECT(errs == 0 && rounds > 0, nm, "%lu rounds, %lu errors: %s", rounds, errs, first);
+    kfmt(nm, sizeof(nm), "%s_torture_other_process_state_intact", name);
+    EXPECT(pid > 0 && w == pid && !r.crashed && r.exit_code == 0, nm,
+           "pid=%ld wait=%ld crashed=%d vector=%u exit=%d: %s", pid, w, r.crashed, r.crash_vector, r.exit_code, out);
+    emit_fd(1, "OS0TEST info %s torture: main %lu rounds, threads %lu rounds", name, main_t.rounds, rounds);
+}
+
+/* A child that runs one VEX (or EVEX) instruction and exits 0 if it is allowed. */
+static int child_avx_probe(int wide512) {
+    if (wide512) __asm__ volatile(".intel_syntax noprefix\nvpxord zmm0, zmm0, zmm0\n.att_syntax prefix" ::: "memory");
+    else         __asm__ volatile(".intel_syntax noprefix\nvpxor ymm0, ymm0, ymm0\n.att_syntax prefix" ::: "memory");
+    __asm__ volatile("vzeroupper" ::: "memory");
+    emit_fd(1, "avx probe: instruction ran");
+    return 0;
+}
+
+static void cpuid_leaf(uint32_t leaf, uint32_t sub, uint32_t* a, uint32_t* b, uint32_t* c, uint32_t* d) {
+    __asm__ volatile("cpuid" : "=a"(*a), "=b"(*b), "=c"(*c), "=d"(*d) : "a"(leaf), "c"(sub));
+}
+
+static void test_simd(void) {
+    stage("simd");
+    uint64_t f = mos_sysinfo_cpu_features();
+    uint64_t xcr0 = mos_sysinfo_xcr0();
+    EXPECT(f != SYS_ERR_INVAL && xcr0 != SYS_ERR_INVAL, "simd_sysinfo_cpu_queries_accepted", "features=0x%llx xcr0=0x%llx",
+           (unsigned long long)f, (unsigned long long)xcr0);
+    int avx = mos_cpu_has(SYS_CPU_AVX);
+    emit_fd(1, "OS0TEST info cpu features=0x%llx xcr0=0x%llx avx=%d avx2=%d avx512f=%d", (unsigned long long)f,
+            (unsigned long long)xcr0, avx, mos_cpu_has(SYS_CPU_AVX2), mos_cpu_has(SYS_CPU_AVX512F));
+
+    EXPECT(avx == ((xcr0 & 6) == 6), "simd_avx_bit_matches_enabled_xcr0", "avx=%d xcr0=0x%llx", avx, (unsigned long long)xcr0);
+    EXPECT(!mos_cpu_has(SYS_CPU_AVX2) || avx, "simd_avx2_implies_avx", "features 0x%llx", (unsigned long long)f);
+    EXPECT(!mos_cpu_has(SYS_CPU_FMA | SYS_CPU_F16C) || avx, "simd_fma_f16c_imply_avx", "features 0x%llx", (unsigned long long)f);
+    EXPECT(!mos_cpu_has(SYS_CPU_AVX512F) || (avx && (xcr0 & 0xE0) == 0xE0), "simd_avx512_needs_its_state", "features 0x%llx xcr0 0x%llx",
+           (unsigned long long)f, (unsigned long long)xcr0);
+    EXPECT(mos_cpu_has(0), "simd_cpu_has_empty_mask_is_true", "returned 0");
+
+    uint32_t a, b, c, d;
+    cpuid_leaf(1, 0, &a, &b, &c, &d);
+    int osxsave = (c >> 27) & 1;
+    EXPECT(osxsave == (xcr0 != 0), "simd_osxsave_cpuid_bit_matches_xcr0", "cpuid OSXSAVE=%d xcr0=0x%llx", osxsave, (unsigned long long)xcr0);
+    EXPECT(((c >> 0) & 1) == (mos_cpu_has(SYS_CPU_SSE3) ? 1u : 0u), "simd_sse3_bit_matches_cpuid", "cpuid %u", (c >> 0) & 1);
+    EXPECT(((c >> 23) & 1) == (mos_cpu_has(SYS_CPU_POPCNT) ? 1u : 0u), "simd_popcnt_bit_matches_cpuid", "cpuid %u", (c >> 23) & 1);
+    if (osxsave) {
+        uint32_t lo, hi;
+        __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+        EXPECT((((uint64_t)hi << 32) | lo) == xcr0, "simd_xgetbv_matches_sysinfo_xcr0", "xgetbv 0x%x%08x sysinfo 0x%llx", hi, lo, (unsigned long long)xcr0);
+    }
+
+    /* The SSE path always: xmm0-15, x87, MXCSR. */
+    run_torture(0, "sse");
+
+    mos_wait_result_t r;
+    long pid = spawn_wait("avx_probe", NULL, NULL, NULL, NULL, NULL, &r);
+    if (avx) {
+        EXPECT(pid > 0 && !r.crashed && r.exit_code == 0, "simd_avx_instruction_runs_when_reported",
+               "pid=%ld crashed=%d vector=%u exit=%d", pid, r.crashed, r.crash_vector, r.exit_code);
+        run_torture(1, "avx");
+    } else {
+        EXPECT(pid > 0 && r.crashed && r.crash_vector == 6, "simd_avx_instruction_faults_ud_when_not_reported",
+               "pid=%ld crashed=%d vector=%u exit=%d", pid, r.crashed, r.crash_vector, r.exit_code);
+        emit_fd(1, "OS0TEST info AVX not usable here (CPU without AVX, or booted with noavx): YMM torture skipped");
+    }
+    pid = spawn_wait("avx512_probe", NULL, NULL, NULL, NULL, NULL, &r);
+    if (mos_cpu_has(SYS_CPU_AVX512F))
+        EXPECT(pid > 0 && !r.crashed && r.exit_code == 0, "simd_avx512_instruction_runs_when_reported",
+               "pid=%ld crashed=%d vector=%u exit=%d", pid, r.crashed, r.crash_vector, r.exit_code);
+    else
+        EXPECT(pid > 0 && r.crashed && r.crash_vector == 6, "simd_avx512_instruction_faults_ud_when_not_reported",
+               "pid=%ld crashed=%d vector=%u exit=%d", pid, r.crashed, r.crash_vector, r.exit_code);
+}
+
 /* ================================================================== main */
 
 int main(int argc, char** argv, char** envp) {
@@ -2523,6 +2757,7 @@ int main(int argc, char** argv, char** envp) {
     test_spawn_failure_cleanup();
     test_exec_relative();
     test_vm();
+    test_simd();
 
     stage("cleanup");
     mos_chdir(g_start_cwd[0] ? g_start_cwd : "0:/");
