@@ -2111,6 +2111,54 @@ static void test_bad_pointers_2(void) {
             EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0), 0, "gpu_write_surface_from_heap");
             g.data = g_pb_ro;
             EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0), 0, "gpu_write_surface_from_readonly_vm");
+            /* present flags: bad combinations are refused before anything else
+               (this program is not the screen owner, so a good one is PERM) */
+            g.op = SYS_GPU_PRESENT; g.out = NULL; g.window_id = 0; g.x = g.y = 0;
+            g.flags = 1u << 4;
+            EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0), ERR(SYS_ERR_INVAL), "gpu_present_unknown_flag");
+            g.flags = FGPU_PRESENT_SCALE2 | FGPU_PRESENT_SCALE3;
+            EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0), ERR(SYS_ERR_INVAL), "gpu_present_scale2_and_3");
+            g.flags = FGPU_PRESENT_SCALE2 | FGPU_PRESENT_FLIP;
+            EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0), ERR(SYS_ERR_INVAL), "gpu_present_scale_and_flip");
+            g.flags = FGPU_PRESENT_SCALE3; g.window_id = 1;
+            EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0), ERR(SYS_ERR_INVAL), "gpu_present_scale_into_window");
+            g.window_id = 0; g.flags = FGPU_PRESENT_SCALE2 | FGPU_PRESENT_PACED;
+            for (int i = 0; i < 5; i++) {
+                g.out = g_bad_out[i];
+                char nm[96]; kfmt(nm, sizeof(nm), "gpu_present_bad_timestamp_%s", g_tag_out[i]);
+                EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0), ERR(SYS_ERR_INVAL), nm);
+            }
+            g.out = NULL;
+            EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0), ERR(SYS_ERR_PERM), "gpu_present_scaled_not_screen_owner");
+
+            /* pacing: six paced presents 20 ms apart take about 100 ms. The
+               window does not exist, so nothing is drawn; the wait comes
+               first, which is what is measured. */
+            syscall_gpu_request_t pc;
+            memset(&pc, 0, sizeof(pc));
+            pc.size = sizeof(pc); pc.version = SYS_GPU_ABI_VERSION; pc.op = SYS_GPU_SET_PACE;
+            pc.bytes = 100;
+            EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&pc, 0, 0), ERR(SYS_ERR_INVAL), "gpu_set_pace_too_short");
+            pc.bytes = 10ull * 1000000000ull;
+            EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&pc, 0, 0), ERR(SYS_ERR_INVAL), "gpu_set_pace_too_long");
+            pc.bytes = 20000000ull;
+            EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&pc, 0, 0), 0, "gpu_set_pace_20ms");
+            g.flags = FGPU_PRESENT_PACED; g.window_id = 0x7ffffff0u;
+            uint64_t stamp[6];
+            for (int i = 0; i < 6; i++) {
+                uint64_t st = 0;
+                g.out = &st;
+                mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0);
+                stamp[i] = mos_clock_monotonic_ns();
+            }
+            uint64_t span = stamp[5] - stamp[0];
+            if (span >= 90000000ull && span <= 250000000ull) check_pass("gpu_present_paced_interval");
+            else check_fail("gpu_present_paced_interval", "5 intervals took %ld us, expected about 100000 (90000..250000)",
+                            (long)(span / 1000));
+            pc.bytes = 0;      /* back to 60 Hz */
+            EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&pc, 0, 0), 0, "gpu_set_pace_default");
+            g.window_id = 0; g.out = NULL; g.flags = 0;
+
             g.op = SYS_GPU_DESTROY_SURFACE;
             EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0), 0, "gpu_destroy_surface");
         } else {

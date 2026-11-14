@@ -202,7 +202,29 @@ See [fgsl.md](fgsl.md#attributes).
 | `fglDrawIndexed(gl, vertices, indices, first_index, count)` | Triangles from an index buffer. |
 | `fglSubmit(gl)` | Run the recorded commands. |
 | `fglPresent(gl)` | Submit and show the frame. Returns 0, or -1 with `gl->error` set. |
+| `fglPresentScaled(gl, scale)` | Upscale every later `fglPresent` by 1, 2 or 3 (nearest neighbour; screen only). See [Scaled and paced present](#scaled-and-paced-present). |
+| `fglSwapInterval(gl, n)` | `0` = present at once, `n` = wait for the next boundary of n/60 s before each present (`1` = 60 fps). |
+| `fglSwapIntervalNs(gl, ns)` | The same with the interval in nanoseconds (1 ms to 1 s). |
+| `fglLastPresentNs(gl)` | Monotonic time (ns) the last paced present was released. |
+| `fglSetPresentFlags(gl, flags)` | Raw `FGPU_PRESENT_*` flags for `fglPresent`. |
 | `fglReadPixels(gl, out, pitch)` | Copy the frame into your memory. |
+
+### Scaled and paced present
+
+A full-screen game can render at a lower internal size and let the kernel
+upscale: create the context at 960x540 (`desc.width/height`), call
+`fglPresentScaled(gl, 2)` and every `fglPresent` fills a 1920x1080 screen
+(3 gives 2880x1620, clipped to the screen; `desc.x/y` place the scaled
+image, negative values clip). The surface goes straight into the framebuffer
+with non-temporal SSE2 stores, one copy and no kernel back buffer; page
+flipping is not used for scaled frames. `fglSwapInterval(gl, 1)` makes each
+present wait for the next 1/60 s boundary (the process sleeps; it does not
+spin), so a loop that renders in less than 16.7 ms runs at a steady 60 fps.
+A frame that is late by under one interval presents at once and keeps the
+phase; later than that restarts the phase. `fglLastPresentNs` reports when
+the frame was released. Both options need `FGPU_CAP_SCALED_PRESENT` and
+`FGPU_CAP_PACED_PRESENT` in `syscall_gpu_info_t.caps`; older kernels reject
+the flags and `fglPresent` returns -1.
 
 Calls only *record*; nothing is drawn until `fglSubmit`/`fglPresent`. State
 changes between draws apply to the draws after them, in order, so you can

@@ -287,6 +287,9 @@ typedef struct {
     uint32_t texture_flags[FGPU_MAX_TEXTURE_UNITS];
     int textures_dirty;
     char shader_log[192];               // why the last fglCreateShader failed
+    // present options (ABI 2 + OS-5)
+    uint32_t present_flags;             // FGPU_PRESENT_SCALE2/3, FGPU_PRESENT_PACED
+    uint64_t last_present_ns;           // monotonic time of the last paced present
 } FGLContext;
 
 /* ============================================================ syscalls */
@@ -822,7 +825,9 @@ static inline int fglSubmit(FGLContext* gl) {
     return 0;
 }
 
-// Submits and shows the frame (in the window, or on the screen).
+// Submits and shows the frame (in the window, or on the screen). With
+// fglPresentScaled the frame is upscaled; with fglSwapInterval it waits for
+// the next frame boundary first.
 static inline int fglPresent(FGLContext* gl) {
     if (fglSubmit(gl) != 0) return -1;
     syscall_gpu_request_t r;
@@ -832,15 +837,65 @@ static inline int fglPresent(FGLContext* gl) {
     r.window_id = gl->desc.window_id;
     r.x = gl->desc.x;
     r.y = gl->desc.y;
-    if (gl->desc.page_flip) r.flags = FGPU_PRESENT_FLIP;
+    r.flags = gl->present_flags;
+    // A scaled present copies; flipping needs a screen-sized surface.
+    int flip = gl->desc.page_flip && !(gl->present_flags & (FGPU_PRESENT_SCALE2 | FGPU_PRESENT_SCALE3));
+    if (flip) r.flags |= FGPU_PRESENT_FLIP;
+    uint64_t stamp = 0;
+    if (gl->present_flags & FGPU_PRESENT_PACED) r.out = &stamp;
     uint64_t res = fgl__call(&r);
-    if (gl->desc.page_flip) {          // draw the next frame into the other buffer
+    if (res == SYS_SUCCESS && stamp) gl->last_present_ns = stamp;
+    if (flip) {                        // draw the next frame into the other buffer
         gl->back ^= 1;
         gl->cmd_len = 0;
         fgl__bind(gl);
     }
     return res == SYS_SUCCESS ? 0 : -1;
 }
+
+// Upscales every following fglPresent by `scale` (1, 2 or 3; nearest
+// neighbour), so a game can render at 960x540 and fill a 1920x1080 screen.
+// The scaled image sits at desc.x/desc.y and is clipped to the screen. Screen
+// only (not for windows); the kernel's fast path writes the framebuffer
+// directly. Returns -1 if scale is not 1-3 or this is a window context; on a
+// kernel without FGPU_CAP_SCALED_PRESENT (see fglGetDeviceInfo) fglPresent
+// then fails.
+static inline int fglPresentScaled(FGLContext* gl, uint32_t scale) {
+    if (scale < 1 || scale > 3 || gl->desc.window_id) return -1;
+    gl->present_flags &= ~(uint32_t)(FGPU_PRESENT_SCALE2 | FGPU_PRESENT_SCALE3);
+    if (scale == 2) gl->present_flags |= FGPU_PRESENT_SCALE2;
+    if (scale == 3) gl->present_flags |= FGPU_PRESENT_SCALE3;
+    return 0;
+}
+
+// Sets the raw FGPU_PRESENT_* flags used by fglPresent (FLIP is added by
+// the context when page_flip is on and no scaling is requested).
+static inline void fglSetPresentFlags(FGLContext* gl, uint32_t flags) {
+    gl->present_flags = flags & ~(uint32_t)FGPU_PRESENT_FLIP;
+}
+
+// Frame pacing: 0 = present at once; n >= 1 = each present waits for the
+// next boundary of an interval of n/60 s (1 = 60 fps, 2 = 30 fps). The wait
+// sleeps in the kernel. fglSwapIntervalNs takes the interval directly
+// (1 ms to 1 s; for example 8333333 for 120 Hz). The interval is shared by
+// the whole screen. Returns -1 if the kernel refuses it.
+static inline int fglSwapIntervalNs(FGLContext* gl, uint64_t interval_ns) {
+    if (interval_ns == 0) { gl->present_flags &= ~(uint32_t)FGPU_PRESENT_PACED; return 0; }
+    syscall_gpu_request_t r;
+    memset(&r, 0, sizeof(r));
+    r.op = SYS_GPU_SET_PACE;
+    r.bytes = interval_ns;
+    if (fgl__call(&r) != SYS_SUCCESS) return -1;
+    gl->present_flags |= FGPU_PRESENT_PACED;
+    return 0;
+}
+static inline int fglSwapInterval(FGLContext* gl, uint32_t n) {
+    return fglSwapIntervalNs(gl, n ? (uint64_t)n * 16666667ull : 0);
+}
+
+// Monotonic time (ns since boot) the last paced present was released, 0 if
+// none yet. Differences between calls measure the frame time.
+static inline uint64_t fglLastPresentNs(const FGLContext* gl) { return gl->last_present_ns; }
 
 // Copies the last frame into memory (pitch = bytes per row).
 static inline int fglReadPixels(FGLContext* gl, uint32_t* out, uint32_t pitch) {
