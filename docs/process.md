@@ -1,8 +1,10 @@
 # Process and terminal
 
 Terminal output, ending the program, time, sleeping, process IDs,
-launching other programs and the Ctrl+C cleanup hook. Include
-`minimalos.h`.
+launching other programs, clocks, the working directory, `stat` and
+`rename`, and the Ctrl+C cleanup hook. Include `minimalos.h`. Starting a
+program and waiting for it with arguments, environment and redirected
+output is in [Spawning and waiting](spawn.md) (`process.h`).
 
 ## `mos_write`
 
@@ -328,8 +330,9 @@ for (long i = 0; i < n; i++)
 long mos_getcwd(char* path, size_t path_size);
 ```
 
-Copies the terminal's current directory, which relative paths are resolved
-against.
+Copies the program's working directory, which relative paths are resolved
+against. It is the terminal's current directory until the program calls
+[`mos_chdir`](#mos_chdir); programs started by this one inherit it.
 
 | Parameter | Description |
 | --- | --- |
@@ -344,6 +347,128 @@ small.
 ```c
 char cwd[256];
 if (mos_getcwd(cwd, sizeof cwd) == 0) printf("in %s\n", cwd);
+```
+
+## `mos_chdir`
+
+```c
+long mos_chdir(const char* path);
+```
+
+Sets the program's working directory, which relative paths are resolved
+against. The setting belongs to the program and is shared by all its
+threads; it does not change the terminal's directory. Programs started
+with [`mos_spawn`](spawn.md#mos_spawn) or `mos_exec` inherit it.
+
+| Parameter | Description |
+| --- | --- |
+| `path` | A directory: `0:/dir`, `/dir` (the working directory's drive), or relative. `.` and `..` are allowed; `..` at the root stays at the root |
+
+**Returns** `SYS_SUCCESS`, `SYS_ERR_NOTFOUND` if `path` is not an existing
+directory, `SYS_ERR_INVAL` for a NULL, invalid or over-long path.
+
+**Notes**
+
+- [`mos_getcwd`](#mos_getcwd) then returns the normalized form:
+  `0:/dir/sub`, no trailing slash except for a drive root (`0:/`).
+
+**Example**
+
+```c
+mos_chdir("0:/data");
+mos_create("notes.txt", "text", "txt");     /* 0:/data/notes.txt */
+```
+
+## `mos_stat`
+
+```c
+long mos_stat(const char* path, syscall_stat_t* out);
+```
+
+Size, type and times of a file or directory, without opening it.
+
+| Parameter | Description |
+| --- | --- |
+| `path` | File or directory |
+| `out` | Filled in on success |
+
+`syscall_stat_t`:
+
+| Field | Meaning |
+| --- | --- |
+| `size` | Data bytes; 0 for a directory |
+| `type` | `SYS_STAT_FILE` or `SYS_STAT_DIR` |
+| `flags` | `SYS_STAT_HIDDEN`, `SYS_STAT_RUNNABLE` (bit mask) |
+| `created`, `modified` | Seconds since 1970-01-01. MinimaFS keeps only the day. 0 when unknown, and always 0 for a directory |
+
+**Returns** `SYS_SUCCESS`, `SYS_ERR_NOTFOUND` when nothing is at `path`,
+`SYS_ERR_INVAL` for a NULL argument or an invalid path.
+
+**Example**
+
+```c
+syscall_stat_t st;
+if (mos_stat("0:/etc/motd.txt", &st) == 0 && st.type == SYS_STAT_FILE)
+    printf("%lu bytes\n", (unsigned long)st.size);
+```
+
+## `mos_rename`
+
+```c
+long mos_rename(const char* from, const char* to);
+```
+
+Renames or moves a file or directory on one drive, also into another
+directory.
+
+| Parameter | Description |
+| --- | --- |
+| `from` | Existing file or directory |
+| `to` | New path. Its directory must exist |
+
+**Returns** `SYS_SUCCESS`; `SYS_ERR_NOTFOUND` when `from` does not exist;
+`SYS_ERR_INVAL` for a NULL or invalid path; `SYS_ERR_GENERIC` for any
+other refusal.
+
+**Notes**
+
+- A file already at `to` is replaced. A directory at `to` is an error
+  (`SYS_ERR_GENERIC`), whatever `from` is; so is moving a directory into
+  itself or its own subtree, a missing target directory, a different drive,
+  and the drive root.
+- Renaming a path to itself succeeds and changes nothing.
+- Close files before renaming them: a handle opened earlier still writes
+  back to the old name.
+
+**Example**
+
+```c
+mos_rename("0:/data/new.tmp", "0:/data/state.bin");   /* replaces state.bin */
+```
+
+## Clocks
+
+```c
+uint64_t mos_clock_monotonic_ns(void);
+uint64_t mos_clock_realtime_ns(void);
+uint64_t mos_clock_tsc_hz(void);
+```
+
+| Function | Returns |
+| --- | --- |
+| `mos_clock_monotonic_ns` | Nanoseconds since boot. Never goes backwards. Read from the CPU's time-stamp counter when it has a usable one, else it has millisecond steps |
+| `mos_clock_realtime_ns` | Nanoseconds since 1970-01-01 UTC by the system clock (UTC when internet time sync is on). Millisecond steps; jumps when the clock is set, so use the monotonic clock for durations |
+| `mos_clock_tsc_hz` | Time-stamp counter ticks per second when `RDTSC` is a usable clock in a program (invariant TSC), else 0 |
+
+[`process.h`](spawn.md#clocks-and-files) adds `mos_monotonic_ms()` and
+`mos_time_unix()`.
+
+**Example**
+
+```c
+uint64_t t0 = mos_clock_monotonic_ns();
+do_work();
+printf("took %lu us\n", (unsigned long)((mos_clock_monotonic_ns() - t0) / 1000));
 ```
 
 ## `mos_syscall`
@@ -362,6 +487,16 @@ wrapper yet.
 | `a1`, `a2`, `a3` | Arguments for `rdi`, `rsi`, `rdx`; pass 0 for unused ones |
 
 **Returns** the raw `rax` value.
+
+## `mos_syscall4`
+
+```c
+long mos_syscall4(long num, long a1, long a2, long a3, long a4);
+```
+
+[`mos_syscall`](#mos_syscall) with a fourth argument in `r10`. Only
+`SYS_FUTEX_WAIT` uses it (its timeout); [`mos_futex_wait`](threads.md#futexes)
+wraps that.
 
 ## `mos_syscall3`
 

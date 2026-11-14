@@ -63,6 +63,82 @@ static inline long mos_exec(const char* path, const char** argv, long argc) {
     return mos_syscall(SYS_EXEC, (long)(uintptr_t)path, (long)(uintptr_t)argv, argc);
 }
 
+// --- Clocks, stat, rename, working directory, spawn/wait (OS-0 calls) ---
+// process.h builds a friendlier API on these. All of them take a plain
+// path ("0:/dir/file", "/dir/file", or relative to the working directory)
+// and return SYS_SUCCESS (0) or a negative SYS_ERR_* value, except where
+// noted.
+
+// Nanoseconds since boot; never goes backwards.
+static inline uint64_t mos_clock_monotonic_ns(void) {
+    return (uint64_t)mos_syscall(SYS_CLOCK, SYS_CLOCK_MONOTONIC, 0, 0);
+}
+
+// Nanoseconds since 1970-01-01 UTC by the system clock (millisecond steps;
+// jumps when the clock is set).
+static inline uint64_t mos_clock_realtime_ns(void) {
+    return (uint64_t)mos_syscall(SYS_CLOCK, SYS_CLOCK_REALTIME, 0, 0);
+}
+
+// RDTSC ticks per second when the TSC is a usable clock in user code
+// (invariant TSC), else 0.
+static inline uint64_t mos_clock_tsc_hz(void) {
+    return (uint64_t)mos_syscall(SYS_CLOCK, SYS_CLOCK_TSC_HZ, 0, 0);
+}
+
+// Size, type and times of a file or directory. SYS_ERR_NOTFOUND when
+// nothing is at `path`.
+static inline long mos_stat(const char* path, syscall_stat_t* out) {
+    return mos_syscall(SYS_STAT, (long)(uintptr_t)path, (long)(uintptr_t)out, 0);
+}
+
+// Moves/renames a file or directory on one drive. Replaces an existing
+// file at `to`; a directory there is an error. SYS_ERR_NOTFOUND when
+// `from` does not exist, SYS_ERR_GENERIC for any other refusal.
+static inline long mos_rename(const char* from, const char* to) {
+    return mos_syscall(SYS_RENAME, (long)(uintptr_t)from, (long)(uintptr_t)to, 0);
+}
+
+// Sets the program's working directory (shared by its threads, inherited
+// by programs it starts). SYS_ERR_NOTFOUND if `path` is not a directory.
+static inline long mos_chdir(const char* path) {
+    return mos_syscall(SYS_CHDIR, (long)(uintptr_t)path, 0, 0);
+}
+
+// Starts a program as a child of the caller. `request->size` must be
+// sizeof(syscall_spawn_t) (process.h's mos_spawn_ex() fills it in).
+// Returns the child's pid (> 0) or a negative SYS_ERR_* value.
+static inline long mos_spawn_raw(const syscall_spawn_t* request) {
+    return mos_syscall(SYS_SPAWN, (long)(uintptr_t)request, 0, 0);
+}
+
+// Waits for a child (pid, or SYS_WAIT_ANY) to end; returns its pid.
+// `flags` is 0 or SYS_WAIT_NOHANG. `out` may be NULL.
+static inline long mos_wait_raw(long pid, long flags, syscall_wait_t* out) {
+    return mos_syscall(SYS_WAIT, pid, flags, (long)(uintptr_t)out);
+}
+
+// SYS_VM, the raw calls (vm.h has the friendlier layer). Each returns a
+// negative SYS_ERR_* value on failure.
+//   mos_vm_map_raw: the mapping's address (>= 2 TiB unless FIXED).
+//   the others:     SYS_SUCCESS.
+static inline long mos_vm_map_raw(const syscall_vm_map_t* request) {
+    return mos_syscall(SYS_VM, SYS_VM_MAP, (long)(uintptr_t)request, 0);
+}
+
+static inline long mos_vm_unmap_raw(void* address, size_t length) {
+    return mos_syscall(SYS_VM, SYS_VM_UNMAP, (long)(uintptr_t)address, (long)length);
+}
+
+static inline long mos_vm_protect_raw(void* address, size_t length, unsigned prot) {
+    return mos_syscall4(SYS_VM, SYS_VM_PROTECT, (long)(uintptr_t)address,
+                        (long)length, (long)prot);
+}
+
+static inline long mos_vm_decommit_raw(void* address, size_t length) {
+    return mos_syscall(SYS_VM, SYS_VM_DECOMMIT, (long)(uintptr_t)address, (long)length);
+}
+
 static inline long mos_mouse_call(uint64_t operation, uint64_t arg1,
                                   uint64_t arg2) {
     return mos_syscall(SYS_MOUSE, (long)operation, (long)arg1, (long)arg2);

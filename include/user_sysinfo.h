@@ -20,6 +20,17 @@ static inline uint64_t mos_sysinfo_heap_free(void)       { return mos_sysinfo(SY
 static inline uint64_t mos_sysinfo_pmm_used_pages(void)  { return mos_sysinfo(SYS_SYSINFO_PMM_USED_PAGES); }
 static inline uint64_t mos_sysinfo_pmm_free_pages(void)  { return mos_sysinfo(SYS_SYSINFO_PMM_FREE_PAGES); }
 
+/* CPU features (SYS_CPU_* in syscall.h). The AVX family is only reported when
+ * the OS enabled the state, so a set bit means the instructions are usable. */
+static inline uint64_t mos_sysinfo_cpu_features(void) { return mos_sysinfo(SYS_SYSINFO_CPU_FEATURES); }
+static inline uint64_t mos_sysinfo_xcr0(void)         { return mos_sysinfo(SYS_SYSINFO_XCR0); }
+
+/* 1 when every feature in `mask` (SYS_CPU_* bits or'ed together) is usable. */
+static inline int mos_cpu_has(uint64_t mask) {
+    uint64_t f = mos_sysinfo_cpu_features();
+    return f != SYS_ERR_INVAL && (f & mask) == mask;
+}
+
 static inline uint64_t mos_sysinfo_core_usage(uint32_t core_id) {
     return mos_sysinfo(SYS_SYSINFO_CORE_USAGE_BASE + core_id);
 }

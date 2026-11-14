@@ -132,6 +132,52 @@ uint64_t mos_sysinfo_process_count(void);
 **Returns** the number of processes. To list them use
 [`mos_pslist`](process.md#mos_pslist).
 
+## `mos_cpu_has`
+
+```c
+int mos_cpu_has(uint64_t mask);
+```
+
+**Returns** 1 when every `SYS_CPU_*` feature in `mask` is usable, else 0.
+The AVX-family bits (`SYS_CPU_AVX`, `SYS_CPU_AVX2`, `SYS_CPU_FMA`,
+`SYS_CPU_F16C`, `SYS_CPU_AVX512F` and the other AVX-512 bits) are set only
+when the kernel enabled the register state (`CR4.OSXSAVE` and `XCR0`), so
+"1" means the instructions will not fault. They are 0 on a CPU without
+XSAVE/AVX and when the kernel was booted with the `noavx` flag, even though
+CPUID would still list them. Always test before running VEX or EVEX code;
+without the bit the instruction raises #UD and ends the program.
+
+The other bits are CPUID reports: `SYS_CPU_SSE3`, `SSSE3`, `SSE41`, `SSE42`,
+`POPCNT`, `BMI1`, `BMI2`, `LZCNT`, `AES`, `PCLMUL`, `MOVBE`, `RDRAND`,
+`RDSEED`, `ADX`, `SHA`. SSE2 is always there (x86-64).
+
+**Example** - choosing a code path:
+
+```c
+#include "user_sysinfo.h"
+
+if (mos_cpu_has(SYS_CPU_AVX2 | SYS_CPU_FMA))
+    render_avx2();          /* compiled with __attribute__((target("avx2,fma"))) */
+else
+    render_sse2();
+```
+
+Compile only the functions that use AVX with `__attribute__((target("avx2")))`
+(or `-mavx2` for a separate file); the rest of the program must stay SSE-only
+so it runs everywhere. The kernel saves and restores all YMM/ZMM state around
+every system call, interrupt and context switch, so no extra care is needed
+between threads.
+
+## `mos_sysinfo_cpu_features`, `mos_sysinfo_xcr0`
+
+```c
+uint64_t mos_sysinfo_cpu_features(void);   /* SYS_SYSINFO_CPU_FEATURES, 0x0C */
+uint64_t mos_sysinfo_xcr0(void);           /* SYS_SYSINFO_XCR0, 0x0D */
+```
+
+The raw feature mask (see `mos_cpu_has`) and the `XCR0` value the kernel runs
+with: 0 without XSAVE/AVX, 7 for x87+SSE+AVX, 0xE7 with AVX-512.
+
 ## `mos_sysinfo`
 
 ```c

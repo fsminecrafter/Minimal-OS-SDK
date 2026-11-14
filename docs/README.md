@@ -9,10 +9,12 @@ truth; these pages describe them as of SDK v1.1 and the kernel's
 | Page | Header | What is in it |
 | --- | --- | --- |
 | [Conventions and errors](conventions.md) | `syscall.h` | Calling convention, result codes, privilege rules, which header to include |
-| [Process and terminal](process.md) | `minimalos.h` | Output to the terminal, exit, sleep, time, PIDs, launching programs, cleanup on Ctrl+C |
+| [Process and terminal](process.md) | `minimalos.h` | Output to the terminal, exit, sleep, time, clocks, PIDs, launching programs, working directory, `stat`, `rename`, cleanup on Ctrl+C |
 | [Files](files.md) | `minimalos.h` | MinimaFS: open, create, read, write, seek, list, delete, metadata |
-| [Threads](threads.md) | `thread.h` | Threads in one program, `mos_mutex_t` locks |
+| [Spawning and waiting](spawn.md) | `process.h` | Start programs with arguments, environment, working directory and redirected output; wait for them; `getenv`; clock helpers |
+| [Threads](threads.md) | `thread.h` | Threads in one program, `mos_mutex_t` locks, futexes, thread-local storage base |
 | [Memory and randomness](memory.md) | `stdlib.h` | `malloc`, `calloc`, `realloc`, `free`, random bytes, `atoi` |
+| [Virtual memory](vm.md) | `vm.h` | Pages of your own: map, unmap, protect, decommit, reserve/commit, executable mappings, guard pages, where the image and stack live |
 | [Strings and memory](strings.md) | `string.h` | `strlen`, `strcmp`, `strstr`, `memcpy`, constant-time compare … |
 | [Formatted output](output.md) | `stdio.h`, `iostream` | `printf` and `std::cout` |
 | [Windows](windows.md) | `window.h` | mosWM windows: create, draw, present, events |
@@ -20,7 +22,7 @@ truth; these pages describe them as of SDK v1.1 and the kernel's
 | [Graphics](graphics.md) | `graphics.h`, `x86_64/user_graphics.h` | Full-screen framebuffer: acquire, blit, present, primitives |
 | [Input](input.md) | `x86_64/user_syscalls.h`, `user_mouse.h`, `user_usb.h` | Raw keyboard and mouse events for full-screen programs |
 | [Networking](network.md) | `net.h` | DNS, TCP client and server, UDP, the ktls transport |
-| [System information](sysinfo.md) | `user_sysinfo.h` | CPU, RAM, heap, cores, uptime, processes |
+| [System information](sysinfo.md) | `user_sysinfo.h` | CPU usage and features (AVX), RAM, heap, cores, uptime, processes |
 | [Packages](packages.md) | `minimalos.h` | `.mpkg` archives: unzip, zip, inspect |
 | [Device managers](managers.md) | `x86_64/user_managers.h` | GPU, audio, storage and USB manager calls |
 | [Text in your own pixels](font.md) | `font.h` | `draw_text` / `text_width`: smooth Inter text (bitmap fallback) in any pixel buffer |
@@ -49,7 +51,7 @@ Each function has the same parts:
 #include "minimalos.h"
 #include "stdio.h"
 
-int main(int argc, char** argv) {
+int main(int argc, char** argv) {   /* or main(argc, argv, envp) */
     printf("hello from pid %ld, %d argument(s)\n", mos_getpid(), argc);
     for (int i = 0; i < argc; i++) printf("argv[%d] = %s\n", i, argv[i]);
     mos_exit(0);

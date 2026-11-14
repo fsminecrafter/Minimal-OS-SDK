@@ -4,7 +4,11 @@ MinimaFS file and directory calls. Include `minimalos.h`.
 
 Paths look like `0:/etc/System.conf`: a drive number, a colon, then an
 absolute path. A path without a drive prefix is resolved against the
-terminal's current directory (see [`mos_getcwd`](process.md#mos_getcwd)).
+program's working directory (see [`mos_getcwd`](process.md#mos_getcwd) and
+[`mos_chdir`](process.md#mos_chdir)); `/dir/file` is the root of that
+directory's drive. [`mos_stat`](process.md#mos_stat) and
+[`mos_rename`](process.md#mos_rename) are documented with the process
+calls.
 
 A file handle is a `long`. Keep it in a `long`: it is a 64-bit value, and
 truncating it to `int` can corrupt it. Valid handles are positive;
