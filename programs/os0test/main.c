@@ -43,6 +43,7 @@
 #include "process.h"
 #include "string.h"
 #include "vm.h"
+#include "window.h"
 #include "user_sysinfo.h"
 
 #define TMP        "0:/os0test_tmp"
@@ -625,6 +626,8 @@ static int child_avx_probe(int wide512);
 static int child_smp(const char* mode);
 
 /* os0test.run --child <mode> [arg] */
+static int child_gpu(const char* mode);
+
 static int child_main(int argc, char** argv, char** envp) {
     const char* mode = argc > 2 ? argv[2] : "";
     long arg = argc > 3 ? parse_long(argv[3]) : 0;
@@ -635,9 +638,22 @@ static int child_main(int argc, char** argv, char** envp) {
     if (streq(mode, "relay")) return child_relay(argv);
     if (streq(mode, "tls_hw")) return child_tls_hw();
     if (streq(mode, "tsc")) return child_tsc();
+    if (streq(mode, "win_leak") || streq(mode, "win_crash")) {
+        /* Maps a window's shared frames and ends without unmapping or
+         * closing anything (win_crash: with a CPU exception). */
+        uint32_t id = mos_window_create(0, 10, 10, 640, 480, "leak");
+        if (!id) return 80;
+        mos_window_surface_t sf;
+        if (mos_window_surface_map(id, &sf) != SYS_SUCCESS) return 81;
+        for (uint32_t i = 0; i < 640u * 480u; i++) mos_window_surface_back(&sf)[i] = 0xFF112233u;
+        if (mos_window_surface_present(id, &sf, 0, 0, 640, 480) != SYS_SUCCESS) return 82;
+        if (streq(mode, "win_crash")) __asm__ volatile("ud2");
+        return 0;
+    }
     if (sstarts(mode, "vm_")) return child_vm(mode, arg);
     if (sstarts(mode, "torture_")) return child_torture(streq(mode, "torture_avx"), arg);
     if (sstarts(mode, "smp_")) return child_smp(mode + 4);
+    if (sstarts(mode, "gpu_")) return child_gpu(mode);
     if (streq(mode, "avx_probe")) return child_avx_probe(0);
     if (streq(mode, "avx512_probe")) return child_avx_probe(1);
     if (streq(mode, "streams")) {
@@ -2108,6 +2124,54 @@ static void test_bad_pointers_2(void) {
             EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0), 0, "gpu_write_surface_from_heap");
             g.data = g_pb_ro;
             EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0), 0, "gpu_write_surface_from_readonly_vm");
+            /* present flags: bad combinations are refused before anything else
+               (this program is not the screen owner, so a good one is PERM) */
+            g.op = SYS_GPU_PRESENT; g.out = NULL; g.window_id = 0; g.x = g.y = 0;
+            g.flags = 1u << 4;
+            EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0), ERR(SYS_ERR_INVAL), "gpu_present_unknown_flag");
+            g.flags = FGPU_PRESENT_SCALE2 | FGPU_PRESENT_SCALE3;
+            EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0), ERR(SYS_ERR_INVAL), "gpu_present_scale2_and_3");
+            g.flags = FGPU_PRESENT_SCALE2 | FGPU_PRESENT_FLIP;
+            EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0), ERR(SYS_ERR_INVAL), "gpu_present_scale_and_flip");
+            g.flags = FGPU_PRESENT_SCALE3; g.window_id = 1;
+            EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0), ERR(SYS_ERR_INVAL), "gpu_present_scale_into_window");
+            g.window_id = 0; g.flags = FGPU_PRESENT_SCALE2 | FGPU_PRESENT_PACED;
+            for (int i = 0; i < 5; i++) {
+                g.out = g_bad_out[i];
+                char nm[96]; kfmt(nm, sizeof(nm), "gpu_present_bad_timestamp_%s", g_tag_out[i]);
+                EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0), ERR(SYS_ERR_INVAL), nm);
+            }
+            g.out = NULL;
+            EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0), ERR(SYS_ERR_PERM), "gpu_present_scaled_not_screen_owner");
+
+            /* pacing: six paced presents 20 ms apart take about 100 ms. The
+               window does not exist, so nothing is drawn; the wait comes
+               first, which is what is measured. */
+            syscall_gpu_request_t pc;
+            memset(&pc, 0, sizeof(pc));
+            pc.size = sizeof(pc); pc.version = SYS_GPU_ABI_VERSION; pc.op = SYS_GPU_SET_PACE;
+            pc.bytes = 100;
+            EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&pc, 0, 0), ERR(SYS_ERR_INVAL), "gpu_set_pace_too_short");
+            pc.bytes = 10ull * 1000000000ull;
+            EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&pc, 0, 0), ERR(SYS_ERR_INVAL), "gpu_set_pace_too_long");
+            pc.bytes = 20000000ull;
+            EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&pc, 0, 0), 0, "gpu_set_pace_20ms");
+            g.flags = FGPU_PRESENT_PACED; g.window_id = 0x7ffffff0u;
+            uint64_t stamp[6];
+            for (int i = 0; i < 6; i++) {
+                uint64_t st = 0;
+                g.out = &st;
+                mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0);
+                stamp[i] = mos_clock_monotonic_ns();
+            }
+            uint64_t span = stamp[5] - stamp[0];
+            if (span >= 90000000ull && span <= 250000000ull) check_pass("gpu_present_paced_interval");
+            else check_fail("gpu_present_paced_interval", "5 intervals took %ld us, expected about 100000 (90000..250000)",
+                            (long)(span / 1000));
+            pc.bytes = 0;      /* back to 60 Hz */
+            EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&pc, 0, 0), 0, "gpu_set_pace_default");
+            g.window_id = 0; g.out = NULL; g.flags = 0;
+
             g.op = SYS_GPU_DESTROY_SURFACE;
             EXPECT_RET(mos_syscall(SYS_GPU, (long)(uintptr_t)&g, 0, 0), 0, "gpu_destroy_surface");
         } else {
@@ -3009,6 +3073,177 @@ static void test_vm(void) {
     test_vm_stacks();
 }
 
+
+/* ============================================== window shared frames */
+
+#define WS_W 128u
+#define WS_H 96u
+
+static uint32_t ws_px(uint32_t x, uint32_t y) { return 0xFF000000u | (y << 8) | x; }
+
+static int ws_matches(const uint32_t* base, uint32_t pitch_bytes, uint32_t w, uint32_t h) {
+    for (uint32_t y = 0; y < h; y++)
+        for (uint32_t x = 0; x < w; x++)
+            if (((const uint32_t*)((const uint8_t*)base + (size_t)y * pitch_bytes))[x] != ws_px(x, y)) return 0;
+    return 1;
+}
+
+static void test_window_shared(void) {
+    stage("window_shared");
+    long f_start = vm_free_pages();
+    uint32_t id = mos_window_create(0, 20, 20, WS_W, WS_H, "os0test shared");
+    EXPECT(id != 0, "wshare_create_window", "no window");
+    if (!id) return;
+    uint32_t id2 = mos_window_create(0, 40, 40, WS_W, WS_H, "os0test copy");
+
+    /* Not mapped yet: presenting a shared buffer makes no sense. */
+    EXPECT_RET(mos_window_present_shared(id, 0, 0, 0, 0, 0), ERR(SYS_ERR_INVAL), "wshare_present_before_map_inval");
+
+    long f0 = vm_free_pages();
+    mos_window_surface_t sf;
+    memset(&sf, 0, sizeof(sf));
+    EXPECT_RET(mos_window_surface_map(id, &sf), SYS_SUCCESS, "wshare_map_frame");
+    long f1 = vm_free_pages();
+    EXPECT(sf.info.address >= VM_MMAP_BASE && (sf.info.address & (VM_PAGE - 1)) == 0, "wshare_map_address_aligned_above_2tib", "address 0x%llx", (unsigned long long)sf.info.address);
+    EXPECT(sf.info.width == WS_W && sf.info.height == WS_H && sf.info.pitch == WS_W * 4 &&
+           sf.info.buffer_count == 2 && sf.info.front == 0 && sf.info.buffer_stride >= (uint64_t)WS_W * 4 * WS_H,
+           "wshare_map_reports_geometry", "w=%u h=%u pitch=%u count=%u front=%u stride=%llu", sf.info.width, sf.info.height,
+           sf.info.pitch, sf.info.buffer_count, sf.info.front, (unsigned long long)sf.info.buffer_stride);
+    EXPECT(f0 - f1 >= 20 && f0 - f1 <= 24 + VM_PAGES_SLACK, "wshare_map_takes_frames_up_front", "used %ld pages", f0 - f1);
+    uint32_t* b0 = sf.buffer[0];
+    uint32_t* b1 = sf.buffer[1];
+    EXPECT(b0 && b1 && b1 > b0, "wshare_two_buffers", "b0=%llx b1=%llx", PTR(b0), PTR(b1));
+    if (!b0 || !b1) return;
+    EXPECT(vm_is_zero((uint8_t*)b0, WS_W * 4 * WS_H) && vm_is_zero((uint8_t*)b1, WS_W * 4 * WS_H), "wshare_buffers_start_zero", "not zero");
+
+    /* Draw into the back buffer and present it with a damage rectangle. */
+    uint32_t* back = mos_window_surface_back(&sf);
+    EXPECT(back == b1, "wshare_back_buffer_is_1_first", "back=%llx", PTR(back));
+    for (uint32_t y = 0; y < WS_H; y++)
+        for (uint32_t x = 0; x < WS_W; x++) back[y * WS_W + x] = ws_px(x, y);
+    syscall_window_info_t inf0, inf1;
+    mos_window_get_info(id, &inf0);
+    EXPECT_RET(mos_window_surface_present(id, &sf, 10, 20, 30, 40), SYS_SUCCESS, "wshare_present_with_damage");
+    mos_window_get_info(id, &inf1);
+    EXPECT(inf1.frame_version == inf0.frame_version + 1, "wshare_present_bumps_frame_version", "%u -> %u", inf0.frame_version, inf1.frame_version);
+    EXPECT(sf.info.front == 1 && mos_window_surface_back(&sf) == b0, "wshare_present_swaps_buffers", "front=%u", sf.info.front);
+    EXPECT_RET(mos_window_surface_present(id, &sf, 0, 0, 0, 0), SYS_SUCCESS, "wshare_present_whole_window");   /* now buffer 0 (zeros) is front */
+    EXPECT_RET(mos_window_present_shared(id, 1, 0, 0, 0, 0), SYS_SUCCESS, "wshare_represent_other_buffer");
+    sf.info.front = 1;
+
+    /* Second mapping of the same frames in this process. */
+    mos_window_surface_t sf2;
+    EXPECT_RET(mos_window_surface_map(id, &sf2), SYS_SUCCESS, "wshare_second_mapping");
+    EXPECT(sf2.info.address != sf.info.address && sf2.info.front == 1 && sf2.info.generation == sf.info.generation,
+           "wshare_second_mapping_other_address_same_object", "addr %llx/%llx front %u gen %u/%u", (unsigned long long)sf.info.address,
+           (unsigned long long)sf2.info.address, sf2.info.front, sf.info.generation, sf2.info.generation);
+    EXPECT(ws_matches(sf2.buffer[1], WS_W * 4, WS_W, WS_H), "wshare_second_mapping_sees_the_same_bytes", "pixels differ");
+    sf2.buffer[1][5] = 0xFF00FF00u;
+    EXPECT(sf.buffer[1][5] == 0xFF00FF00u, "wshare_write_visible_through_other_mapping", "got %08x", sf.buffer[1][5]);
+
+    /* The copy path still works on a shared window: it writes the front buffer. */
+    {
+        uint32_t* tmp = (uint32_t*)malloc(WS_W * WS_H * 4);
+        if (tmp) {
+            for (uint32_t i = 0; i < WS_W * WS_H; i++) tmp[i] = 0xFFABCDEFu;
+            EXPECT_RET(mos_window_present(id, tmp, WS_W * 4, 4, 4, 8, 8), SYS_SUCCESS, "wshare_copy_present_still_works");
+            EXPECT(sf.buffer[sf.info.front][4 * WS_W + 4] == 0xFFABCDEFu && sf.buffer[sf.info.front][12 * WS_W + 12] != 0xFFABCDEFu,
+                   "wshare_copy_present_lands_in_front_buffer", "pixel %08x", sf.buffer[sf.info.front][4 * WS_W + 4]);
+            free(tmp);
+        }
+    }
+
+    /* Invalid arguments. */
+    EXPECT_RET(mos_window_present_shared(id, 2, 0, 0, 0, 0), ERR(SYS_ERR_INVAL), "wshare_present_buffer_2_inval");
+    EXPECT_RET(mos_window_present_shared(id, 0, 100, 0, 64, 10), ERR(SYS_ERR_INVAL), "wshare_present_rect_outside_inval");
+    EXPECT_RET(mos_window_present_shared(id, 0, 0, 0, 10, 0), ERR(SYS_ERR_INVAL), "wshare_present_zero_height_inval");
+    EXPECT_RET(mos_window_present_shared(0, 0, 0, 0, 0, 0), ERR(SYS_ERR_NOTFOUND), "wshare_present_unknown_window");
+    syscall_window_shared_t junk;
+    EXPECT_RET(mos_window_map_frame(0, &junk), ERR(SYS_ERR_NOTFOUND), "wshare_map_unknown_window");
+    EXPECT_RET(mos_window_map_frame(id, NULL), ERR(SYS_ERR_INVAL), "wshare_map_null_struct_inval");
+    EXPECT_RET(mos_window_map_frame(id, (syscall_window_shared_t*)(uintptr_t)8), ERR(SYS_ERR_INVAL), "wshare_map_bad_pointer_inval");
+    EXPECT_RET(mos_window_take_damage(id, &junk), ERR(SYS_ERR_PERM), "wshare_take_damage_needs_manager");
+    if (id2) {
+        EXPECT_RET(mos_window_present_shared(id2, 0, 0, 0, 0, 0), ERR(SYS_ERR_INVAL), "wshare_copy_window_has_no_shared_frames");
+        mos_window_close(id2);
+    }
+
+    /* Protection of a shared area: whole only, never beyond what it was given. */
+    uint8_t* area = (uint8_t*)(uintptr_t)sf2.info.address;
+    size_t area_len = (size_t)(sf2.info.buffer_stride * 2);
+    EXPECT_RET(mos_vm_decommit(area, area_len), ERR(SYS_ERR_INVAL), "wshare_decommit_refused");
+    EXPECT_RET(mos_vm_protect(area, VM_PAGE, MOS_VM_PROT_READ), ERR(SYS_ERR_INVAL), "wshare_partial_protect_refused");
+    EXPECT_RET(mos_vm_protect(area, area_len, MOS_VM_PROT_RX), ERR(SYS_ERR_INVAL), "wshare_protect_exec_refused");
+    EXPECT_RET(mos_vm_protect(area, area_len, MOS_VM_PROT_READ), SYS_SUCCESS, "wshare_protect_whole_to_read");
+    EXPECT(ws_matches(sf2.buffer[1], WS_W * 4, WS_W, WS_H) || sf2.buffer[1][5] == 0xFF00FF00u, "wshare_data_survives_protect", "data lost");
+    EXPECT_RET(mos_vm_protect(area, area_len, MOS_VM_PROT_RW), SYS_SUCCESS, "wshare_protect_back_to_rw");
+    sf2.buffer[1][6] = 0x12345678u;
+    EXPECT(sf.buffer[1][6] == 0x12345678u, "wshare_write_after_protect_still_shared", "got %08x", sf.buffer[1][6]);
+    EXPECT_RET(mos_vm_unmap(area, VM_PAGE), ERR(SYS_ERR_INVAL), "wshare_partial_unmap_refused");
+    EXPECT(sf2.buffer[1][6] == 0x12345678u, "wshare_partial_unmap_changes_nothing", "mapping damaged");
+
+    /* Unmapping one mapping leaves the other (and the frames) alone. */
+    EXPECT_RET(mos_window_surface_unmap(&sf2), SYS_SUCCESS, "wshare_unmap_second_mapping");
+    EXPECT(sf.buffer[1][6] == 0x12345678u && sf.buffer[1][100] == ws_px(100, 0), "wshare_first_mapping_survives_other_unmap", "data changed");
+
+    /* Resize replaces the buffers; the old mapping stays valid but stale. */
+    mos_window_get_info(id, &inf0);
+    EXPECT_RET(mos_window_set_bounds(id, 20, 20, 160, 120), SYS_SUCCESS, "wshare_resize");
+    mos_window_surface_t sf3;
+    EXPECT_RET(mos_window_surface_map(id, &sf3), SYS_SUCCESS, "wshare_map_after_resize");
+    EXPECT(sf3.info.width == 160 && sf3.info.height == 120 && sf3.info.pitch == 640 && sf3.info.generation == sf.info.generation + 1 &&
+           sf3.info.front == 0 && sf3.info.address != sf.info.address,
+           "wshare_resize_gives_new_generation", "w=%u h=%u gen %u->%u front=%u", sf3.info.width, sf3.info.height,
+           sf.info.generation, sf3.info.generation, sf3.info.front);
+    EXPECT(sf.buffer[1][100] == ws_px(100, 0) && sf.buffer[1][WS_W + 3] == ws_px(3, 1), "wshare_old_mapping_valid_after_resize", "old data lost");
+    EXPECT(sf3.buffer[0][0] == ws_px(0, 0) && sf3.buffer[0][2 * 160 + 7] == ws_px(7, 2) && sf3.buffer[0][100 * 160 + 140] == 0,
+           "wshare_resize_keeps_overlap_in_front_buffer", "pixels %08x %08x", sf3.buffer[0][0], sf3.buffer[0][2 * 160 + 7]);
+    EXPECT_RET(mos_window_surface_present(id, &sf3, 0, 0, 160, 120), SYS_SUCCESS, "wshare_present_after_resize");
+    EXPECT_RET(mos_window_present_shared(id, 0, 150, 0, 20, 20), ERR(SYS_ERR_INVAL), "wshare_present_rect_uses_new_size");
+    EXPECT_RET(mos_window_surface_unmap(&sf), SYS_SUCCESS, "wshare_unmap_stale_mapping");
+    EXPECT_RET(mos_window_surface_unmap(&sf), ERR(SYS_ERR_INVAL), "wshare_unmap_twice_inval");
+
+    /* Closing the window does not pull the frames from under the mapping. */
+    sf3.buffer[0][1] = 0xFF010203u;
+    EXPECT_RET(mos_window_close(id), SYS_SUCCESS, "wshare_close_window");
+    EXPECT(sf3.buffer[0][1] == 0xFF010203u, "wshare_mapping_outlives_window", "data lost");
+    EXPECT_RET(mos_window_surface_unmap(&sf3), SYS_SUCCESS, "wshare_unmap_last_mapping");
+    long f_end = vm_free_pages();
+    EXPECT(f_start - f_end <= VM_PAGES_SLACK, "wshare_cycle_leaks_no_frames", "%ld pages gone", f_start - f_end);
+
+    /* Frames are freed with the last mapping, also when the mapper dies. */
+    {
+        uint32_t big_id = mos_window_create(0, 0, 0, 640, 480, "big");
+        long g0 = vm_free_pages();
+        mos_window_surface_t big;
+        if (big_id && mos_window_surface_map(big_id, &big) == SYS_SUCCESS) {
+            long g1 = vm_free_pages();
+            EXPECT(g0 - g1 >= 590 && g0 - g1 <= 600 + VM_PAGES_SLACK, "wshare_640x480_takes_600_pages", "used %ld pages", g0 - g1);
+            mos_window_close(big_id);
+            long g2 = vm_free_pages();
+            EXPECT(g2 - g1 <= VM_PAGES_SLACK, "wshare_close_keeps_frames_while_mapped", "%ld pages came back", g2 - g1);
+            mos_window_surface_unmap(&big);
+            long g3 = vm_free_pages();
+            EXPECT(g3 - g2 >= 590, "wshare_last_unmap_frees_frames", "got back %ld pages", g3 - g2);
+        } else {
+            check_fail("wshare_640x480_takes_600_pages", "map failed");
+            if (big_id) mos_window_close(big_id);
+        }
+        static const char* const modes[2] = { "win_leak", "win_crash" };
+        for (int m = 0; m < 2; m++) {
+            long h0 = vm_free_pages();
+            mos_wait_result_t r;
+            long pid = spawn_wait_stack(modes[m], NULL, 0, &r);
+            long h1 = vm_free_pages();
+            char nm[64];
+            kfmt(nm, sizeof(nm), "wshare_%s_child_ran", modes[m]);
+            EXPECT(pid > 0 && (m == 1 ? r.crashed : (!r.crashed && r.exit_code == 0)), nm, "pid=%ld crashed=%d exit=%d", pid, r.crashed, r.exit_code);
+            kfmt(nm, sizeof(nm), "wshare_%s_child_end_frees_frames", modes[m]);
+            EXPECT(h0 - h1 <= VM_PAGES_SLACK, nm, "%ld pages gone", h0 - h1);
+        }
+    }
+}
+
 /* ================================================================== SIMD
  * Register state across context switches. Each worker loads a pattern of its
  * own into the vector registers (and x87 / MXCSR), lets the kernel do things
@@ -3829,6 +4064,284 @@ static void test_smp_threads(void) {
     test_smp_stale_and_exit();
 }
 
+/* ===================================================== GPU (OS-4 contexts) */
+
+static long gpu_call(syscall_gpu_request_t* g) {
+    g->size = sizeof(*g);
+    if (!g->version) g->version = SYS_GPU_ABI_VERSION;
+    return mos_syscall(SYS_GPU, (long)(uintptr_t)g, 0, 0);
+}
+
+static uint32_t gpu_new_surface(uint32_t w, uint32_t h, long* res) {
+    syscall_gpu_request_t g;
+    memset(&g, 0, sizeof(g));
+    g.op = SYS_GPU_CREATE_SURFACE; g.width = w; g.height = h;
+    g.format = FGPU_FORMAT_XRGB8888; g.flags = FGPU_SURFACE_SYSTEM_MEMORY;
+    long r = gpu_call(&g);
+    if (res) *res = r;
+    return r == 0 ? g.handle : 0;
+}
+
+static uint32_t gpu_new_buffer(uint64_t bytes, long* res) {
+    syscall_gpu_request_t g;
+    memset(&g, 0, sizeof(g));
+    g.op = SYS_GPU_CREATE_BUFFER; g.bytes = bytes;
+    long r = gpu_call(&g);
+    if (res) *res = r;
+    return r == 0 ? g.handle : 0;
+}
+
+static long gpu_destroy(uint32_t op, uint32_t h) {
+    syscall_gpu_request_t g;
+    memset(&g, 0, sizeof(g));
+    g.op = op; g.handle = h;
+    return gpu_call(&g);
+}
+
+/* Clears `surf` to `color`; returns the SUBMIT result, the fence in *fence. */
+static long gpu_clear(uint32_t surf, uint32_t color, int async, uint32_t* fence) {
+    uint32_t cmd[7];
+    cmd[0] = FGPU_CMD(FGPU_OP_BIND_TARGET, 3); cmd[1] = surf; cmd[2] = 0;
+    cmd[3] = FGPU_CMD(FGPU_OP_CLEAR, 4); cmd[4] = FGPU_CLEAR_COLOR; cmd[5] = color; cmd[6] = 0;
+    syscall_gpu_request_t g;
+    memset(&g, 0, sizeof(g));
+    g.op = SYS_GPU_SUBMIT; g.data = cmd; g.bytes = sizeof(cmd);
+    g.flags = async ? FGPU_SUBMIT_ASYNC : 0;
+    long r = gpu_call(&g);
+    if (fence) *fence = g.handle;
+    return r;
+}
+
+static long gpu_wait(uint32_t fence, uint64_t timeout_ns, uint32_t* tris) {
+    syscall_gpu_request_t g;
+    memset(&g, 0, sizeof(g));
+    g.op = SYS_GPU_WAIT; g.handle = fence; g.bytes = timeout_ns;
+    long r = gpu_call(&g);
+    if (tris) *tris = g.handle;
+    return r;
+}
+
+/* The first pixel of `surf` (0xFFFFFFFF on failure). */
+static uint32_t gpu_pixel(uint32_t surf, uint32_t w, uint32_t h) {
+    static uint32_t px[256 * 256];
+    if (w * h > 256 * 256) return 0xFFFFFFFFu;
+    syscall_gpu_request_t g;
+    memset(&g, 0, sizeof(g));
+    g.op = SYS_GPU_READBACK; g.handle = surf; g.out = px; g.pitch = w * 4;
+    if (gpu_call(&g) != 0) return 0xFFFFFFFFu;
+    return px[(h - 1) * w + (w - 1)] & 0xFFFFFF;
+}
+
+typedef struct {
+    uint32_t main_buf;
+    long upload;
+    uint32_t made_surf;
+    long made;
+} gpu_thread_arg_t;
+
+static void gpu_thread(void* p) {
+    gpu_thread_arg_t* a = (gpu_thread_arg_t*)p;
+    static uint8_t data[64];
+    syscall_gpu_request_t g;
+    memset(&g, 0, sizeof(g));
+    g.op = SYS_GPU_UPLOAD_BUFFER; g.handle = a->main_buf; g.data = data; g.bytes = sizeof(data);
+    a->upload = gpu_call(&g);
+    a->made_surf = gpu_new_surface(8, 8, &a->made);
+}
+
+/* Spawned: makes objects, queues async work and ends without waiting. */
+static int child_gpu(const char* mode) {
+    uint32_t s = gpu_new_surface(256, 256, NULL);
+    for (int i = 0; i < 16; i++) gpu_new_buffer(65536, NULL);
+    uint32_t f;
+    for (int i = 0; i < 4; i++) gpu_clear(s, 0x112233u + (uint32_t)i, 1, &f);
+    if (streq(mode, "gpu_crash")) __asm__ volatile("ud2");
+    return 7;
+}
+
+static void test_gpu(void) {
+    stage("gpu");
+    syscall_gpu_request_t g;
+    memset(&g, 0, sizeof(g));
+    syscall_gpu_info_t info;
+    memset(&info, 0, sizeof(info));
+    info.size = sizeof(info);
+    g.op = SYS_GPU_INFO; g.out = &info;
+    EXPECT_RET(gpu_call(&g), SYS_SUCCESS, "gpu_info");
+    EXPECT(info.version >= 3, "gpu_abi_version_3", "version %u", info.version);
+    EXPECT(info.caps & FGPU_CAP_ASYNC, "gpu_cap_async", "caps %x", info.caps);
+
+    /* Objects belong to the program: a thread uses and makes them, and what
+     * it made outlives it. */
+    long r;
+    uint32_t buf = gpu_new_buffer(4096, &r);
+    EXPECT_RET(r, SYS_SUCCESS, "gpu_ctx_buffer_create");
+    gpu_thread_arg_t ta;
+    memset(&ta, 0, sizeof(ta));
+    ta.main_buf = buf;
+    mos_thread_t t;
+    if (mos_thread_create(&t, gpu_thread, &ta, 0) == 0) mos_thread_join(&t);
+    EXPECT_RET(ta.upload, SYS_SUCCESS, "gpu_ctx_thread_uses_main_buffer");
+    EXPECT_RET(ta.made, SYS_SUCCESS, "gpu_ctx_thread_creates_surface");
+    EXPECT(gpu_pixel(ta.made_surf, 8, 8) != 0xFFFFFFFFu, "gpu_ctx_thread_surface_outlives_thread",
+           "readback of %x failed", ta.made_surf);
+    EXPECT_RET(gpu_destroy(SYS_GPU_DESTROY_SURFACE, ta.made_surf), SYS_SUCCESS, "gpu_ctx_destroy_thread_surface");
+
+    /* Handles: stale, wrong type, garbage. */
+    EXPECT_RET(gpu_destroy(SYS_GPU_DESTROY_SURFACE, buf), ERR(SYS_ERR_NOTFOUND), "gpu_handle_wrong_type");
+    EXPECT_RET(gpu_destroy(SYS_GPU_DESTROY_BUFFER, buf), SYS_SUCCESS, "gpu_handle_destroy_buffer");
+    EXPECT_RET(gpu_destroy(SYS_GPU_DESTROY_BUFFER, buf), ERR(SYS_ERR_NOTFOUND), "gpu_handle_stale");
+    uint32_t again = gpu_new_buffer(4096, NULL);
+    EXPECT(again && again != buf, "gpu_handle_reuse_differs", "old %x new %x", buf, again);
+    EXPECT_RET(gpu_destroy(SYS_GPU_DESTROY_BUFFER, buf), ERR(SYS_ERR_NOTFOUND), "gpu_handle_stale_after_reuse");
+    gpu_destroy(SYS_GPU_DESTROY_BUFFER, again);
+    EXPECT_RET(gpu_destroy(SYS_GPU_DESTROY_BUFFER, 0x7FFFFFFFu), ERR(SYS_ERR_NOTFOUND), "gpu_handle_garbage");
+
+    /* Synchronous submit still works and reports through `handle`. */
+    uint32_t surf = gpu_new_surface(64, 64, &r);
+    EXPECT_RET(r, SYS_SUCCESS, "gpu_surface_create");
+    EXPECT_RET(gpu_clear(surf, 0x0000FF, 0, NULL), SYS_SUCCESS, "gpu_sync_submit");
+    EXPECT(gpu_pixel(surf, 64, 64) == 0x0000FF, "gpu_sync_submit_result", "pixel %x", gpu_pixel(surf, 64, 64));
+
+    /* Async: fences increase, results are seen by a later readback. */
+    uint32_t f1 = 0, f2 = 0;
+    EXPECT_RET(gpu_clear(surf, 0xFF0000, 1, &f1), SYS_SUCCESS, "gpu_async_submit");
+    EXPECT(f1 != 0, "gpu_async_fence_nonzero", "fence %u", f1);
+    EXPECT(gpu_pixel(surf, 64, 64) == 0xFF0000, "gpu_async_readback_sees_result", "pixel %x", gpu_pixel(surf, 64, 64));
+    EXPECT_RET(gpu_clear(surf, 0x00FF00, 1, &f2), SYS_SUCCESS, "gpu_async_submit_2");
+    EXPECT(f2 == f1 + 1, "gpu_async_fences_increase", "%u then %u", f1, f2);
+    EXPECT_RET(gpu_wait(f2, ~0ull, NULL), SYS_SUCCESS, "gpu_wait_fence");
+    EXPECT_RET(gpu_wait(f2, 0, NULL), SYS_SUCCESS, "gpu_wait_done_fence_no_timeout");
+    EXPECT_RET(gpu_wait(0, 0, NULL), SYS_SUCCESS, "gpu_wait_all_idle");
+    EXPECT(gpu_pixel(surf, 64, 64) == 0x00FF00, "gpu_wait_result", "pixel %x", gpu_pixel(surf, 64, 64));
+
+    /* More than the queue holds: the extra submits wait, all run in order. */
+    int ok = 1;
+    uint32_t last = 0, prev = f2;
+    for (uint32_t i = 0; i < 12; i++) {
+        uint32_t f;
+        if (gpu_clear(surf, 0x100000u * (i + 1), 1, &f) != 0 || f != prev + 1) ok = 0;
+        prev = last = f;
+    }
+    EXPECT(ok, "gpu_async_queue_backpressure", "a submit failed or fences skipped");
+    EXPECT_RET(gpu_wait(last, 5000000000ull, NULL), SYS_SUCCESS, "gpu_wait_after_backpressure");
+    EXPECT(gpu_pixel(surf, 64, 64) == 0xC00000, "gpu_async_order_kept", "pixel %x", gpu_pixel(surf, 64, 64));
+
+    /* A rejected async buffer is reported by the next WAIT, once. */
+    uint32_t bad[2] = { FGPU_CMD(0x7FFF, 2), 0 };
+    memset(&g, 0, sizeof(g));
+    g.op = SYS_GPU_SUBMIT; g.data = bad; g.bytes = sizeof(bad); g.flags = FGPU_SUBMIT_ASYNC;
+    EXPECT_RET(gpu_call(&g), SYS_SUCCESS, "gpu_async_bad_buffer_queued");
+    EXPECT_RET(gpu_wait(0, ~0ull, NULL), ERR(SYS_ERR_INVAL), "gpu_wait_reports_bad_buffer");
+    EXPECT_RET(gpu_wait(0, ~0ull, NULL), SYS_SUCCESS, "gpu_wait_error_cleared");
+    /* A version-2 request ignores the flag (runs synchronously). */
+    memset(&g, 0, sizeof(g));
+    uint32_t cmd[7] = { FGPU_CMD(FGPU_OP_BIND_TARGET, 3), surf, 0,
+                        FGPU_CMD(FGPU_OP_CLEAR, 4), FGPU_CLEAR_COLOR, 0x123456, 0 };
+    g.version = 2; g.op = SYS_GPU_SUBMIT; g.data = cmd; g.bytes = sizeof(cmd); g.flags = FGPU_SUBMIT_ASYNC;
+    EXPECT_RET(gpu_call(&g), SYS_SUCCESS, "gpu_v2_submit_flag_ignored");
+    memset(&g, 0, sizeof(g));
+    g.version = 2; g.op = SYS_GPU_WAIT;
+    EXPECT_RET(gpu_call(&g), SYS_SUCCESS, "gpu_v2_wait_harmless");
+
+    /* Quota: one program cannot take every buffer slot. */
+    static uint32_t many[4200];
+    uint32_t made = 0;
+    long last_r = 0;
+    for (uint32_t i = 0; i < 4200; i++) {
+        many[i] = gpu_new_buffer(16, &last_r);
+        if (!many[i]) break;
+        made++;
+    }
+    EXPECT(made == 4096 && last_r == ERR(SYS_ERR_NOMEM), "gpu_buffer_quota",
+           "made %u, last %ld (%s)", made, last_r, ename(last_r));
+    for (uint32_t i = 0; i < made; i++) gpu_destroy(SYS_GPU_DESTROY_BUFFER, many[i]);
+    uint32_t after = gpu_new_buffer(16, &r);
+    EXPECT_RET(r, SYS_SUCCESS, "gpu_buffer_quota_freed");
+    gpu_destroy(SYS_GPU_DESTROY_BUFFER, after);
+
+    /* Programs that end (or crash) with objects and queued work: their
+     * objects are freed, and the GPU keeps working for everyone else. */
+    mos_wait_result_t wr;
+    uint64_t free0 = mos_sysinfo_heap_free(), free1;
+    long pid = spawn_wait("gpu_exit", NULL, NULL, NULL, NULL, NULL, &wr);
+    EXPECT(pid > 0 && wr.exit_code == 7, "gpu_child_exit_with_queued_work", "pid %ld code %d", pid, (int)wr.exit_code);
+    pid = spawn_wait("gpu_crash", NULL, NULL, NULL, NULL, NULL, &wr);
+    EXPECT(pid > 0, "gpu_child_crash_with_queued_work", "pid %ld", pid);
+    for (int i = 0; i < 4; i++) spawn_wait("gpu_exit", NULL, NULL, NULL, NULL, NULL, &wr);
+    free1 = mos_sysinfo_heap_free();
+    /* 6 children x ~1.3 MB each would show; allow slack for the heap. */
+    EXPECT(free1 + 2 * 1024 * 1024 >= free0, "gpu_child_objects_freed",
+           "heap free %lu -> %lu", (unsigned long)free0, (unsigned long)free1);
+    EXPECT_RET(gpu_clear(surf, 0x00AA00, 0, NULL), SYS_SUCCESS, "gpu_works_after_children");
+    EXPECT(gpu_pixel(surf, 64, 64) == 0x00AA00, "gpu_result_after_children", "pixel %x", gpu_pixel(surf, 64, 64));
+    gpu_destroy(SYS_GPU_DESTROY_SURFACE, surf);
+}
+
+/* GPU present into a window: the first converts it to shared frames, the
+ * next goes straight into its back buffer; the copy path still works on it,
+ * and a resized window is presented into its new buffers. */
+static uint32_t gw_front_pixel(uint32_t win, uint32_t x, uint32_t y, uint32_t* version, long* res) {
+    mos_window_surface_t sf;
+    memset(&sf, 0, sizeof(sf));
+    *res = (long)mos_window_surface_map(win, &sf);
+    if (*res != 0) return 0xFFFFFFFFu;
+    uint32_t v = 0xFFFFFFFFu;
+    if (sf.info.buffer_count == SYSCALL_WINDOW_SHARED_BUFFERS && sf.info.front < 2 &&
+        x < sf.info.width && y < sf.info.height)
+        v = ((const uint32_t*)((const uint8_t*)sf.buffer[sf.info.front] + (size_t)y * sf.info.pitch))[x] & 0xFFFFFF;
+    if (version) *version = sf.info.frame_version;
+    mos_vm_unmap((void*)(uintptr_t)sf.info.address, (size_t)sf.info.buffer_stride * SYSCALL_WINDOW_SHARED_BUFFERS);
+    return v;
+}
+
+static long gpu_present_window(uint32_t surf, uint32_t win, uint32_t flags) {
+    syscall_gpu_request_t g;
+    memset(&g, 0, sizeof(g));
+    g.op = SYS_GPU_PRESENT; g.handle = surf; g.window_id = win; g.flags = flags;
+    return gpu_call(&g);
+}
+
+static void test_gpu_window_present(void) {
+    stage("gpu_window_present");
+    uint32_t win = mos_window_create(0, 60, 60, 64, 48, "os0test gpu window");
+    EXPECT(win != 0, "gpuwin_create_window", "no window");
+    if (!win) return;
+    long r;
+    uint32_t surf = gpu_new_surface(128, 96, &r);
+    EXPECT_RET(r, SYS_SUCCESS, "gpuwin_surface");
+    uint32_t v1 = 0, v2 = 0;
+    gpu_clear(surf, 0x3366CC, 0, NULL);
+    EXPECT_RET(gpu_present_window(surf, win, 0), SYS_SUCCESS, "gpuwin_present_converts");
+    uint32_t px = gw_front_pixel(win, 63, 47, &v1, &r);
+    EXPECT(r == 0 && px == 0x3366CC, "gpuwin_front_after_first_present", "map %ld pixel %x", r, px);
+    gpu_clear(surf, 0x00FF00, 0, NULL);
+    EXPECT_RET(gpu_present_window(surf, win, 0), SYS_SUCCESS, "gpuwin_present_shared");
+    px = gw_front_pixel(win, 10, 10, &v2, &r);
+    EXPECT(r == 0 && px == 0x00FF00, "gpuwin_front_after_second_present", "map %ld pixel %x", r, px);
+    EXPECT(v2 != v1, "gpuwin_present_counts", "frame_version %u then %u", v1, v2);
+    /* The copy path on the converted window lands in the front buffer. */
+    static uint32_t pix[64 * 48];
+    for (uint32_t i = 0; i < 64 * 48; i++) pix[i] = 0xFF112233u;
+    EXPECT_RET((long)mos_window_present(win, pix, 64 * 4, 0, 0, 64, 48), SYS_SUCCESS, "gpuwin_copy_present_after");
+    px = gw_front_pixel(win, 5, 5, NULL, &r);
+    EXPECT(r == 0 && px == 0x112233, "gpuwin_copy_present_result", "map %ld pixel %x", r, px);
+    /* Grown window: GPU present goes into the new buffers. */
+    EXPECT_RET((long)mos_window_set_bounds(win, 60, 60, 100, 80), SYS_SUCCESS, "gpuwin_resize");
+    gpu_clear(surf, 0xAA00AA, 0, NULL);
+    EXPECT_RET(gpu_present_window(surf, win, 0), SYS_SUCCESS, "gpuwin_present_after_resize");
+    px = gw_front_pixel(win, 99, 79, NULL, &r);
+    EXPECT(r == 0 && px == 0xAA00AA, "gpuwin_front_after_resize", "map %ld pixel %x", r, px);
+    /* Larger than the surface: refused, window untouched. */
+    EXPECT_RET((long)mos_window_set_bounds(win, 60, 60, 200, 120), SYS_SUCCESS, "gpuwin_resize_big");
+    EXPECT_RET(gpu_present_window(surf, win, 0), ERR(SYS_ERR_INVAL), "gpuwin_surface_too_small");
+    /* Scaling is screen only. */
+    EXPECT_RET(gpu_present_window(surf, win, FGPU_PRESENT_SCALE2), ERR(SYS_ERR_INVAL), "gpuwin_scale_refused");
+    mos_window_close(win);
+    EXPECT_RET(gpu_present_window(surf, win, 0), ERR(SYS_ERR_NOTFOUND), "gpuwin_closed_window");
+    gpu_destroy(SYS_GPU_DESTROY_SURFACE, surf);
+}
+
 /* ================================================================== main */
 
 int main(int argc, char** argv, char** envp) {
@@ -3878,8 +4391,11 @@ int main(int argc, char** argv, char** envp) {
     test_spawn_failure_cleanup();
     test_exec_relative();
     test_vm();
+    test_window_shared();
     test_smp_threads();
     test_simd();
+    test_gpu();
+    test_gpu_window_present();
 
     stage("cleanup");
     mos_chdir(g_start_cwd[0] ? g_start_cwd : "0:/");

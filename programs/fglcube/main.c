@@ -4,6 +4,9 @@
  *     ./build.sh programs/fglcube        -> fglcube.run
  *     fglcube [seconds] [--gouraud|--flat|--wire|--shader] [--still]
  *
+ * --scale N  render at 1/N of the screen (N = 2 or 3) and let the kernel
+ * --paced     wait for the 60 Hz frame boundary in every present, and print
+ *             the measured frame time once a second
  * --still freezes the animation at one fixed time and prints "FGLCUBE READY"
  * once the first frame is shown (tools/debug/ci_fglcube.sh takes a screenshot
  * then and compares renderings between CPU rasterizer modes).
@@ -109,13 +112,16 @@ static void number(char* out, long v) {
 int main(int argc, char** argv) {
     long seconds = 0;
     uint32_t program = FGL_PROGRAM_PHONG;
-    int wire = 0, shaded = 0, still = 0;
+    int wire = 0, shaded = 0, still = 0, paced = 0;
+    long scale = 1;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--gouraud") == 0) program = FGL_PROGRAM_GOURAUD;
         else if (strcmp(argv[i], "--flat") == 0) program = FGL_PROGRAM_COLOR;
         else if (strcmp(argv[i], "--wire") == 0) wire = 1;
         else if (strcmp(argv[i], "--shader") == 0) shaded = 1;
         else if (strcmp(argv[i], "--still") == 0) still = 1;
+        else if (strcmp(argv[i], "--paced") == 0) paced = 1;
+        else if (strcmp(argv[i], "--scale") == 0 && i + 1 < argc) scale = atoi(argv[++i]);
         else seconds = atoi(argv[i]);
     }
 
@@ -144,9 +150,12 @@ int main(int argc, char** argv) {
         desc.window_id = window;
     } else {
         if (mos_graphics_acquire() != 0) { printf("fglcube: screen is busy\n"); return 1; }
-        desc.width = info.screen_width;
-        desc.height = info.screen_height;
-        desc.page_flip = 1;
+        if (scale < 1 || scale > 3) { printf("fglcube: --scale takes 1, 2 or 3\n"); mos_graphics_release(); return 1; }
+        desc.width = info.screen_width / (uint32_t)scale;
+        desc.height = info.screen_height / (uint32_t)scale;
+        desc.x = (int32_t)(info.screen_width - desc.width * (uint32_t)scale) / 2;
+        desc.y = (int32_t)(info.screen_height - desc.height * (uint32_t)scale) / 2;
+        desc.page_flip = scale == 1;
     }
 
     FGLContext* gl = fglCreateContext(&desc);
@@ -154,6 +163,14 @@ int main(int argc, char** argv) {
         printf("fglcube: could not create GPU surfaces\n");
         if (!windowed) mos_graphics_release();
         return 1;
+    }
+
+    if (scale > 1 && !windowed && fglPresentScaled(gl, (uint32_t)scale) != 0) {
+        printf("fglcube: scaled present not available\n");
+    }
+    if (paced && fglSwapInterval(gl, 1) != 0) {
+        printf("fglcube: paced present not available\n");
+        paced = 0;
     }
 
     // Vertices with texture coordinates. The built-in programs read the
@@ -201,6 +218,7 @@ int main(int argc, char** argv) {
     float aspect = (float)desc.width / (float)desc.height;
     long start = mos_uptime(), last_title = start;
     long frames = 0, fps_frames = 0;
+    uint64_t last_ns = 0;
     while (!g_quit) {
         long now = mos_uptime();
         float t = still ? 1.2f : (float)(now - start) / 1000.0f;
@@ -238,6 +256,7 @@ int main(int argc, char** argv) {
         }
         frames++;
         fps_frames++;
+        if (paced && frames == 1) { last_ns = fglLastPresentNs(gl); fps_frames = 0; }
         if (still && frames == 3) printf("FGLCUBE READY\n");
 
         if (now - last_title >= 1000) {
@@ -248,6 +267,8 @@ int main(int argc, char** argv) {
             memcpy(end, " fps", 5);
             if (windowed) mos_window_set_title(window, text);
             else printf("%s\n", text);
+            if (paced && last_ns && fps_frames) printf("frame %ld us\n", (long)((fglLastPresentNs(gl) - last_ns) / 1000 / (uint64_t)fps_frames));
+            if (paced) last_ns = fglLastPresentNs(gl);
             fps_frames = 0;
             last_title = now;
         }

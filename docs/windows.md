@@ -142,6 +142,48 @@ window, a short pitch or a NULL buffer, `SYS_ERR_NOTFOUND` /
 mos_window_present(id, px, W * 4, cx, cy, 32, 32);
 ```
 
+## Shared frames (`mos_window_surface_*`)
+
+`mos_window_present` copies your pixels into the window. To avoid the copy, map the
+window's frame buffers and draw into them directly:
+
+```c
+mos_window_surface_t sf;
+if (mos_window_surface_map(id, &sf) == SYS_SUCCESS) {
+    uint32_t* px = mos_window_surface_back(&sf);      /* rows: sf.info.pitch bytes */
+    /* ... draw ... */
+    mos_window_surface_present(id, &sf, x, y, w, h);  /* damage rect; swaps buffers */
+}
+```
+
+A window has two buffers (double buffering). The manager shows the front one, you draw
+into the other, and `mos_window_surface_present` publishes it (the kernel only records
+which buffer and which rectangle changed; mosWM recomposites just that rectangle). The
+damage is what differs from the buffer shown before: after drawing only a rectangle,
+copy the old front buffer into the back buffer first, or present everything
+(`width == height == 0`).
+
+| Call | Purpose |
+| --- | --- |
+| `mos_window_map_frame(id, &shared)` | Raw `SYS_WINDOW_MAP_FRAME`: fills `syscall_window_shared_t` (`address`, `buffer_stride`, `width`, `height`, `pitch`, `generation`, `front`) |
+| `mos_window_present_shared(id, buffer, x, y, w, h)` | Raw `SYS_WINDOW_PRESENT_SHARED` |
+| `mos_window_take_damage(id, &shared)` | Window manager only: damage since the last call |
+| `mos_window_surface_map` / `_back` / `_present` / `_unmap` | The convenient form above |
+
+**Resizing.** A resize replaces both buffers. After `SYSCALL_WINDOW_EVENT_RESIZED`
+call `mos_window_surface_map` again (new address and size, `generation` + 1, front 0,
+the old picture copied into buffer 0) and `mos_window_surface_unmap` the old surface
+first. A stale mapping stays readable and writable until you unmap it, but nothing you
+write there is shown. Closing the window does not unmap anything; the frames are freed
+when the last mapping (yours, the window manager's) is gone or its process ends.
+
+`mos_window_present` still works on a mapped window (it writes into the front buffer).
+Errors: `SYS_ERR_NOMEM` (no contiguous memory, or over the 128 MiB limit of shared
+frames), `SYS_ERR_INVAL` (bad buffer number or rectangle, or not mapped yet),
+`SYS_ERR_PERM`. `mos_vm_decommit` of the mapping is refused (`SYS_ERR_INVAL`), and
+`mos_vm_unmap` / `mos_vm_protect` must cover the whole mapping; protect may only
+lower access.
+
 ## `mos_window_next_event`
 
 ```c
