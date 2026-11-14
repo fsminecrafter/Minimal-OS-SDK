@@ -4278,6 +4278,70 @@ static void test_gpu(void) {
     gpu_destroy(SYS_GPU_DESTROY_SURFACE, surf);
 }
 
+/* GPU present into a window: the first converts it to shared frames, the
+ * next goes straight into its back buffer; the copy path still works on it,
+ * and a resized window is presented into its new buffers. */
+static uint32_t gw_front_pixel(uint32_t win, uint32_t x, uint32_t y, uint32_t* version, long* res) {
+    mos_window_surface_t sf;
+    memset(&sf, 0, sizeof(sf));
+    *res = (long)mos_window_surface_map(win, &sf);
+    if (*res != 0) return 0xFFFFFFFFu;
+    uint32_t v = 0xFFFFFFFFu;
+    if (sf.info.buffer_count == SYSCALL_WINDOW_SHARED_BUFFERS && sf.info.front < 2 &&
+        x < sf.info.width && y < sf.info.height)
+        v = ((const uint32_t*)((const uint8_t*)sf.buffer[sf.info.front] + (size_t)y * sf.info.pitch))[x] & 0xFFFFFF;
+    if (version) *version = sf.info.frame_version;
+    mos_vm_unmap((void*)(uintptr_t)sf.info.address, (size_t)sf.info.buffer_stride * SYSCALL_WINDOW_SHARED_BUFFERS);
+    return v;
+}
+
+static long gpu_present_window(uint32_t surf, uint32_t win, uint32_t flags) {
+    syscall_gpu_request_t g;
+    memset(&g, 0, sizeof(g));
+    g.op = SYS_GPU_PRESENT; g.handle = surf; g.window_id = win; g.flags = flags;
+    return gpu_call(&g);
+}
+
+static void test_gpu_window_present(void) {
+    stage("gpu_window_present");
+    uint32_t win = mos_window_create(0, 60, 60, 64, 48, "os0test gpu window");
+    EXPECT(win != 0, "gpuwin_create_window", "no window");
+    if (!win) return;
+    long r;
+    uint32_t surf = gpu_new_surface(128, 96, &r);
+    EXPECT_RET(r, SYS_SUCCESS, "gpuwin_surface");
+    uint32_t v1 = 0, v2 = 0;
+    gpu_clear(surf, 0x3366CC, 0, NULL);
+    EXPECT_RET(gpu_present_window(surf, win, 0), SYS_SUCCESS, "gpuwin_present_converts");
+    uint32_t px = gw_front_pixel(win, 63, 47, &v1, &r);
+    EXPECT(r == 0 && px == 0x3366CC, "gpuwin_front_after_first_present", "map %ld pixel %x", r, px);
+    gpu_clear(surf, 0x00FF00, 0, NULL);
+    EXPECT_RET(gpu_present_window(surf, win, 0), SYS_SUCCESS, "gpuwin_present_shared");
+    px = gw_front_pixel(win, 10, 10, &v2, &r);
+    EXPECT(r == 0 && px == 0x00FF00, "gpuwin_front_after_second_present", "map %ld pixel %x", r, px);
+    EXPECT(v2 != v1, "gpuwin_present_counts", "frame_version %u then %u", v1, v2);
+    /* The copy path on the converted window lands in the front buffer. */
+    static uint32_t pix[64 * 48];
+    for (uint32_t i = 0; i < 64 * 48; i++) pix[i] = 0xFF112233u;
+    EXPECT_RET((long)mos_window_present(win, pix, 64 * 4, 0, 0, 64, 48), SYS_SUCCESS, "gpuwin_copy_present_after");
+    px = gw_front_pixel(win, 5, 5, NULL, &r);
+    EXPECT(r == 0 && px == 0x112233, "gpuwin_copy_present_result", "map %ld pixel %x", r, px);
+    /* Grown window: GPU present goes into the new buffers. */
+    EXPECT_RET((long)mos_window_set_bounds(win, 60, 60, 100, 80), SYS_SUCCESS, "gpuwin_resize");
+    gpu_clear(surf, 0xAA00AA, 0, NULL);
+    EXPECT_RET(gpu_present_window(surf, win, 0), SYS_SUCCESS, "gpuwin_present_after_resize");
+    px = gw_front_pixel(win, 99, 79, NULL, &r);
+    EXPECT(r == 0 && px == 0xAA00AA, "gpuwin_front_after_resize", "map %ld pixel %x", r, px);
+    /* Larger than the surface: refused, window untouched. */
+    EXPECT_RET((long)mos_window_set_bounds(win, 60, 60, 200, 120), SYS_SUCCESS, "gpuwin_resize_big");
+    EXPECT_RET(gpu_present_window(surf, win, 0), ERR(SYS_ERR_INVAL), "gpuwin_surface_too_small");
+    /* Scaling is screen only. */
+    EXPECT_RET(gpu_present_window(surf, win, FGPU_PRESENT_SCALE2), ERR(SYS_ERR_INVAL), "gpuwin_scale_refused");
+    mos_window_close(win);
+    EXPECT_RET(gpu_present_window(surf, win, 0), ERR(SYS_ERR_NOTFOUND), "gpuwin_closed_window");
+    gpu_destroy(SYS_GPU_DESTROY_SURFACE, surf);
+}
+
 /* ================================================================== main */
 
 int main(int argc, char** argv, char** envp) {
@@ -4331,6 +4395,7 @@ int main(int argc, char** argv, char** envp) {
     test_smp_threads();
     test_simd();
     test_gpu();
+    test_gpu_window_present();
 
     stage("cleanup");
     mos_chdir(g_start_cwd[0] ? g_start_cwd : "0:/");
