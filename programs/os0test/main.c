@@ -43,6 +43,7 @@
 #include "process.h"
 #include "string.h"
 #include "vm.h"
+#include "window.h"
 #include "user_sysinfo.h"
 
 #define TMP        "0:/os0test_tmp"
@@ -637,6 +638,18 @@ static int child_main(int argc, char** argv, char** envp) {
     if (streq(mode, "relay")) return child_relay(argv);
     if (streq(mode, "tls_hw")) return child_tls_hw();
     if (streq(mode, "tsc")) return child_tsc();
+    if (streq(mode, "win_leak") || streq(mode, "win_crash")) {
+        /* Maps a window's shared frames and ends without unmapping or
+         * closing anything (win_crash: with a CPU exception). */
+        uint32_t id = mos_window_create(0, 10, 10, 640, 480, "leak");
+        if (!id) return 80;
+        mos_window_surface_t sf;
+        if (mos_window_surface_map(id, &sf) != SYS_SUCCESS) return 81;
+        for (uint32_t i = 0; i < 640u * 480u; i++) mos_window_surface_back(&sf)[i] = 0xFF112233u;
+        if (mos_window_surface_present(id, &sf, 0, 0, 640, 480) != SYS_SUCCESS) return 82;
+        if (streq(mode, "win_crash")) __asm__ volatile("ud2");
+        return 0;
+    }
     if (sstarts(mode, "vm_")) return child_vm(mode, arg);
     if (sstarts(mode, "torture_")) return child_torture(streq(mode, "torture_avx"), arg);
     if (sstarts(mode, "smp_")) return child_smp(mode + 4);
@@ -3060,6 +3073,177 @@ static void test_vm(void) {
     test_vm_stacks();
 }
 
+
+/* ============================================== window shared frames */
+
+#define WS_W 128u
+#define WS_H 96u
+
+static uint32_t ws_px(uint32_t x, uint32_t y) { return 0xFF000000u | (y << 8) | x; }
+
+static int ws_matches(const uint32_t* base, uint32_t pitch_bytes, uint32_t w, uint32_t h) {
+    for (uint32_t y = 0; y < h; y++)
+        for (uint32_t x = 0; x < w; x++)
+            if (((const uint32_t*)((const uint8_t*)base + (size_t)y * pitch_bytes))[x] != ws_px(x, y)) return 0;
+    return 1;
+}
+
+static void test_window_shared(void) {
+    stage("window_shared");
+    long f_start = vm_free_pages();
+    uint32_t id = mos_window_create(0, 20, 20, WS_W, WS_H, "os0test shared");
+    EXPECT(id != 0, "wshare_create_window", "no window");
+    if (!id) return;
+    uint32_t id2 = mos_window_create(0, 40, 40, WS_W, WS_H, "os0test copy");
+
+    /* Not mapped yet: presenting a shared buffer makes no sense. */
+    EXPECT_RET(mos_window_present_shared(id, 0, 0, 0, 0, 0), ERR(SYS_ERR_INVAL), "wshare_present_before_map_inval");
+
+    long f0 = vm_free_pages();
+    mos_window_surface_t sf;
+    memset(&sf, 0, sizeof(sf));
+    EXPECT_RET(mos_window_surface_map(id, &sf), SYS_SUCCESS, "wshare_map_frame");
+    long f1 = vm_free_pages();
+    EXPECT(sf.info.address >= VM_MMAP_BASE && (sf.info.address & (VM_PAGE - 1)) == 0, "wshare_map_address_aligned_above_2tib", "address 0x%llx", (unsigned long long)sf.info.address);
+    EXPECT(sf.info.width == WS_W && sf.info.height == WS_H && sf.info.pitch == WS_W * 4 &&
+           sf.info.buffer_count == 2 && sf.info.front == 0 && sf.info.buffer_stride >= (uint64_t)WS_W * 4 * WS_H,
+           "wshare_map_reports_geometry", "w=%u h=%u pitch=%u count=%u front=%u stride=%llu", sf.info.width, sf.info.height,
+           sf.info.pitch, sf.info.buffer_count, sf.info.front, (unsigned long long)sf.info.buffer_stride);
+    EXPECT(f0 - f1 >= 20 && f0 - f1 <= 24 + VM_PAGES_SLACK, "wshare_map_takes_frames_up_front", "used %ld pages", f0 - f1);
+    uint32_t* b0 = sf.buffer[0];
+    uint32_t* b1 = sf.buffer[1];
+    EXPECT(b0 && b1 && b1 > b0, "wshare_two_buffers", "b0=%llx b1=%llx", PTR(b0), PTR(b1));
+    if (!b0 || !b1) return;
+    EXPECT(vm_is_zero((uint8_t*)b0, WS_W * 4 * WS_H) && vm_is_zero((uint8_t*)b1, WS_W * 4 * WS_H), "wshare_buffers_start_zero", "not zero");
+
+    /* Draw into the back buffer and present it with a damage rectangle. */
+    uint32_t* back = mos_window_surface_back(&sf);
+    EXPECT(back == b1, "wshare_back_buffer_is_1_first", "back=%llx", PTR(back));
+    for (uint32_t y = 0; y < WS_H; y++)
+        for (uint32_t x = 0; x < WS_W; x++) back[y * WS_W + x] = ws_px(x, y);
+    syscall_window_info_t inf0, inf1;
+    mos_window_get_info(id, &inf0);
+    EXPECT_RET(mos_window_surface_present(id, &sf, 10, 20, 30, 40), SYS_SUCCESS, "wshare_present_with_damage");
+    mos_window_get_info(id, &inf1);
+    EXPECT(inf1.frame_version == inf0.frame_version + 1, "wshare_present_bumps_frame_version", "%u -> %u", inf0.frame_version, inf1.frame_version);
+    EXPECT(sf.info.front == 1 && mos_window_surface_back(&sf) == b0, "wshare_present_swaps_buffers", "front=%u", sf.info.front);
+    EXPECT_RET(mos_window_surface_present(id, &sf, 0, 0, 0, 0), SYS_SUCCESS, "wshare_present_whole_window");   /* now buffer 0 (zeros) is front */
+    EXPECT_RET(mos_window_present_shared(id, 1, 0, 0, 0, 0), SYS_SUCCESS, "wshare_represent_other_buffer");
+    sf.info.front = 1;
+
+    /* Second mapping of the same frames in this process. */
+    mos_window_surface_t sf2;
+    EXPECT_RET(mos_window_surface_map(id, &sf2), SYS_SUCCESS, "wshare_second_mapping");
+    EXPECT(sf2.info.address != sf.info.address && sf2.info.front == 1 && sf2.info.generation == sf.info.generation,
+           "wshare_second_mapping_other_address_same_object", "addr %llx/%llx front %u gen %u/%u", (unsigned long long)sf.info.address,
+           (unsigned long long)sf2.info.address, sf2.info.front, sf.info.generation, sf2.info.generation);
+    EXPECT(ws_matches(sf2.buffer[1], WS_W * 4, WS_W, WS_H), "wshare_second_mapping_sees_the_same_bytes", "pixels differ");
+    sf2.buffer[1][5] = 0xFF00FF00u;
+    EXPECT(sf.buffer[1][5] == 0xFF00FF00u, "wshare_write_visible_through_other_mapping", "got %08x", sf.buffer[1][5]);
+
+    /* The copy path still works on a shared window: it writes the front buffer. */
+    {
+        uint32_t* tmp = (uint32_t*)malloc(WS_W * WS_H * 4);
+        if (tmp) {
+            for (uint32_t i = 0; i < WS_W * WS_H; i++) tmp[i] = 0xFFABCDEFu;
+            EXPECT_RET(mos_window_present(id, tmp, WS_W * 4, 4, 4, 8, 8), SYS_SUCCESS, "wshare_copy_present_still_works");
+            EXPECT(sf.buffer[sf.info.front][4 * WS_W + 4] == 0xFFABCDEFu && sf.buffer[sf.info.front][12 * WS_W + 12] != 0xFFABCDEFu,
+                   "wshare_copy_present_lands_in_front_buffer", "pixel %08x", sf.buffer[sf.info.front][4 * WS_W + 4]);
+            free(tmp);
+        }
+    }
+
+    /* Invalid arguments. */
+    EXPECT_RET(mos_window_present_shared(id, 2, 0, 0, 0, 0), ERR(SYS_ERR_INVAL), "wshare_present_buffer_2_inval");
+    EXPECT_RET(mos_window_present_shared(id, 0, 100, 0, 64, 10), ERR(SYS_ERR_INVAL), "wshare_present_rect_outside_inval");
+    EXPECT_RET(mos_window_present_shared(id, 0, 0, 0, 10, 0), ERR(SYS_ERR_INVAL), "wshare_present_zero_height_inval");
+    EXPECT_RET(mos_window_present_shared(0, 0, 0, 0, 0, 0), ERR(SYS_ERR_NOTFOUND), "wshare_present_unknown_window");
+    syscall_window_shared_t junk;
+    EXPECT_RET(mos_window_map_frame(0, &junk), ERR(SYS_ERR_NOTFOUND), "wshare_map_unknown_window");
+    EXPECT_RET(mos_window_map_frame(id, NULL), ERR(SYS_ERR_INVAL), "wshare_map_null_struct_inval");
+    EXPECT_RET(mos_window_map_frame(id, (syscall_window_shared_t*)(uintptr_t)8), ERR(SYS_ERR_INVAL), "wshare_map_bad_pointer_inval");
+    EXPECT_RET(mos_window_take_damage(id, &junk), ERR(SYS_ERR_PERM), "wshare_take_damage_needs_manager");
+    if (id2) {
+        EXPECT_RET(mos_window_present_shared(id2, 0, 0, 0, 0, 0), ERR(SYS_ERR_INVAL), "wshare_copy_window_has_no_shared_frames");
+        mos_window_close(id2);
+    }
+
+    /* Protection of a shared area: whole only, never beyond what it was given. */
+    uint8_t* area = (uint8_t*)(uintptr_t)sf2.info.address;
+    size_t area_len = (size_t)(sf2.info.buffer_stride * 2);
+    EXPECT_RET(mos_vm_decommit(area, area_len), ERR(SYS_ERR_INVAL), "wshare_decommit_refused");
+    EXPECT_RET(mos_vm_protect(area, VM_PAGE, MOS_VM_PROT_READ), ERR(SYS_ERR_INVAL), "wshare_partial_protect_refused");
+    EXPECT_RET(mos_vm_protect(area, area_len, MOS_VM_PROT_RX), ERR(SYS_ERR_INVAL), "wshare_protect_exec_refused");
+    EXPECT_RET(mos_vm_protect(area, area_len, MOS_VM_PROT_READ), SYS_SUCCESS, "wshare_protect_whole_to_read");
+    EXPECT(ws_matches(sf2.buffer[1], WS_W * 4, WS_W, WS_H) || sf2.buffer[1][5] == 0xFF00FF00u, "wshare_data_survives_protect", "data lost");
+    EXPECT_RET(mos_vm_protect(area, area_len, MOS_VM_PROT_RW), SYS_SUCCESS, "wshare_protect_back_to_rw");
+    sf2.buffer[1][6] = 0x12345678u;
+    EXPECT(sf.buffer[1][6] == 0x12345678u, "wshare_write_after_protect_still_shared", "got %08x", sf.buffer[1][6]);
+    EXPECT_RET(mos_vm_unmap(area, VM_PAGE), ERR(SYS_ERR_INVAL), "wshare_partial_unmap_refused");
+    EXPECT(sf2.buffer[1][6] == 0x12345678u, "wshare_partial_unmap_changes_nothing", "mapping damaged");
+
+    /* Unmapping one mapping leaves the other (and the frames) alone. */
+    EXPECT_RET(mos_window_surface_unmap(&sf2), SYS_SUCCESS, "wshare_unmap_second_mapping");
+    EXPECT(sf.buffer[1][6] == 0x12345678u && sf.buffer[1][100] == ws_px(100, 0), "wshare_first_mapping_survives_other_unmap", "data changed");
+
+    /* Resize replaces the buffers; the old mapping stays valid but stale. */
+    mos_window_get_info(id, &inf0);
+    EXPECT_RET(mos_window_set_bounds(id, 20, 20, 160, 120), SYS_SUCCESS, "wshare_resize");
+    mos_window_surface_t sf3;
+    EXPECT_RET(mos_window_surface_map(id, &sf3), SYS_SUCCESS, "wshare_map_after_resize");
+    EXPECT(sf3.info.width == 160 && sf3.info.height == 120 && sf3.info.pitch == 640 && sf3.info.generation == sf.info.generation + 1 &&
+           sf3.info.front == 0 && sf3.info.address != sf.info.address,
+           "wshare_resize_gives_new_generation", "w=%u h=%u gen %u->%u front=%u", sf3.info.width, sf3.info.height,
+           sf.info.generation, sf3.info.generation, sf3.info.front);
+    EXPECT(sf.buffer[1][100] == ws_px(100, 0) && sf.buffer[1][WS_W + 3] == ws_px(3, 1), "wshare_old_mapping_valid_after_resize", "old data lost");
+    EXPECT(sf3.buffer[0][0] == ws_px(0, 0) && sf3.buffer[0][2 * 160 + 7] == ws_px(7, 2) && sf3.buffer[0][100 * 160 + 140] == 0,
+           "wshare_resize_keeps_overlap_in_front_buffer", "pixels %08x %08x", sf3.buffer[0][0], sf3.buffer[0][2 * 160 + 7]);
+    EXPECT_RET(mos_window_surface_present(id, &sf3, 0, 0, 160, 120), SYS_SUCCESS, "wshare_present_after_resize");
+    EXPECT_RET(mos_window_present_shared(id, 0, 150, 0, 20, 20), ERR(SYS_ERR_INVAL), "wshare_present_rect_uses_new_size");
+    EXPECT_RET(mos_window_surface_unmap(&sf), SYS_SUCCESS, "wshare_unmap_stale_mapping");
+    EXPECT_RET(mos_window_surface_unmap(&sf), ERR(SYS_ERR_INVAL), "wshare_unmap_twice_inval");
+
+    /* Closing the window does not pull the frames from under the mapping. */
+    sf3.buffer[0][1] = 0xFF010203u;
+    EXPECT_RET(mos_window_close(id), SYS_SUCCESS, "wshare_close_window");
+    EXPECT(sf3.buffer[0][1] == 0xFF010203u, "wshare_mapping_outlives_window", "data lost");
+    EXPECT_RET(mos_window_surface_unmap(&sf3), SYS_SUCCESS, "wshare_unmap_last_mapping");
+    long f_end = vm_free_pages();
+    EXPECT(f_start - f_end <= VM_PAGES_SLACK, "wshare_cycle_leaks_no_frames", "%ld pages gone", f_start - f_end);
+
+    /* Frames are freed with the last mapping, also when the mapper dies. */
+    {
+        uint32_t big_id = mos_window_create(0, 0, 0, 640, 480, "big");
+        long g0 = vm_free_pages();
+        mos_window_surface_t big;
+        if (big_id && mos_window_surface_map(big_id, &big) == SYS_SUCCESS) {
+            long g1 = vm_free_pages();
+            EXPECT(g0 - g1 >= 590 && g0 - g1 <= 600 + VM_PAGES_SLACK, "wshare_640x480_takes_600_pages", "used %ld pages", g0 - g1);
+            mos_window_close(big_id);
+            long g2 = vm_free_pages();
+            EXPECT(g2 - g1 <= VM_PAGES_SLACK, "wshare_close_keeps_frames_while_mapped", "%ld pages came back", g2 - g1);
+            mos_window_surface_unmap(&big);
+            long g3 = vm_free_pages();
+            EXPECT(g3 - g2 >= 590, "wshare_last_unmap_frees_frames", "got back %ld pages", g3 - g2);
+        } else {
+            check_fail("wshare_640x480_takes_600_pages", "map failed");
+            if (big_id) mos_window_close(big_id);
+        }
+        static const char* const modes[2] = { "win_leak", "win_crash" };
+        for (int m = 0; m < 2; m++) {
+            long h0 = vm_free_pages();
+            mos_wait_result_t r;
+            long pid = spawn_wait_stack(modes[m], NULL, 0, &r);
+            long h1 = vm_free_pages();
+            char nm[64];
+            kfmt(nm, sizeof(nm), "wshare_%s_child_ran", modes[m]);
+            EXPECT(pid > 0 && (m == 1 ? r.crashed : (!r.crashed && r.exit_code == 0)), nm, "pid=%ld crashed=%d exit=%d", pid, r.crashed, r.exit_code);
+            kfmt(nm, sizeof(nm), "wshare_%s_child_end_frees_frames", modes[m]);
+            EXPECT(h0 - h1 <= VM_PAGES_SLACK, nm, "%ld pages gone", h0 - h1);
+        }
+    }
+}
+
 /* ================================================================== SIMD
  * Register state across context switches. Each worker loads a pattern of its
  * own into the vector registers (and x87 / MXCSR), lets the kernel do things
@@ -4143,6 +4327,7 @@ int main(int argc, char** argv, char** envp) {
     test_spawn_failure_cleanup();
     test_exec_relative();
     test_vm();
+    test_window_shared();
     test_smp_threads();
     test_simd();
     test_gpu();

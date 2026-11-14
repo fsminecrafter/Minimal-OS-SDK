@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "syscall.h"
+#include "vm.h"
 
 typedef struct {
     void (*onwindowclose)(uint32_t id);
@@ -286,6 +287,113 @@ static inline uint64_t mos_window_register_manager(void) {
     syscall_window_request_t request =
         mos_window_request(SYS_WINDOW_REGISTER_MANAGER, 0);
     return mos_window_call(&request);
+}
+
+/* ------------------------------------------------------------------
+ * Shared frames: draw into the window without a copy.
+ *
+ * mos_window_map_frame() maps the window's two buffers into your address
+ * space (writable for the owner, read-only for the window manager). Draw
+ * into the back buffer, then tell the kernel it is ready with
+ * mos_window_present_shared() (buffer number + damage rectangle); the
+ * window manager shows the front buffer and recomposites only the damage.
+ * The old mos_window_present() keeps working on the same window.
+ *
+ * Each buffer holds the whole window (width * 4 bytes per row, pixels are
+ * 0xAARRGGBB), the two are `buffer_stride` bytes apart. The damage you
+ * present is the part that differs from the buffer shown before, so if you
+ * redraw only a rectangle, copy the previous front buffer into the back
+ * buffer first (or present the whole window).
+ *
+ * Resizing replaces the buffers: after SYSCALL_WINDOW_EVENT_RESIZED (or
+ * whenever `generation` changed) the old mapping still works but is stale
+ * and no longer shown; map again for the new buffers (new address, new
+ * size) and unmap the old range yourself (mos_vm_unmap, two strides). The
+ * frames are freed when the last process that mapped them unmaps them or
+ * ends, whichever comes last.
+ *
+ * Errors: SYS_ERR_NOMEM (no contiguous memory / over the 128 MiB limit),
+ * SYS_ERR_PERM (not your window and not the manager), SYS_ERR_AGAIN (the
+ * manager asked for a window that is not shared), SYS_ERR_INVAL (bad
+ * buffer number or rectangle, window not mapped yet).
+ * ------------------------------------------------------------------ */
+static inline uint64_t mos_window_map_frame(uint32_t id,
+                                            syscall_window_shared_t* shared) {
+    syscall_window_request_t request =
+        mos_window_request(SYS_WINDOW_MAP_FRAME, id);
+    request.shared = shared;
+    return mos_window_call(&request);
+}
+
+/* Buffer `buffer` is ready; x/y/width/height is what changed (0 width and
+ * height: all of it). Becomes the front buffer; draw into the other one. */
+static inline uint64_t mos_window_present_shared(uint32_t id, uint32_t buffer,
+                                                 uint32_t x, uint32_t y,
+                                                 uint32_t width,
+                                                 uint32_t height) {
+    syscall_window_request_t request =
+        mos_window_request(SYS_WINDOW_PRESENT_SHARED, id);
+    request.flags = buffer;
+    request.x = x;
+    request.y = y;
+    request.width = width;
+    request.height = height;
+    return mos_window_call(&request);
+}
+
+/* Window manager only: what changed in the window since the last call,
+ * and which buffer is in front. buffer_count 0: the window uses the copy
+ * path (damage is still reported). */
+static inline uint64_t mos_window_take_damage(uint32_t id,
+                                              syscall_window_shared_t* shared) {
+    syscall_window_request_t request =
+        mos_window_request(SYS_WINDOW_TAKE_DAMAGE, id);
+    request.shared = shared;
+    return mos_window_call(&request);
+}
+
+/* The convenient form for an application. */
+typedef struct {
+    syscall_window_shared_t info;     /* sizes, generation, front */
+    uint32_t* buffer[SYSCALL_WINDOW_SHARED_BUFFERS];
+} mos_window_surface_t;
+
+static inline uint64_t mos_window_surface_map(uint32_t id,
+                                              mos_window_surface_t* surface) {
+    uint64_t result = mos_window_map_frame(id, &surface->info);
+    if (result != SYS_SUCCESS) return result;
+    for (uint32_t i = 0; i < SYSCALL_WINDOW_SHARED_BUFFERS; i++)
+        surface->buffer[i] = (uint32_t*)(uintptr_t)(surface->info.address +
+                                         (uint64_t)i * surface->info.buffer_stride);
+    return SYS_SUCCESS;
+}
+
+/* Pixels to draw into: the buffer that is not shown. Rows are
+ * info.pitch bytes apart. */
+static inline uint32_t* mos_window_surface_back(const mos_window_surface_t* surface) {
+    return surface->buffer[surface->info.front ^ 1u];
+}
+
+/* Presents the back buffer (damage rectangle as above) and swaps. */
+static inline uint64_t mos_window_surface_present(uint32_t id,
+                                                  mos_window_surface_t* surface,
+                                                  uint32_t x, uint32_t y,
+                                                  uint32_t width,
+                                                  uint32_t height) {
+    uint32_t next = surface->info.front ^ 1u;
+    uint64_t result = mos_window_present_shared(id, next, x, y, width, height);
+    if (result == SYS_SUCCESS) surface->info.front = next;
+    return result;
+}
+
+/* Unmaps the buffers of this surface (also the stale ones after a resize). */
+static inline uint64_t mos_window_surface_unmap(mos_window_surface_t* surface) {
+    if (!surface->info.address) return SYS_ERR_INVAL;
+    uint64_t result = mos_vm_unmap((void*)(uintptr_t)surface->info.address,
+        (size_t)(surface->info.buffer_stride * SYSCALL_WINDOW_SHARED_BUFFERS));
+    surface->info.address = 0;
+    surface->buffer[0] = surface->buffer[1] = 0;
+    return result;
 }
 
 #endif
