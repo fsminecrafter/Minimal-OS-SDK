@@ -625,6 +625,8 @@ static int child_avx_probe(int wide512);
 static int child_smp(const char* mode);
 
 /* os0test.run --child <mode> [arg] */
+static int child_gpu(const char* mode);
+
 static int child_main(int argc, char** argv, char** envp) {
     const char* mode = argc > 2 ? argv[2] : "";
     long arg = argc > 3 ? parse_long(argv[3]) : 0;
@@ -638,6 +640,7 @@ static int child_main(int argc, char** argv, char** envp) {
     if (sstarts(mode, "vm_")) return child_vm(mode, arg);
     if (sstarts(mode, "torture_")) return child_torture(streq(mode, "torture_avx"), arg);
     if (sstarts(mode, "smp_")) return child_smp(mode + 4);
+    if (sstarts(mode, "gpu_")) return child_gpu(mode);
     if (streq(mode, "avx_probe")) return child_avx_probe(0);
     if (streq(mode, "avx512_probe")) return child_avx_probe(1);
     if (streq(mode, "streams")) {
@@ -3829,6 +3832,220 @@ static void test_smp_threads(void) {
     test_smp_stale_and_exit();
 }
 
+/* ===================================================== GPU (OS-4 contexts) */
+
+static long gpu_call(syscall_gpu_request_t* g) {
+    g->size = sizeof(*g);
+    if (!g->version) g->version = SYS_GPU_ABI_VERSION;
+    return mos_syscall(SYS_GPU, (long)(uintptr_t)g, 0, 0);
+}
+
+static uint32_t gpu_new_surface(uint32_t w, uint32_t h, long* res) {
+    syscall_gpu_request_t g;
+    memset(&g, 0, sizeof(g));
+    g.op = SYS_GPU_CREATE_SURFACE; g.width = w; g.height = h;
+    g.format = FGPU_FORMAT_XRGB8888; g.flags = FGPU_SURFACE_SYSTEM_MEMORY;
+    long r = gpu_call(&g);
+    if (res) *res = r;
+    return r == 0 ? g.handle : 0;
+}
+
+static uint32_t gpu_new_buffer(uint64_t bytes, long* res) {
+    syscall_gpu_request_t g;
+    memset(&g, 0, sizeof(g));
+    g.op = SYS_GPU_CREATE_BUFFER; g.bytes = bytes;
+    long r = gpu_call(&g);
+    if (res) *res = r;
+    return r == 0 ? g.handle : 0;
+}
+
+static long gpu_destroy(uint32_t op, uint32_t h) {
+    syscall_gpu_request_t g;
+    memset(&g, 0, sizeof(g));
+    g.op = op; g.handle = h;
+    return gpu_call(&g);
+}
+
+/* Clears `surf` to `color`; returns the SUBMIT result, the fence in *fence. */
+static long gpu_clear(uint32_t surf, uint32_t color, int async, uint32_t* fence) {
+    uint32_t cmd[7];
+    cmd[0] = FGPU_CMD(FGPU_OP_BIND_TARGET, 3); cmd[1] = surf; cmd[2] = 0;
+    cmd[3] = FGPU_CMD(FGPU_OP_CLEAR, 4); cmd[4] = FGPU_CLEAR_COLOR; cmd[5] = color; cmd[6] = 0;
+    syscall_gpu_request_t g;
+    memset(&g, 0, sizeof(g));
+    g.op = SYS_GPU_SUBMIT; g.data = cmd; g.bytes = sizeof(cmd);
+    g.flags = async ? FGPU_SUBMIT_ASYNC : 0;
+    long r = gpu_call(&g);
+    if (fence) *fence = g.handle;
+    return r;
+}
+
+static long gpu_wait(uint32_t fence, uint64_t timeout_ns, uint32_t* tris) {
+    syscall_gpu_request_t g;
+    memset(&g, 0, sizeof(g));
+    g.op = SYS_GPU_WAIT; g.handle = fence; g.bytes = timeout_ns;
+    long r = gpu_call(&g);
+    if (tris) *tris = g.handle;
+    return r;
+}
+
+/* The first pixel of `surf` (0xFFFFFFFF on failure). */
+static uint32_t gpu_pixel(uint32_t surf, uint32_t w, uint32_t h) {
+    static uint32_t px[256 * 256];
+    if (w * h > 256 * 256) return 0xFFFFFFFFu;
+    syscall_gpu_request_t g;
+    memset(&g, 0, sizeof(g));
+    g.op = SYS_GPU_READBACK; g.handle = surf; g.out = px; g.pitch = w * 4;
+    if (gpu_call(&g) != 0) return 0xFFFFFFFFu;
+    return px[(h - 1) * w + (w - 1)] & 0xFFFFFF;
+}
+
+typedef struct {
+    uint32_t main_buf;
+    long upload;
+    uint32_t made_surf;
+    long made;
+} gpu_thread_arg_t;
+
+static void gpu_thread(void* p) {
+    gpu_thread_arg_t* a = (gpu_thread_arg_t*)p;
+    static uint8_t data[64];
+    syscall_gpu_request_t g;
+    memset(&g, 0, sizeof(g));
+    g.op = SYS_GPU_UPLOAD_BUFFER; g.handle = a->main_buf; g.data = data; g.bytes = sizeof(data);
+    a->upload = gpu_call(&g);
+    a->made_surf = gpu_new_surface(8, 8, &a->made);
+}
+
+/* Spawned: makes objects, queues async work and ends without waiting. */
+static int child_gpu(const char* mode) {
+    uint32_t s = gpu_new_surface(256, 256, NULL);
+    for (int i = 0; i < 16; i++) gpu_new_buffer(65536, NULL);
+    uint32_t f;
+    for (int i = 0; i < 4; i++) gpu_clear(s, 0x112233u + (uint32_t)i, 1, &f);
+    if (streq(mode, "gpu_crash")) __asm__ volatile("ud2");
+    return 7;
+}
+
+static void test_gpu(void) {
+    stage("gpu");
+    syscall_gpu_request_t g;
+    memset(&g, 0, sizeof(g));
+    syscall_gpu_info_t info;
+    memset(&info, 0, sizeof(info));
+    info.size = sizeof(info);
+    g.op = SYS_GPU_INFO; g.out = &info;
+    EXPECT_RET(gpu_call(&g), SYS_SUCCESS, "gpu_info");
+    EXPECT(info.version >= 3, "gpu_abi_version_3", "version %u", info.version);
+    EXPECT(info.caps & FGPU_CAP_ASYNC, "gpu_cap_async", "caps %x", info.caps);
+
+    /* Objects belong to the program: a thread uses and makes them, and what
+     * it made outlives it. */
+    long r;
+    uint32_t buf = gpu_new_buffer(4096, &r);
+    EXPECT_RET(r, SYS_SUCCESS, "gpu_ctx_buffer_create");
+    gpu_thread_arg_t ta;
+    memset(&ta, 0, sizeof(ta));
+    ta.main_buf = buf;
+    mos_thread_t t;
+    if (mos_thread_create(&t, gpu_thread, &ta, 0) == 0) mos_thread_join(&t);
+    EXPECT_RET(ta.upload, SYS_SUCCESS, "gpu_ctx_thread_uses_main_buffer");
+    EXPECT_RET(ta.made, SYS_SUCCESS, "gpu_ctx_thread_creates_surface");
+    EXPECT(gpu_pixel(ta.made_surf, 8, 8) != 0xFFFFFFFFu, "gpu_ctx_thread_surface_outlives_thread",
+           "readback of %x failed", ta.made_surf);
+    EXPECT_RET(gpu_destroy(SYS_GPU_DESTROY_SURFACE, ta.made_surf), SYS_SUCCESS, "gpu_ctx_destroy_thread_surface");
+
+    /* Handles: stale, wrong type, garbage. */
+    EXPECT_RET(gpu_destroy(SYS_GPU_DESTROY_SURFACE, buf), ERR(SYS_ERR_NOTFOUND), "gpu_handle_wrong_type");
+    EXPECT_RET(gpu_destroy(SYS_GPU_DESTROY_BUFFER, buf), SYS_SUCCESS, "gpu_handle_destroy_buffer");
+    EXPECT_RET(gpu_destroy(SYS_GPU_DESTROY_BUFFER, buf), ERR(SYS_ERR_NOTFOUND), "gpu_handle_stale");
+    uint32_t again = gpu_new_buffer(4096, NULL);
+    EXPECT(again && again != buf, "gpu_handle_reuse_differs", "old %x new %x", buf, again);
+    EXPECT_RET(gpu_destroy(SYS_GPU_DESTROY_BUFFER, buf), ERR(SYS_ERR_NOTFOUND), "gpu_handle_stale_after_reuse");
+    gpu_destroy(SYS_GPU_DESTROY_BUFFER, again);
+    EXPECT_RET(gpu_destroy(SYS_GPU_DESTROY_BUFFER, 0x7FFFFFFFu), ERR(SYS_ERR_NOTFOUND), "gpu_handle_garbage");
+
+    /* Synchronous submit still works and reports through `handle`. */
+    uint32_t surf = gpu_new_surface(64, 64, &r);
+    EXPECT_RET(r, SYS_SUCCESS, "gpu_surface_create");
+    EXPECT_RET(gpu_clear(surf, 0x0000FF, 0, NULL), SYS_SUCCESS, "gpu_sync_submit");
+    EXPECT(gpu_pixel(surf, 64, 64) == 0x0000FF, "gpu_sync_submit_result", "pixel %x", gpu_pixel(surf, 64, 64));
+
+    /* Async: fences increase, results are seen by a later readback. */
+    uint32_t f1 = 0, f2 = 0;
+    EXPECT_RET(gpu_clear(surf, 0xFF0000, 1, &f1), SYS_SUCCESS, "gpu_async_submit");
+    EXPECT(f1 != 0, "gpu_async_fence_nonzero", "fence %u", f1);
+    EXPECT(gpu_pixel(surf, 64, 64) == 0xFF0000, "gpu_async_readback_sees_result", "pixel %x", gpu_pixel(surf, 64, 64));
+    EXPECT_RET(gpu_clear(surf, 0x00FF00, 1, &f2), SYS_SUCCESS, "gpu_async_submit_2");
+    EXPECT(f2 == f1 + 1, "gpu_async_fences_increase", "%u then %u", f1, f2);
+    EXPECT_RET(gpu_wait(f2, ~0ull, NULL), SYS_SUCCESS, "gpu_wait_fence");
+    EXPECT_RET(gpu_wait(f2, 0, NULL), SYS_SUCCESS, "gpu_wait_done_fence_no_timeout");
+    EXPECT_RET(gpu_wait(0, 0, NULL), SYS_SUCCESS, "gpu_wait_all_idle");
+    EXPECT(gpu_pixel(surf, 64, 64) == 0x00FF00, "gpu_wait_result", "pixel %x", gpu_pixel(surf, 64, 64));
+
+    /* More than the queue holds: the extra submits wait, all run in order. */
+    int ok = 1;
+    uint32_t last = 0, prev = f2;
+    for (uint32_t i = 0; i < 12; i++) {
+        uint32_t f;
+        if (gpu_clear(surf, 0x100000u * (i + 1), 1, &f) != 0 || f != prev + 1) ok = 0;
+        prev = last = f;
+    }
+    EXPECT(ok, "gpu_async_queue_backpressure", "a submit failed or fences skipped");
+    EXPECT_RET(gpu_wait(last, 5000000000ull, NULL), SYS_SUCCESS, "gpu_wait_after_backpressure");
+    EXPECT(gpu_pixel(surf, 64, 64) == 0xC00000, "gpu_async_order_kept", "pixel %x", gpu_pixel(surf, 64, 64));
+
+    /* A rejected async buffer is reported by the next WAIT, once. */
+    uint32_t bad[2] = { FGPU_CMD(0x7FFF, 2), 0 };
+    memset(&g, 0, sizeof(g));
+    g.op = SYS_GPU_SUBMIT; g.data = bad; g.bytes = sizeof(bad); g.flags = FGPU_SUBMIT_ASYNC;
+    EXPECT_RET(gpu_call(&g), SYS_SUCCESS, "gpu_async_bad_buffer_queued");
+    EXPECT_RET(gpu_wait(0, ~0ull, NULL), ERR(SYS_ERR_INVAL), "gpu_wait_reports_bad_buffer");
+    EXPECT_RET(gpu_wait(0, ~0ull, NULL), SYS_SUCCESS, "gpu_wait_error_cleared");
+    /* A version-2 request ignores the flag (runs synchronously). */
+    memset(&g, 0, sizeof(g));
+    uint32_t cmd[7] = { FGPU_CMD(FGPU_OP_BIND_TARGET, 3), surf, 0,
+                        FGPU_CMD(FGPU_OP_CLEAR, 4), FGPU_CLEAR_COLOR, 0x123456, 0 };
+    g.version = 2; g.op = SYS_GPU_SUBMIT; g.data = cmd; g.bytes = sizeof(cmd); g.flags = FGPU_SUBMIT_ASYNC;
+    EXPECT_RET(gpu_call(&g), SYS_SUCCESS, "gpu_v2_submit_flag_ignored");
+    memset(&g, 0, sizeof(g));
+    g.version = 2; g.op = SYS_GPU_WAIT;
+    EXPECT_RET(gpu_call(&g), SYS_SUCCESS, "gpu_v2_wait_harmless");
+
+    /* Quota: one program cannot take every buffer slot. */
+    static uint32_t many[4200];
+    uint32_t made = 0;
+    long last_r = 0;
+    for (uint32_t i = 0; i < 4200; i++) {
+        many[i] = gpu_new_buffer(16, &last_r);
+        if (!many[i]) break;
+        made++;
+    }
+    EXPECT(made == 4096 && last_r == ERR(SYS_ERR_NOMEM), "gpu_buffer_quota",
+           "made %u, last %ld (%s)", made, last_r, ename(last_r));
+    for (uint32_t i = 0; i < made; i++) gpu_destroy(SYS_GPU_DESTROY_BUFFER, many[i]);
+    uint32_t after = gpu_new_buffer(16, &r);
+    EXPECT_RET(r, SYS_SUCCESS, "gpu_buffer_quota_freed");
+    gpu_destroy(SYS_GPU_DESTROY_BUFFER, after);
+
+    /* Programs that end (or crash) with objects and queued work: their
+     * objects are freed, and the GPU keeps working for everyone else. */
+    mos_wait_result_t wr;
+    uint64_t free0 = mos_sysinfo_heap_free(), free1;
+    long pid = spawn_wait("gpu_exit", NULL, NULL, NULL, NULL, NULL, &wr);
+    EXPECT(pid > 0 && wr.exit_code == 7, "gpu_child_exit_with_queued_work", "pid %ld code %d", pid, (int)wr.exit_code);
+    pid = spawn_wait("gpu_crash", NULL, NULL, NULL, NULL, NULL, &wr);
+    EXPECT(pid > 0, "gpu_child_crash_with_queued_work", "pid %ld", pid);
+    for (int i = 0; i < 4; i++) spawn_wait("gpu_exit", NULL, NULL, NULL, NULL, NULL, &wr);
+    free1 = mos_sysinfo_heap_free();
+    /* 6 children x ~1.3 MB each would show; allow slack for the heap. */
+    EXPECT(free1 + 2 * 1024 * 1024 >= free0, "gpu_child_objects_freed",
+           "heap free %lu -> %lu", (unsigned long)free0, (unsigned long)free1);
+    EXPECT_RET(gpu_clear(surf, 0x00AA00, 0, NULL), SYS_SUCCESS, "gpu_works_after_children");
+    EXPECT(gpu_pixel(surf, 64, 64) == 0x00AA00, "gpu_result_after_children", "pixel %x", gpu_pixel(surf, 64, 64));
+    gpu_destroy(SYS_GPU_DESTROY_SURFACE, surf);
+}
+
 /* ================================================================== main */
 
 int main(int argc, char** argv, char** envp) {
@@ -3880,6 +4097,7 @@ int main(int argc, char** argv, char** envp) {
     test_vm();
     test_smp_threads();
     test_simd();
+    test_gpu();
 
     stage("cleanup");
     mos_chdir(g_start_cwd[0] ? g_start_cwd : "0:/");
