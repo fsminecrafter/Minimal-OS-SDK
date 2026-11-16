@@ -186,6 +186,20 @@ or from their name: `position`, `normal`, `color`, `uv` / `texcoord`
 (also with `a_`, `in_`, `a` or `in` prefixes) are 0, 1, 2 and 3.
 See [fgsl.md](fgsl.md#attributes).
 
+### Read-only shader buffers
+
+```c
+void fglBindStorageBuffer(FGLContext* gl, uint32_t binding, FGLBuffer buffer);
+```
+
+Bind a buffer to a shader declaration such as
+`layout(binding = 0) buffer vec4 lights[];`. Buffer contents are read-only
+from FGSL; each element is one 16-byte `vec4`, and the bound buffer size
+must be a multiple of 16 bytes. There are `FGL_MAX_STORAGE_BUFFERS`
+bindings. Negative and out-of-range shader indices return a zero vector.
+On the NVIDIA Turing backend, shaders that read storage buffers currently
+run on the CPU backend until native bounds-checked loads are implemented.
+
 ## State and drawing
 
 | Call | Effect |
@@ -361,7 +375,7 @@ cube with one color per face (`NULL` for the default colors);
 | Surface / texture size | 4096 × 4096 |
 | Buffer size | 16 MiB |
 | Command buffer | 1 MiB per submit (FarcadeGL grows its buffer as needed) |
-| Shader program | 2048 instructions per stage, 32 temporary vec4s, 8 varyings, 64 uniform vec4s (a `mat4` uses 4), 256 constant vec4s, 4 texture units |
+| Shader program | 2048 instructions per stage, 32 temporary vec4s, 8 varyings, 64 uniform vec4s (a `mat4` uses 4), 256 constant vec4s, 4 texture units, 4 storage-buffer bindings |
 | Objects per process | 1024 surfaces (contexts and textures), 4096 buffers, 1024 shaders; shared by the threads of a program |
 
 ## Performance
@@ -394,6 +408,7 @@ times slower. Tips:
 | `fglDraw`, `fglDrawIndexed`, `fglSubmit`, `fglPresent`, `fglReadPixels` | [State and drawing](#state-and-drawing) |
 | `fglCreateShader`, `fglShaderLog`, `fglUseShader`, `fglDestroyShader` | [Shaders](#shaders) |
 | `fglUniformLocation`, `fglUniform1f` … `fglUniform4f`, `fglUniformVec3`, `fglUniformMatrix4`, `fglUniformArray`, `fglUniformTexture` | [Uniforms](#uniforms) |
+| `fglBindStorageBuffer` | [Read-only shader buffers](#read-only-shader-buffers) |
 | `fglCreateTexture`, `fglTextureData`, `fglDestroyTexture`, `fglBindTexture` | [Textures](#textures) |
 | `fglMakeCube`, `fglMakeCubeUV` and the math functions | [Math](#math) |
 

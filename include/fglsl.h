@@ -130,7 +130,8 @@ typedef struct {
     int has_main;
     fglsl__varying varyings[FGPU_SHADER_MAX_VARYINGS];
     int nvaryings;
-    uint32_t next_uniform_reg, next_unit, attrib_mask, texture_mask, flags;
+    uint32_t next_uniform_reg, next_unit, attrib_mask, texture_mask, storage_buffer_mask;
+    uint32_t storage_buffer_stage_mask, flags;
     // return / break / continue jump lists
     uint32_t* ret_list; int* ret_n; fglsl__val ret_val; int ret_type;
     uint32_t* brk_list; int* brk_n;
@@ -682,6 +683,18 @@ static fglsl__val fglsl__postfix(fglsl_program_t* c, fglsl__val v) {
         if (fglsl__accept(c, '[')) {
             fglsl__val ix = fglsl__expr(c);
             fglsl__expect(c, ']');
+            if (v.count == -1) {
+                if (v.type != FGLSL_VEC4 || ix.type != FGLSL_FLOAT) {
+                    fglsl__error(c, "buffer indexing requires a scalar index", 0);
+                    return v;
+                }
+                fglsl__val loaded = fglsl__newtemp(c, FGLSL_VEC4);
+                fglsl__emit(c, FGPU_SOP_BUFFER_LOAD, fglsl__dst(loaded, 4), fglsl__src(ix),
+                            (uint32_t)v.index, 0);
+                loaded.fresh = 1;
+                v = loaded;
+                continue;
+            }
             int i = (int)fglsl__const_int(c, ix, "index (use a literal or a loop counter)");
             if (v.count) {
                 if (i < 0 || i >= v.count) { fglsl__error(c, "array index out of range", 0); return v; }
@@ -1429,8 +1442,8 @@ static fglsl_uniform_t* fglsl__uniform_named(fglsl_program_t* c, const char* nam
     return 0;
 }
 
-static void fglsl__global_var(fglsl_program_t* c, int qual, int type, int location) {
-    // qual: 'u' uniform, 'i' in/attribute/varying-in, 'o' out/varying-out, 0 none, 'c' const
+static void fglsl__global_var(fglsl_program_t* c, int qual, int type, int location, int binding) {
+    // qual: 'u' uniform, 'b' storage buffer, 'i' in/attribute/varying-in, 'o' out/varying-out, 0 none, 'c' const
     do {
         if (!fglsl__is(c, FGLSL__TK_ID)) { fglsl__error(c, "expected a name", 0); return; }
         char name[FGLSL_NAME_MAX];
@@ -1438,13 +1451,33 @@ static void fglsl__global_var(fglsl_program_t* c, int qual, int type, int locati
         fglsl__next(c);
         int count = 0;
         if (fglsl__accept(c, '[')) {
-            if (!fglsl__is(c, FGLSL__TK_NUM)) { fglsl__error(c, "array size must be a number", 0); return; }
-            count = (int)c->lx.num;
-            fglsl__next(c);
+            if (qual == 'b' && fglsl__is(c, ']')) {
+                count = -1;
+            } else {
+                if (!fglsl__is(c, FGLSL__TK_NUM)) { fglsl__error(c, "array size must be a number", 0); return; }
+                count = (int)c->lx.num;
+                fglsl__next(c);
+            }
             fglsl__expect(c, ']');
-            if (count < 1 || count > 64) { fglsl__error(c, "array size out of range", name); return; }
+            if (count != -1 && (count < 1 || count > 64)) { fglsl__error(c, "array size out of range", name); return; }
         }
-        if (qual == 'u') {
+        if (qual == 'b') {
+            if (type != FGLSL_VEC4 || count != -1 || binding < 0 ||
+                binding >= (int)FGPU_MAX_STORAGE_BUFFERS) {
+                fglsl__error(c, "storage buffers must be unsized vec4 arrays with a valid binding:", name);
+                return;
+            }
+            uint32_t bit = 1u << binding;
+            if (c->storage_buffer_stage_mask & bit) {
+                fglsl__error(c, "storage buffer binding declared twice:", name);
+                return;
+            }
+            c->storage_buffer_stage_mask |= bit;
+            c->storage_buffer_mask |= bit;
+            fglsl__val v = fglsl__mkval(FGPU_FILE_NONE, binding, FGLSL_VEC4);
+            v.count = -1;
+            fglsl__declare(c, name, v);
+        } else if (qual == 'u') {
             fglsl_uniform_t* u = fglsl__uniform_named(c, name);
             if (u) {
                 if (u->type != type || u->array != (uint32_t)count) {
@@ -1599,7 +1632,7 @@ static void fglsl__globals(fglsl_program_t* c) {
         if (fglsl__accept(c, ';')) continue;
         if (fglsl__isword(c, "precision")) { fglsl__skip(c); continue; }
         if (fglsl__isword(c, "struct")) { fglsl__error(c, "structs are not supported", 0); return; }
-        int qual = 0, location = -1;
+        int qual = 0, location = -1, binding = -1;
         for (;;) {
             if (fglsl__isword(c, "layout")) {
                 fglsl__next(c);
@@ -1609,12 +1642,21 @@ static void fglsl__globals(fglsl_program_t* c) {
                     fglsl__expect(c, '=');
                     if (fglsl__is(c, FGLSL__TK_NUM)) { location = (int)c->lx.num; fglsl__next(c); }
                     if (location < 0 || location >= (int)FGPU_MAX_ATTRIBS) { fglsl__error(c, "location out of range", 0); return; }
+                } else if (fglsl__isword(c, "binding")) {
+                    fglsl__next(c);
+                    fglsl__expect(c, '=');
+                    if (fglsl__is(c, FGLSL__TK_NUM)) { binding = (int)c->lx.num; fglsl__next(c); }
+                    if (binding < 0 || binding >= (int)FGPU_MAX_STORAGE_BUFFERS) {
+                        fglsl__error(c, "storage buffer binding out of range", 0);
+                        return;
+                    }
                 }
                 while (!c->err && !fglsl__is(c, ')') && !fglsl__is(c, FGLSL__TK_EOF)) fglsl__next(c);
                 fglsl__expect(c, ')');
                 continue;
             }
             if (fglsl__isword(c, "uniform")) qual = 'u';
+            else if (fglsl__isword(c, "buffer")) qual = 'b';
             else if (fglsl__isword(c, "attribute")) qual = 'i';
             else if (fglsl__isword(c, "varying")) qual = c->fragment ? 'i' : 'o';
             else if (fglsl__isword(c, "in")) qual = 'i';
@@ -1647,7 +1689,7 @@ static void fglsl__globals(fglsl_program_t* c) {
             continue;
         }
         c->lx = save;
-        fglsl__global_var(c, qual, type, location);
+        fglsl__global_var(c, qual, type, location, binding);
     }
 }
 
@@ -1658,6 +1700,7 @@ static int fglsl__stage(fglsl_program_t* c, const char* src, int fragment, uint3
     c->lx.pos = 0;
     c->lx.line = 1;
     c->count = 0;
+    c->storage_buffer_stage_mask = 0;
     c->label_pc = (uint32_t)-1;
     c->nsyms = 0;
     c->scope = 0;
@@ -1704,6 +1747,7 @@ FGLSL__API int fglsl_compile(fglsl_program_t* c, const char* vertex_src, const c
     c->next_unit = 0;
     c->attrib_mask = 0;
     c->texture_mask = 0;
+    c->storage_buffer_mask = 0;
     c->flags = 0;
     c->max_temp = 0;
     fgpu_shader_header_t h;
@@ -1729,7 +1773,7 @@ FGLSL__API int fglsl_compile(fglsl_program_t* c, const char* vertex_src, const c
     h.uniform_count = c->next_uniform_reg;
     h.texture_mask = c->texture_mask;
     h.temp_count = (uint32_t)c->max_temp;
-    h.reserved = 0;
+    h.storage_buffer_mask = c->storage_buffer_mask;
     const uint32_t* hw = (const uint32_t*)(const void*)&h;
     for (uint32_t i = 0; i < sizeof(h) / 4; i++) c->words[i] = hw[i];
     c->size = used * 4;

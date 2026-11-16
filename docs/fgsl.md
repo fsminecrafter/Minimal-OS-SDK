@@ -80,12 +80,17 @@ Constructors whose arguments are all constants are folded at compile time.
 | Declaration | Meaning |
 | --- | --- |
 | `uniform T name;` | Set by the program with `fglUniform*`. The same name in both shaders is one uniform. |
+| `layout(binding = N) buffer vec4 name[];` | Read-only storage buffer at binding 0-3; bind with `fglBindStorageBuffer`. |
 | `attribute T name;` / `in T name;` (vertex) | Per-vertex input, `float` to `vec4`. |
 | `varying T name;` / `out T name;` (vertex) | Output to the fragment shader, `float` to `vec4`, interpolated perspective-correctly. |
 | `varying T name;` / `in T name;` (fragment) | Input from the vertex shader, matched by name and type. |
 | `out vec4 name;` (fragment) | The fragment color (same as `gl_FragColor`). |
 | `const T name = expr;` | A constant; folded when the value is known at compile time. |
 | `T name;` (global or local) | A variable; starts at zero. |
+
+Storage buffers are unsized `vec4` arrays and read-only. An index is
+truncated toward zero; a negative or out-of-range index returns `(0, 0,
+0, 0)`. The bound buffer's size must be a multiple of 16 bytes.
 
 ### Attributes
 
@@ -178,6 +183,7 @@ Not available: `asin`, `acos`, `refract`, `faceforward`, derivatives
 | Uniform registers | 64 vec4 (`mat4` = 4, arrays count every element) |
 | Constants | 256 vec4 |
 | Samplers | 4 |
+| Storage-buffer bindings | 4 |
 | Attributes | 8 |
 
 The compiler reports when a shader goes over a limit

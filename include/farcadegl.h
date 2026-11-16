@@ -235,6 +235,7 @@ typedef uint32_t FGLTexture;    // a color surface; 0 = none
 #define FGL_TEXTURE_LINEAR FGPU_TEXTURE_LINEAR   // bilinear filtering (default: nearest)
 #define FGL_TEXTURE_CLAMP  FGPU_TEXTURE_CLAMP    // clamp to the edge (default: repeat)
 #define FGL_MAX_TEXTURE_UNITS FGPU_MAX_TEXTURE_UNITS
+#define FGL_MAX_STORAGE_BUFFERS FGPU_MAX_STORAGE_BUFFERS
 
 // The fgl_* uniforms FarcadeGL fills in for every shader that declares them.
 enum {
@@ -286,6 +287,8 @@ typedef struct {
     FGLTexture textures[FGPU_MAX_TEXTURE_UNITS];
     uint32_t texture_flags[FGPU_MAX_TEXTURE_UNITS];
     int textures_dirty;
+    FGLBuffer storage_buffers[FGPU_MAX_STORAGE_BUFFERS];
+    int storage_buffers_dirty;
     char shader_log[192];               // why the last fglCreateShader failed
     // present options (ABI 2 + OS-5)
     uint32_t present_flags;             // FGPU_PRESENT_SCALE2/3, FGPU_PRESENT_PACED
@@ -362,7 +365,7 @@ static inline void fgl__bind(FGLContext* gl) {
     fgl__emit(gl, FGPU_OP_BIND_TARGET, t, sizeof(t));
     // Every command buffer starts from the defaults: send state again.
     gl->state_dirty = gl->uniforms_dirty = 1;
-    gl->layout_dirty = gl->textures_dirty = 1;
+    gl->layout_dirty = gl->textures_dirty = gl->storage_buffers_dirty = 1;
     gl->uploaded = NULL;
 }
 
@@ -415,6 +418,8 @@ static inline FGLContext* fglCreateContext(const FGLContextDesc* desc) {
 
 /* ============================================================= buffers */
 
+static inline int fglSubmit(FGLContext* gl);
+
 static inline FGLBuffer fglCreateBuffer(FGLContext* gl, uint32_t bytes) {
     (void)gl;
     syscall_gpu_request_t r;
@@ -438,7 +443,10 @@ static inline int fglBufferData(FGLContext* gl, FGLBuffer buffer, uint32_t offse
 }
 
 static inline void fglDestroyBuffer(FGLContext* gl, FGLBuffer buffer) {
-    (void)gl;
+    fglSubmit(gl);
+    for (uint32_t i = 0; i < FGPU_MAX_STORAGE_BUFFERS; i++)
+        if (gl->storage_buffers[i] == buffer) gl->storage_buffers[i] = 0;
+    gl->storage_buffers_dirty = 1;
     fgl__destroy(SYS_GPU_DESTROY_BUFFER, buffer);
 }
 
@@ -562,6 +570,13 @@ static inline void fgl__flush_state(FGLContext* gl) {
             fgl__emit(gl, FGPU_OP_BIND_TEXTURE, w, sizeof(w));
         }
         gl->textures_dirty = 0;
+    }
+    if (gl->storage_buffers_dirty) {
+        for (uint32_t i = 0; i < FGPU_MAX_STORAGE_BUFFERS; i++) {
+            uint32_t w[2] = { i, gl->storage_buffers[i] };
+            fgl__emit(gl, FGPU_OP_BIND_STORAGE_BUFFER, w, sizeof(w));
+        }
+        gl->storage_buffers_dirty = 0;
     }
     if (gl->uniforms_dirty) {
         fgpu_uniforms_t u;
@@ -754,6 +769,13 @@ static inline void fglBindTexture(FGLContext* gl, uint32_t unit, FGLTexture t, u
 static inline void fglUniformTexture(FGLContext* gl, FGLShader* sh, int loc, FGLTexture t, uint32_t flags) {
     if (!sh || loc < 0 || (uint32_t)loc >= sh->uniform_count || sh->uniforms[loc].type != FGLSL_SAMPLER) return;
     fglBindTexture(gl, sh->uniforms[loc].reg, t, flags);
+}
+
+// Binds a read-only shader buffer to a binding declared with layout(binding = N).
+static inline void fglBindStorageBuffer(FGLContext* gl, uint32_t binding, FGLBuffer buffer) {
+    if (binding >= FGPU_MAX_STORAGE_BUFFERS) return;
+    gl->storage_buffers[binding] = buffer;
+    gl->storage_buffers_dirty = 1;
 }
 
 /* ====================================================== vertex layouts */
