@@ -170,8 +170,11 @@ float with vector arguments (as in GLSL).
 | `length`, `distance`, `dot`, `cross`, `normalize`, `reflect(I, N)` | |
 | `texture(sampler, uv)`, `texture2D(sampler, uv)` | Returns `vec4`, see [textures](farcadegl.md#textures). |
 
+`texture` on a mipmapped texture (see [mipmaps](farcadegl.md#mipmaps)) picks its level from the
+derivatives of the coordinate across the 2x2 pixel quad.
+
 Not available: `asin`, `acos`, `refract`, `faceforward`, derivatives
-(`dFdx`...), `texture` with a bias or LOD, matrix functions.
+(`dFdx`...), `texture` with a bias or explicit LOD (`textureLod`), matrix functions.
 
 ## Limits
 
@@ -182,7 +185,7 @@ Not available: `asin`, `acos`, `refract`, `faceforward`, derivatives
 | Varyings | 8 |
 | Uniform registers | 64 vec4 (`mat4` = 4, arrays count every element) |
 | Constants | 256 vec4 |
-| Samplers | 4 |
+| Samplers | 16 |
 | Storage-buffer bindings | 4 |
 | Attributes | 8 |
 

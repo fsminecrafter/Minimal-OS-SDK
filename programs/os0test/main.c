@@ -4278,6 +4278,295 @@ static void test_gpu(void) {
     gpu_destroy(SYS_GPU_DESTROY_SURFACE, surf);
 }
 
+/* ---- OS-6: scissor, mipmaps, 16 texture units (CPU backend, any adapter) ---- */
+
+static long gpu_submit_words(const uint32_t* cmd, uint32_t words) {
+    syscall_gpu_request_t g;
+    memset(&g, 0, sizeof(g));
+    g.op = SYS_GPU_SUBMIT; g.data = cmd; g.bytes = (uint64_t)words * 4;
+    return gpu_call(&g);
+}
+
+/* All pixels of a (at most 64 x 64) surface, 0xFFFFFFFF in px[0] on failure. */
+static uint32_t* gpu_read_all(uint32_t surf, uint32_t w, uint32_t h) {
+    static uint32_t px[64 * 64];
+    syscall_gpu_request_t g;
+    memset(&g, 0, sizeof(g));
+    g.op = SYS_GPU_READBACK; g.handle = surf; g.out = px; g.pitch = w * 4;
+    if (w * h > 64 * 64 || gpu_call(&g) != 0) { px[0] = 0xFFFFFFFFu; px[1] = 0xFFFFFFFFu; }
+    return px;
+}
+
+/* A shader program with a vertex stage (position = attribute 0, varying 0 = attribute 3, the uv)
+ * and a fragment stage that returns texture(unit, varying 0). Blob words in `out`. */
+static uint32_t gpu_tex_shader(uint32_t* out, uint32_t unit) {
+    uint32_t vs[2 * FGPU_SHADER_INSTRUCTION_WORDS] = {
+        FGPU_SOP_MOV, FGPU_DST(FGPU_FILE_OUTPUT, 0, 15), FGPU_SRC(FGPU_FILE_INPUT, 0, FGPU_SWIZZLE_XYZW), 0, 0,
+        FGPU_SOP_MOV, FGPU_DST(FGPU_FILE_OUTPUT, 1, 15), FGPU_SRC(FGPU_FILE_INPUT, 3, FGPU_SWIZZLE_XYZW), 0, 0,
+    };
+    uint32_t fs[FGPU_SHADER_INSTRUCTION_WORDS] = {
+        FGPU_SOP_TEX, FGPU_DST(FGPU_FILE_OUTPUT, 0, 15), FGPU_SRC(FGPU_FILE_INPUT, 0, FGPU_SWIZZLE_XYZW), unit, 0,
+    };
+    fgpu_shader_header_t h;
+    memset(&h, 0, sizeof(h));
+    uint32_t hw = sizeof(h) / 4;
+    h.magic = FGPU_SHADER_MAGIC; h.version = FGPU_SHADER_VERSION;
+    h.vs_offset = hw; h.vs_count = 2;
+    h.fs_offset = hw + 10; h.fs_count = 1;
+    h.const_offset = hw + 15; h.const_count = 0;
+    h.attrib_mask = 1u | (1u << 3);
+    h.varying_count = 1;
+    h.texture_mask = 1u << unit;
+    h.size = (hw + 15) * 4;
+    memcpy(out, &h, sizeof(h));
+    memcpy(out + hw, vs, sizeof(vs));
+    memcpy(out + hw + 10, fs, sizeof(fs));
+    return h.size;
+}
+
+/* Draws a size x size pixel quad at (x0, y0) of a 32 x 32 target with the texture on `unit`. */
+static long gpu_draw_textured_quad(uint32_t target, uint32_t program, uint32_t vbuf, uint32_t tex, uint32_t unit,
+                                   uint32_t flags, int x0, int y0, int size) {
+    /* attribute 0: position xyz; attribute 3: uv; stride 5 floats */
+    float c[4] = { (float)x0 / 16.0f - 1.0f, 1.0f - (float)y0 / 16.0f, (float)(x0 + size) / 16.0f - 1.0f,
+                   1.0f - (float)(y0 + size) / 16.0f };
+    float v[6][5] = {
+        { c[0], c[1], 0, 0, 0 }, { c[0], c[3], 0, 0, 1 }, { c[2], c[1], 0, 1, 0 },
+        { c[2], c[1], 0, 1, 0 }, { c[0], c[3], 0, 0, 1 }, { c[2], c[3], 0, 1, 1 },
+    };
+    syscall_gpu_request_t g;
+    memset(&g, 0, sizeof(g));
+    g.op = SYS_GPU_UPLOAD_BUFFER; g.handle = vbuf; g.data = v; g.bytes = sizeof(v);
+    long r = gpu_call(&g);
+    if (r != 0) return r;
+    uint32_t cmd[64];
+    uint32_t n = 0;
+    cmd[n++] = FGPU_CMD(FGPU_OP_BIND_TARGET, 3); cmd[n++] = target; cmd[n++] = 0;
+    cmd[n++] = FGPU_CMD(FGPU_OP_SET_SHADER, 2); cmd[n++] = program;
+    cmd[n++] = FGPU_CMD(FGPU_OP_SET_VERTEX_LAYOUT, 7); cmd[n++] = 5; cmd[n++] = 4;
+    cmd[n++] = FGPU_ATTRIB(0, 3); cmd[n++] = 0; cmd[n++] = 0; cmd[n++] = FGPU_ATTRIB(3, 2);
+    cmd[n++] = FGPU_CMD(FGPU_OP_BIND_TEXTURE, 4); cmd[n++] = unit; cmd[n++] = tex; cmd[n++] = flags;
+    cmd[n++] = FGPU_CMD(FGPU_OP_DRAW, 1 + sizeof(fgpu_draw_t) / 4);
+    fgpu_draw_t d = { vbuf, FGPU_VERTEX_LAYOUT, 0, 6, 0, 0, 0 };
+    memcpy(cmd + n, &d, sizeof(d)); n += sizeof(d) / 4;
+    return gpu_submit_words(cmd, n);
+}
+
+static void test_gpu_os6(void) {
+    stage("gpu_os6");
+    long r;
+    /* Capabilities and limits (ABI 4). */
+    syscall_gpu_info_t info;
+    memset(&info, 0, sizeof(info));
+    info.size = sizeof(info);
+    syscall_gpu_request_t g;
+    memset(&g, 0, sizeof(g));
+    g.op = SYS_GPU_INFO; g.out = &info;
+    EXPECT_RET(gpu_call(&g), SYS_SUCCESS, "gpu6_info");
+    EXPECT(info.version >= 4, "gpu6_abi_version_4", "version %u", info.version);
+    EXPECT((info.caps & (FGPU_CAP_SCISSOR | FGPU_CAP_MIPMAPS | FGPU_CAP_TEXTURE_UNITS16)) ==
+           (FGPU_CAP_SCISSOR | FGPU_CAP_MIPMAPS | FGPU_CAP_TEXTURE_UNITS16), "gpu6_caps", "caps %x", info.caps);
+    EXPECT(info.max_texture_units == FGPU_TEXTURE_UNITS && info.max_mip_levels == FGPU_MAX_MIP_LEVELS &&
+           info.max_surface_size == FGPU_MAX_SURFACE_SIZE, "gpu6_limits", "units %u mips %u size %u",
+           info.max_texture_units, info.max_mip_levels, info.max_surface_size);
+    syscall_gpu_info_t old;      /* a program built before ABI 4 passes the shorter size */
+    memset(&old, 0xAB, sizeof(old));
+    old.size = SYS_GPU_INFO_SIZE_BASE;
+    memset(&g, 0, sizeof(g));
+    g.op = SYS_GPU_INFO; g.out = &old;
+    EXPECT_RET(gpu_call(&g), SYS_SUCCESS, "gpu6_info_old_size");
+    EXPECT(old.max_texture_units == 0xABABABABu && old.size == SYS_GPU_INFO_SIZE_BASE, "gpu6_info_old_size_leaves_limits",
+           "units %x size %u", old.max_texture_units, old.size);
+    old.size = sizeof(old) + 4;
+    EXPECT_RET(gpu_call(&g), ERR(SYS_ERR_INVAL), "gpu6_info_bad_size");
+
+    /* Scissored clear: only the rectangle changes; rectangles are clipped to the target. */
+    uint32_t surf = gpu_new_surface(32, 32, &r);
+    EXPECT_RET(r, SYS_SUCCESS, "gpu6_surface");
+    uint32_t cmd[24];
+    uint32_t n = 0;
+    cmd[n++] = FGPU_CMD(FGPU_OP_BIND_TARGET, 3); cmd[n++] = surf; cmd[n++] = 0;
+    cmd[n++] = FGPU_CMD(FGPU_OP_CLEAR, 4); cmd[n++] = FGPU_CLEAR_COLOR; cmd[n++] = 0x112233; cmd[n++] = 0;
+    cmd[n++] = FGPU_CMD(FGPU_OP_SCISSOR, 6); cmd[n++] = 1; cmd[n++] = 8; cmd[n++] = 4; cmd[n++] = 16; cmd[n++] = 8;
+    cmd[n++] = FGPU_CMD(FGPU_OP_CLEAR, 4); cmd[n++] = FGPU_CLEAR_COLOR; cmd[n++] = 0xFF0000; cmd[n++] = 0;
+    EXPECT_RET(gpu_submit_words(cmd, n), SYS_SUCCESS, "gpu6_scissor_clear");
+    uint32_t* px = gpu_read_all(surf, 32, 32);
+    int bad = 0;
+    for (int y = 0; y < 32; y++)
+        for (int x = 0; x < 32; x++) {
+            int in = x >= 8 && x < 24 && y >= 4 && y < 12;
+            if ((px[y * 32 + x] & 0xFFFFFF) != (in ? 0xFF0000u : 0x112233u)) bad++;
+        }
+    EXPECT(bad == 0, "gpu6_scissor_clear_pixels", "%d pixels wrong (first %x)", bad, px[0]);
+    /* Off: the next clear covers everything again (state kept across commands, scissor off). */
+    n = 0;
+    cmd[n++] = FGPU_CMD(FGPU_OP_BIND_TARGET, 3); cmd[n++] = surf; cmd[n++] = 0;
+    cmd[n++] = FGPU_CMD(FGPU_OP_SCISSOR, 6); cmd[n++] = 1; cmd[n++] = (uint32_t)-10; cmd[n++] = (uint32_t)-10; cmd[n++] = 20; cmd[n++] = 12;
+    cmd[n++] = FGPU_CMD(FGPU_OP_CLEAR, 4); cmd[n++] = FGPU_CLEAR_COLOR; cmd[n++] = 0x00FF00; cmd[n++] = 0;
+    cmd[n++] = FGPU_CMD(FGPU_OP_SCISSOR, 6); cmd[n++] = 0; cmd[n++] = 0; cmd[n++] = 0; cmd[n++] = 1; cmd[n++] = 1;
+    cmd[n++] = FGPU_CMD(FGPU_OP_CLEAR, 4); cmd[n++] = FGPU_CLEAR_COLOR; cmd[n++] = 0x0000FF; cmd[n++] = 0;
+    EXPECT_RET(gpu_submit_words(cmd, n), SYS_SUCCESS, "gpu6_scissor_off_and_negative_origin");
+    px = gpu_read_all(surf, 32, 32);
+    EXPECT((px[0] & 0xFFFFFF) == 0x0000FF && (px[31 * 32 + 31] & 0xFFFFFF) == 0x0000FF, "gpu6_scissor_off_clears_all",
+           "px %x %x", px[0], px[31 * 32 + 31]);
+    /* Clipped rectangle (x < 0, y < 0), scissor enabled for a clear that is then the whole thing. */
+    n = 0;
+    cmd[n++] = FGPU_CMD(FGPU_OP_BIND_TARGET, 3); cmd[n++] = surf; cmd[n++] = 0;
+    cmd[n++] = FGPU_CMD(FGPU_OP_CLEAR, 4); cmd[n++] = FGPU_CLEAR_COLOR; cmd[n++] = 0x000000; cmd[n++] = 0;
+    cmd[n++] = FGPU_CMD(FGPU_OP_SCISSOR, 6); cmd[n++] = 1; cmd[n++] = (uint32_t)-10; cmd[n++] = (uint32_t)-10; cmd[n++] = 20; cmd[n++] = 12;
+    cmd[n++] = FGPU_CMD(FGPU_OP_CLEAR, 4); cmd[n++] = FGPU_CLEAR_COLOR; cmd[n++] = 0x00FF00; cmd[n++] = 0;
+    EXPECT_RET(gpu_submit_words(cmd, n), SYS_SUCCESS, "gpu6_scissor_negative_origin");
+    px = gpu_read_all(surf, 32, 32);
+    EXPECT((px[0] & 0xFFFFFF) == 0x00FF00 && (px[1 * 32 + 9] & 0xFFFFFF) == 0x00FF00 && (px[1 * 32 + 10] & 0xFFFFFF) == 0 &&
+           (px[2 * 32 + 5] & 0xFFFFFF) == 0 && (px[1 * 32 + 0] & 0xFFFFFF) == 0x00FF00, "gpu6_scissor_negative_origin_pixels",
+           "px %x %x %x", px[0], px[1 * 32 + 9], px[1 * 32 + 10]);
+    /* An empty rectangle clears nothing; a negative size is refused. */
+    n = 0;
+    cmd[n++] = FGPU_CMD(FGPU_OP_BIND_TARGET, 3); cmd[n++] = surf; cmd[n++] = 0;
+    cmd[n++] = FGPU_CMD(FGPU_OP_SCISSOR, 6); cmd[n++] = 1; cmd[n++] = 4; cmd[n++] = 4; cmd[n++] = 0; cmd[n++] = 10;
+    cmd[n++] = FGPU_CMD(FGPU_OP_CLEAR, 4); cmd[n++] = FGPU_CLEAR_COLOR; cmd[n++] = 0xABCDEF; cmd[n++] = 0;
+    EXPECT_RET(gpu_submit_words(cmd, n), SYS_SUCCESS, "gpu6_scissor_empty_rect");
+    px = gpu_read_all(surf, 32, 32);
+    EXPECT((px[4 * 32 + 4] & 0xFFFFFF) != 0xABCDEF, "gpu6_scissor_empty_rect_clears_nothing", "px %x", px[4 * 32 + 4]);
+    cmd[3] = FGPU_CMD(FGPU_OP_SCISSOR, 6); cmd[4] = 1; cmd[5] = 0; cmd[6] = 0; cmd[7] = (uint32_t)-1; cmd[8] = 4;
+    EXPECT_RET(gpu_submit_words(cmd, 9), ERR(SYS_ERR_INVAL), "gpu6_scissor_negative_size");
+    cmd[3] = FGPU_CMD(FGPU_OP_SCISSOR, 5);
+    EXPECT_RET(gpu_submit_words(cmd, 8), ERR(SYS_ERR_INVAL), "gpu6_scissor_short_command");
+
+    /* Textures: a mip chain, per-level uploads, generation, level selection by quad derivatives. */
+    uint32_t prog_words[64];
+    uint32_t prog_bytes = gpu_tex_shader(prog_words, 0);
+    syscall_gpu_request_t pg;
+    memset(&pg, 0, sizeof(pg));
+    pg.op = SYS_GPU_CREATE_PROGRAM; pg.data = prog_words; pg.bytes = prog_bytes;
+    long pr = gpu_call(&pg);
+    EXPECT_RET(pr, SYS_SUCCESS, "gpu6_create_texture_program");
+    uint32_t prog = pr == 0 ? pg.handle : 0;
+    uint32_t vbuf = gpu_new_buffer(4096, &r);
+    EXPECT_RET(r, SYS_SUCCESS, "gpu6_vertex_buffer");
+
+    memset(&g, 0, sizeof(g));
+    g.op = SYS_GPU_CREATE_SURFACE; g.width = 16; g.height = 16; g.format = FGPU_FORMAT_XRGB8888; g.flags = FGPU_SURFACE_MIPMAPS;
+    EXPECT_RET(gpu_call(&g), SYS_SUCCESS, "gpu6_create_mip_surface");
+    uint32_t mtex = g.handle;
+    static uint32_t level[16 * 16];
+    for (int i = 0; i < 16 * 16; i++) level[i] = 0xFFFF0000u;
+    memset(&g, 0, sizeof(g));
+    g.op = SYS_GPU_WRITE_SURFACE; g.handle = mtex; g.data = level; g.pitch = 64;
+    EXPECT_RET(gpu_call(&g), SYS_SUCCESS, "gpu6_write_level0");
+    /* Generate levels 1..4 from level 0, then replace level 2 (4 x 4) with green. */
+    uint32_t gcmd[2] = { FGPU_CMD(FGPU_OP_GENERATE_MIPMAPS, 2), mtex };
+    EXPECT_RET(gpu_submit_words(gcmd, 2), SYS_SUCCESS, "gpu6_generate_mipmaps");
+    for (int i = 0; i < 16; i++) level[i] = 0xFF00FF00u;
+    memset(&g, 0, sizeof(g));
+    g.op = SYS_GPU_WRITE_SURFACE; g.handle = mtex; g.offset = 2; g.data = level; g.pitch = 16;
+    EXPECT_RET(gpu_call(&g), SYS_SUCCESS, "gpu6_write_level2");
+    g.offset = 4; g.pitch = 4;
+    EXPECT_RET(gpu_call(&g), SYS_SUCCESS, "gpu6_write_level4_1x1");
+    g.offset = 5; g.pitch = 4;
+    EXPECT_RET(gpu_call(&g), ERR(SYS_ERR_INVAL), "gpu6_write_level_out_of_range");
+    for (int i = 0; i < 16; i++) level[i] = 0xFF0000FFu;     /* level 4 (1 x 1) back to blue */
+    g.offset = 4;
+    gpu_call(&g);
+    uint32_t flat = gpu_new_surface(16, 16, &r);       /* no chain */
+    gcmd[1] = flat;
+    EXPECT_RET(gpu_submit_words(gcmd, 2), ERR(SYS_ERR_INVAL), "gpu6_generate_needs_a_chain");
+    gpu_destroy(SYS_GPU_DESTROY_SURFACE, flat);
+
+    uint32_t tgt = gpu_new_surface(32, 32, &r);
+    if (prog && vbuf && tgt) {
+        /* 16 x 16 pixels for 16 texels: level 0 (red). 4 x 4 pixels: lod 2 (green). 1 x 1: lod 4 (blue). */
+        static const struct { int size, x, y; uint32_t want; } cases[] = {
+            { 16, 4, 4, 0xFF0000u }, { 4, 6, 6, 0x00FF00u }, { 8, 2, 2, 0xFF0000u /* level 1 = generated red */ }, { 1, 10, 10, 0x0000FFu },
+        };
+        for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            gpu_clear(tgt, 0x000000, 0, NULL);
+            long dr = gpu_draw_textured_quad(tgt, prog, vbuf, mtex, 0, FGPU_TEXTURE_MIP_NEAREST, cases[i].x, cases[i].y, cases[i].size);
+            px = gpu_read_all(tgt, 32, 32);
+            char nm[64]; kfmt(nm, sizeof(nm), "gpu6_mip_quad_%d_pixels", cases[i].size);
+            uint32_t got = px[(cases[i].y + cases[i].size / 2) * 32 + cases[i].x + cases[i].size / 2] & 0xFFFFFF;
+            EXPECT(dr == 0 && got == cases[i].want, nm, "draw %ld pixel %x expected %x", dr, got, cases[i].want);
+        }
+        /* The same quad without a MIP flag samples level 0 whatever the size. */
+        gpu_clear(tgt, 0x000000, 0, NULL);
+        gpu_draw_textured_quad(tgt, prog, vbuf, mtex, 0, 0, 6, 6, 4);
+        px = gpu_read_all(tgt, 32, 32);
+        EXPECT((px[8 * 32 + 8] & 0xFFFFFF) == 0xFF0000, "gpu6_no_mip_flag_samples_level0", "pixel %x", px[8 * 32 + 8]);
+        /* Scissor on a textured draw: only the rectangle gets the quad. */
+        gpu_clear(tgt, 0x000000, 0, NULL);
+        {
+            uint32_t sc[6] = { FGPU_CMD(FGPU_OP_SCISSOR, 6), 1, 12, 12, 8, 8 };
+            float c0 = -1.0f;
+            (void)c0;
+            /* full-target quad, scissored to (12,12) 8 x 8: submit scissor first, then the draw buffer reuses the state?
+             * State belongs to the buffer: build one buffer with both. */
+            float v[6][5] = { { -1, 1, 0, 0, 0 }, { -1, -1, 0, 0, 1 }, { 1, 1, 0, 1, 0 }, { 1, 1, 0, 1, 0 }, { -1, -1, 0, 0, 1 }, { 1, -1, 0, 1, 1 } };
+            syscall_gpu_request_t u;
+            memset(&u, 0, sizeof(u));
+            u.op = SYS_GPU_UPLOAD_BUFFER; u.handle = vbuf; u.data = v; u.bytes = sizeof(v);
+            gpu_call(&u);
+            uint32_t cm[40];
+            uint32_t k = 0;
+            cm[k++] = FGPU_CMD(FGPU_OP_BIND_TARGET, 3); cm[k++] = tgt; cm[k++] = 0;
+            for (int i = 0; i < 6; i++) cm[k++] = sc[i];
+            cm[k++] = FGPU_CMD(FGPU_OP_SET_SHADER, 2); cm[k++] = prog;
+            cm[k++] = FGPU_CMD(FGPU_OP_SET_VERTEX_LAYOUT, 7); cm[k++] = 5; cm[k++] = 4;
+            cm[k++] = FGPU_ATTRIB(0, 3); cm[k++] = 0; cm[k++] = 0; cm[k++] = FGPU_ATTRIB(3, 2);
+            cm[k++] = FGPU_CMD(FGPU_OP_BIND_TEXTURE, 4); cm[k++] = 0; cm[k++] = mtex; cm[k++] = FGPU_TEXTURE_MIP_NEAREST;
+            cm[k++] = FGPU_CMD(FGPU_OP_DRAW, 1 + sizeof(fgpu_draw_t) / 4);
+            fgpu_draw_t d = { vbuf, FGPU_VERTEX_LAYOUT, 0, 6, 0, 0, 0 };
+            memcpy(cm + k, &d, sizeof(d)); k += sizeof(d) / 4;
+            EXPECT_RET(gpu_submit_words(cm, k), SYS_SUCCESS, "gpu6_scissored_draw");
+            px = gpu_read_all(tgt, 32, 32);
+            int wrong = 0;
+            for (int y = 0; y < 32; y++)
+                for (int x = 0; x < 32; x++) {
+                    int in = x >= 12 && x < 20 && y >= 12 && y < 20;
+                    if (in == ((px[y * 32 + x] & 0xFFFFFF) == 0)) wrong++;   /* inside: drawn (nonzero); outside: untouched */
+                }
+            EXPECT(wrong == 0, "gpu6_scissored_draw_pixels", "%d pixels wrong", wrong);
+        }
+    }
+
+    /* 16 texture units: a texture on unit 15 only. */
+    uint32_t prog15_words[64];
+    uint32_t prog15_bytes = gpu_tex_shader(prog15_words, 15);
+    memset(&pg, 0, sizeof(pg));
+    pg.op = SYS_GPU_CREATE_PROGRAM; pg.data = prog15_words; pg.bytes = prog15_bytes;
+    EXPECT_RET(gpu_call(&pg), SYS_SUCCESS, "gpu6_create_unit15_program");
+    uint32_t prog15 = pg.handle;
+    uint32_t t15 = gpu_new_surface(4, 4, &r);
+    static uint32_t blue[16];
+    for (int i = 0; i < 16; i++) blue[i] = 0xFF2040C0u;
+    memset(&g, 0, sizeof(g));
+    g.op = SYS_GPU_WRITE_SURFACE; g.handle = t15; g.data = blue; g.pitch = 16;
+    EXPECT_RET(gpu_call(&g), SYS_SUCCESS, "gpu6_write_unit15_texture");
+    if (tgt && vbuf && prog15 && t15) {
+        gpu_clear(tgt, 0x000000, 0, NULL);
+        long dr = gpu_draw_textured_quad(tgt, prog15, vbuf, t15, 15, 0, 8, 8, 8);
+        px = gpu_read_all(tgt, 32, 32);
+        EXPECT(dr == 0 && (px[12 * 32 + 12] & 0xFFFFFF) == 0x2040C0, "gpu6_texture_unit_15", "draw %ld pixel %x", dr, px[12 * 32 + 12]);
+        uint32_t bad_unit[4] = { FGPU_CMD(FGPU_OP_BIND_TEXTURE, 4), FGPU_TEXTURE_UNITS, t15, 0 };
+        EXPECT_RET(gpu_submit_words(bad_unit, 4), ERR(SYS_ERR_INVAL), "gpu6_texture_unit_16_rejected");
+    }
+    /* Mip chains need ABI 4 and a color surface. */
+    memset(&g, 0, sizeof(g));
+    g.op = SYS_GPU_CREATE_SURFACE; g.width = 16; g.height = 16; g.format = FGPU_FORMAT_DEPTH32F; g.flags = FGPU_SURFACE_MIPMAPS;
+    EXPECT_RET(gpu_call(&g), ERR(SYS_ERR_INVAL), "gpu6_mips_on_depth_rejected");
+    memset(&g, 0, sizeof(g));
+    g.version = 3; g.op = SYS_GPU_CREATE_SURFACE; g.width = 16; g.height = 16; g.format = FGPU_FORMAT_XRGB8888; g.flags = FGPU_SURFACE_MIPMAPS;
+    EXPECT_RET(gpu_call(&g), SYS_SUCCESS, "gpu6_v3_mip_flag_ignored");
+    gpu_destroy(SYS_GPU_DESTROY_SURFACE, g.handle);
+
+    gpu_destroy(SYS_GPU_DESTROY_SURFACE, t15);
+    gpu_destroy(SYS_GPU_DESTROY_SURFACE, tgt);
+    gpu_destroy(SYS_GPU_DESTROY_SURFACE, mtex);
+    gpu_destroy(SYS_GPU_DESTROY_SURFACE, surf);
+    gpu_destroy(SYS_GPU_DESTROY_BUFFER, vbuf);
+    if (prog) gpu_destroy(SYS_GPU_DESTROY_PROGRAM, prog);
+    if (prog15) gpu_destroy(SYS_GPU_DESTROY_PROGRAM, prog15);
+}
+
 /* GPU present into a window: the first converts it to shared frames, the
  * next goes straight into its back buffer; the copy path still works on it,
  * and a resized window is presented into its new buffers. */
@@ -4395,6 +4684,7 @@ int main(int argc, char** argv, char** envp) {
     test_smp_threads();
     test_simd();
     test_gpu();
+    test_gpu_os6();
     test_gpu_window_present();
 
     stage("cleanup");

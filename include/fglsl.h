@@ -1492,7 +1492,7 @@ static void fglsl__global_var(fglsl_program_t* c, int qual, int type, int locati
                 u->array = (uint32_t)count;
                 if (type == FGLSL_SAMPLER) {
                     if (count) { fglsl__error(c, "sampler arrays are not supported", 0); return; }
-                    if (c->next_unit >= FGPU_MAX_TEXTURE_UNITS) { fglsl__error(c, "too many samplers", 0); return; }
+                    if (c->next_unit >= FGPU_TEXTURE_UNITS) { fglsl__error(c, "too many samplers", 0); return; }
                     u->reg = c->next_unit++;
                     u->regs = 0;
                 } else {
