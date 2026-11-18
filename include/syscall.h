@@ -400,9 +400,15 @@ typedef struct {
     uint32_t buttons;
     int32_t wheel;
     uint8_t mods;
+    // KEY events: reserved[0] is 1 on a key-down the window manager repeats
+    // while the key is held (see SYSCALL_WINDOW_KEY_IS_REPEAT). Others: 0.
     uint8_t reserved[3];
     uint32_t time_ms;
 } syscall_window_event_t;
+
+// True for an auto-repeated key-down; programs that act on presses only
+// (toggles, game actions) skip these, text input takes them.
+#define SYSCALL_WINDOW_KEY_IS_REPEAT(ev) ((ev)->reserved[0] != 0)
 
 typedef struct {
     uint32_t width;

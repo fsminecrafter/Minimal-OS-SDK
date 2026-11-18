@@ -236,6 +236,13 @@ Event types:
   merged (only the newest resize is kept), and consecutive mouse moves with
   the same buttons are merged, so a slow program loses detail but not
   clicks. Drain the queue every frame.
+- Key repeat: while a key is held, the window manager (mosWM) sends it
+  again as a key-down (`buttons` 1) after about 420 ms, then about 30
+  times a second, until it is released. These repeats have
+  `reserved[0] == 1`; `SYSCALL_WINDOW_KEY_IS_REPEAT(&ev)` tests it. Text
+  input should take them; toggles and game actions that should happen once
+  per press skip them. Modifier keys never repeat. easyui apps get the
+  repeats as ordinary `ONKEY` calls.
 - Common HID codes: `a`-`z` 4-29, `1`-`9` 30-38, `0` 39, Enter 40,
   Escape 41, Backspace 42, Tab 43, Space 44, Right 79, Left 80, Down 81,
   Up 82.
