@@ -202,6 +202,7 @@ typedef uint32_t FGLSurface;
 #define FGL_CULL_FACE   (1u << 1)   // cull back faces (counter-clockwise = front)
 #define FGL_WIREFRAME   (1u << 2)
 #define FGL_BLEND       (1u << 3)   // color = src * src.a + dst * (1 - src.a)
+#define FGL_SCISSOR_TEST (1u << 4)  // draws and clears only touch the fglScissor rectangle (top-left origin)
 
 #define FGL_PROGRAM_COLOR   FGPU_PROGRAM_COLOR
 #define FGL_PROGRAM_GOURAUD FGPU_PROGRAM_GOURAUD
@@ -234,7 +235,13 @@ typedef uint32_t FGLTexture;    // a color surface; 0 = none
 
 #define FGL_TEXTURE_LINEAR FGPU_TEXTURE_LINEAR   // bilinear filtering (default: nearest)
 #define FGL_TEXTURE_CLAMP  FGPU_TEXTURE_CLAMP    // clamp to the edge (default: repeat)
-#define FGL_MAX_TEXTURE_UNITS FGPU_MAX_TEXTURE_UNITS
+// Mip filters (textures made with fglCreateTextureMips; others ignore them). Together with
+// FGL_TEXTURE_LINEAR they are GL's NEAREST/LINEAR_MIPMAP_NEAREST/LINEAR; see "Mipmaps" in fgpu_abi.h.
+#define FGL_TEXTURE_MIP_NEAREST FGPU_TEXTURE_MIP_NEAREST   // pick the nearest level
+#define FGL_TEXTURE_MIP_LINEAR  FGPU_TEXTURE_MIP_LINEAR    // blend the two nearest levels
+#define FGL_TEXTURE_TRILINEAR   (FGPU_TEXTURE_LINEAR | FGPU_TEXTURE_MIP_LINEAR)
+#define FGL_MAX_TEXTURE_UNITS FGPU_TEXTURE_UNITS
+#define FGL_MAX_STORAGE_BUFFERS FGPU_MAX_STORAGE_BUFFERS
 
 // The fgl_* uniforms FarcadeGL fills in for every shader that declares them.
 enum {
@@ -283,9 +290,14 @@ typedef struct {
     uint32_t layout_count;
     uint32_t layout[FGPU_MAX_ATTRIBS];
     int layout_dirty;
-    FGLTexture textures[FGPU_MAX_TEXTURE_UNITS];
-    uint32_t texture_flags[FGPU_MAX_TEXTURE_UNITS];
+    FGLTexture textures[FGPU_TEXTURE_UNITS];
+    uint32_t texture_flags[FGPU_TEXTURE_UNITS];
+    float texture_lod[FGPU_TEXTURE_UNITS][3];   // bias, min, max (see fglBindTextureLod)
+    int32_t scissor[4];                 // x, y, width, height (fglScissor), top-left origin
+    int scissor_dirty;
     int textures_dirty;
+    FGLBuffer storage_buffers[FGPU_MAX_STORAGE_BUFFERS];
+    int storage_buffers_dirty;
     char shader_log[192];               // why the last fglCreateShader failed
     // present options (ABI 2 + OS-5)
     uint32_t present_flags;             // FGPU_PRESENT_SCALE2/3, FGPU_PRESENT_PACED
@@ -301,6 +313,7 @@ static inline uint64_t fgl__call(syscall_gpu_request_t* r) {
 }
 
 // Fills *info about the GPU. Returns 0 on success.
+// The limits block (max_texture_units ...) is filled in for kernels without it too.
 static inline int fglGetDeviceInfo(syscall_gpu_info_t* info) {
     memset(info, 0, sizeof(*info));
     info->size = sizeof(*info);
@@ -308,7 +321,19 @@ static inline int fglGetDeviceInfo(syscall_gpu_info_t* info) {
     memset(&r, 0, sizeof(r));
     r.op = SYS_GPU_INFO;
     r.out = info;
-    return fgl__call(&r) == SYS_SUCCESS ? 0 : -1;
+    if (fgl__call(&r) == SYS_SUCCESS) return 0;
+    // A kernel from before ABI 4 only knows the shorter structure (and ABI 3 requests).
+    memset(info, 0, sizeof(*info));
+    info->size = SYS_GPU_INFO_SIZE_BASE;
+    if (fgl__call(&r) != SYS_SUCCESS) return -1;
+    info->size = sizeof(*info);
+    info->max_texture_units = FGPU_MAX_TEXTURE_UNITS;
+    info->max_varyings = FGPU_SHADER_MAX_VARYINGS;
+    info->max_uniform_vec4 = FGPU_SHADER_MAX_UNIFORMS;
+    info->max_storage_buffers = FGPU_MAX_STORAGE_BUFFERS;
+    info->max_surface_size = FGPU_MAX_SURFACE_SIZE;
+    info->max_buffer_bytes = FGPU_MAX_BUFFER_BYTES;
+    return 0;
 }
 
 // FarcadeGL can auto-detect the 3D pipeline from the kernel's GPU info.
@@ -320,6 +345,17 @@ static inline int fglHasHardware3D(void) {
 static inline int fglHasShaders(void) {
     syscall_gpu_info_t info;
     return fglGetDeviceInfo(&info) == 0 && (info.caps & FGPU_CAP_SHADERS) != 0;
+}
+
+// Scissor test (fglScissor) and mipmapped textures (fglCreateTextureMips): FGPU_CAP_SCISSOR / FGPU_CAP_MIPMAPS.
+static inline int fglHasScissor(void) {
+    syscall_gpu_info_t info;
+    return fglGetDeviceInfo(&info) == 0 && (info.caps & FGPU_CAP_SCISSOR) != 0;
+}
+
+static inline int fglHasMipmaps(void) {
+    syscall_gpu_info_t info;
+    return fglGetDeviceInfo(&info) == 0 && (info.caps & FGPU_CAP_MIPMAPS) != 0;
 }
 
 static inline FGLSurface fgl__surface(uint32_t w, uint32_t h, uint32_t format, uint32_t flags) {
@@ -362,7 +398,8 @@ static inline void fgl__bind(FGLContext* gl) {
     fgl__emit(gl, FGPU_OP_BIND_TARGET, t, sizeof(t));
     // Every command buffer starts from the defaults: send state again.
     gl->state_dirty = gl->uniforms_dirty = 1;
-    gl->layout_dirty = gl->textures_dirty = 1;
+    gl->layout_dirty = gl->textures_dirty = gl->storage_buffers_dirty = 1;
+    gl->scissor_dirty = (gl->enabled & FGL_SCISSOR_TEST) != 0;     // the kernel starts with it off
     gl->uploaded = NULL;
 }
 
@@ -403,6 +440,8 @@ static inline FGLContext* fglCreateContext(const FGLContextDesc* desc) {
         return NULL;
     }
     gl->model = gl->view = gl->projection = fglIdentity();
+    gl->scissor[2] = (int32_t)desc->width;      // the whole render target until fglScissor
+    gl->scissor[3] = (int32_t)desc->height;
     gl->program = FGL_PROGRAM_COLOR;
     gl->light_dir = fglNormalize(fglVec3(-0.4f, -0.7f, -0.6f));
     gl->light_color = fglVec3(1, 1, 1);
@@ -414,6 +453,8 @@ static inline FGLContext* fglCreateContext(const FGLContextDesc* desc) {
 }
 
 /* ============================================================= buffers */
+
+static inline int fglSubmit(FGLContext* gl);
 
 static inline FGLBuffer fglCreateBuffer(FGLContext* gl, uint32_t bytes) {
     (void)gl;
@@ -438,14 +479,44 @@ static inline int fglBufferData(FGLContext* gl, FGLBuffer buffer, uint32_t offse
 }
 
 static inline void fglDestroyBuffer(FGLContext* gl, FGLBuffer buffer) {
-    (void)gl;
+    fglSubmit(gl);
+    for (uint32_t i = 0; i < FGPU_MAX_STORAGE_BUFFERS; i++)
+        if (gl->storage_buffers[i] == buffer) gl->storage_buffers[i] = 0;
+    gl->storage_buffers_dirty = 1;
     fgl__destroy(SYS_GPU_DESTROY_BUFFER, buffer);
 }
 
 /* =============================================================== state */
 
-static inline void fglEnable(FGLContext* gl, uint32_t caps) { gl->enabled |= caps; gl->state_dirty = 1; }
-static inline void fglDisable(FGLContext* gl, uint32_t caps) { gl->enabled &= ~caps; gl->state_dirty = 1; }
+static inline void fglEnable(FGLContext* gl, uint32_t caps) {
+    if ((caps & FGL_SCISSOR_TEST) && !(gl->enabled & FGL_SCISSOR_TEST)) gl->scissor_dirty = 1;
+    gl->enabled |= caps;
+    gl->state_dirty = 1;
+}
+static inline void fglDisable(FGLContext* gl, uint32_t caps) {
+    if ((caps & FGL_SCISSOR_TEST) && (gl->enabled & FGL_SCISSOR_TEST)) gl->scissor_dirty = 1;
+    gl->enabled &= ~caps;
+    gl->state_dirty = 1;
+}
+
+// The rectangle FGL_SCISSOR_TEST limits draws and clears to, in pixels of the render target.
+// The origin is the TOP-LEFT pixel and y grows downward, like fglViewport. Negative x, y and
+// parts outside the target are clipped; a zero width or height draws nothing; a negative size
+// makes the next fglSubmit fail. By default it is the whole target. The test costs nothing per
+// pixel (the rectangle only shrinks the area that is rasterized).
+static inline void fglScissor(FGLContext* gl, int32_t x, int32_t y, int32_t w, int32_t h) {
+    gl->scissor[0] = x; gl->scissor[1] = y; gl->scissor[2] = w; gl->scissor[3] = h;
+    gl->scissor_dirty = 1;
+}
+
+// Sends the scissor state when it changed (clears and draws both read it).
+static inline void fgl__flush_scissor(FGLContext* gl) {
+    if (!gl->scissor_dirty) return;
+    uint32_t w[5] = { (gl->enabled & FGL_SCISSOR_TEST) ? 1u : 0u, (uint32_t)gl->scissor[0], (uint32_t)gl->scissor[1],
+                      (uint32_t)gl->scissor[2], (uint32_t)gl->scissor[3] };
+    fgl__emit(gl, FGPU_OP_SCISSOR, w, sizeof(w));
+    gl->scissor_dirty = 0;
+}
 // Selects a built-in program (and stops using a shader).
 static inline void fglUseProgram(FGLContext* gl, uint32_t program) {
     gl->program = program;
@@ -484,6 +555,7 @@ static inline void fglClear(FGLContext* gl, uint32_t bits) {
     uint32_t g = (uint32_t)(gl->clear_color[1] * 255.0f + 0.5f) & 0xFF;
     uint32_t b = (uint32_t)(gl->clear_color[2] * 255.0f + 0.5f) & 0xFF;
     float depth = 1.0f;
+    fgl__flush_scissor(gl);         // with FGL_SCISSOR_TEST only the rectangle is cleared
     uint32_t p[3] = { bits, (r << 16) | (g << 8) | b, 0 };
     memcpy(&p[2], &depth, 4);
     fgl__emit(gl, FGPU_OP_CLEAR, p, sizeof(p));
@@ -533,6 +605,7 @@ static inline void fgl__builtin_uniforms(FGLContext* gl, FGLShader* sh, const fg
 }
 
 static inline void fgl__flush_state(FGLContext* gl) {
+    fgl__flush_scissor(gl);
     if (gl->state_dirty) {
         uint32_t s = 0;
         if (gl->enabled & FGL_DEPTH_TEST) s |= FGPU_STATE_DEPTH_TEST | FGPU_STATE_DEPTH_WRITE;
@@ -556,12 +629,21 @@ static inline void fgl__flush_state(FGLContext* gl) {
         gl->layout_dirty = 0;
     }
     if (gl->textures_dirty) {
-        for (uint32_t i = 0; i < FGPU_MAX_TEXTURE_UNITS; i++) {
+        for (uint32_t i = 0; i < FGPU_TEXTURE_UNITS; i++) {
             if (!gl->textures[i]) continue;
-            uint32_t w[3] = { i, gl->textures[i], gl->texture_flags[i] };
-            fgl__emit(gl, FGPU_OP_BIND_TEXTURE, w, sizeof(w));
+            uint32_t w[6] = { i, gl->textures[i], gl->texture_flags[i], 0, 0, 0 };
+            memcpy(&w[3], gl->texture_lod[i], sizeof(gl->texture_lod[i]));
+            int lod = gl->texture_lod[i][0] != 0.0f || gl->texture_lod[i][1] != 0.0f || gl->texture_lod[i][2] != 0.0f;
+            fgl__emit(gl, FGPU_OP_BIND_TEXTURE, w, lod ? sizeof(w) : 3 * sizeof(uint32_t));
         }
         gl->textures_dirty = 0;
+    }
+    if (gl->storage_buffers_dirty) {
+        for (uint32_t i = 0; i < FGPU_MAX_STORAGE_BUFFERS; i++) {
+            uint32_t w[2] = { i, gl->storage_buffers[i] };
+            fgl__emit(gl, FGPU_OP_BIND_STORAGE_BUFFER, w, sizeof(w));
+        }
+        gl->storage_buffers_dirty = 0;
     }
     if (gl->uniforms_dirty) {
         fgpu_uniforms_t u;
@@ -733,16 +815,65 @@ static inline int fglTextureData(FGLContext* gl, FGLTexture t, const uint32_t* p
 
 static inline void fglDestroyTexture(FGLContext* gl, FGLTexture t) {
     fglSubmit(gl);
-    for (uint32_t i = 0; i < FGPU_MAX_TEXTURE_UNITS; i++)
+    for (uint32_t i = 0; i < FGPU_TEXTURE_UNITS; i++)
         if (gl->textures[i] == t) gl->textures[i] = 0;
     fgl__destroy(SYS_GPU_DESTROY_SURFACE, t);
 }
 
-// Binds a texture to a unit (0-3); flags: FGL_TEXTURE_LINEAR, FGL_TEXTURE_CLAMP.
+// Number of mip levels of a width x height texture (down to 1 x 1, at most FGPU_MAX_MIP_LEVELS).
+static inline uint32_t fglMipLevels(uint32_t width, uint32_t height) {
+    uint32_t m = width > height ? width : height, levels = 1;
+    while ((m >> levels) && levels < FGPU_MAX_MIP_LEVELS) levels++;
+    return levels;
+}
+
+// Like fglCreateTexture, but with room for a full mip chain (level k is max(1, w >> k) x
+// max(1, h >> k)). `pixels` (may be NULL) is level 0; levels 1.. start black until you
+// fill them with fglTextureLevelData or build them with fglGenerateMipmap. Sample the chain
+// with FGL_TEXTURE_MIP_NEAREST / FGL_TEXTURE_MIP_LINEAR (FGL_TEXTURE_TRILINEAR) in
+// fglBindTexture. Returns 0 on failure (also on kernels without FGPU_CAP_MIPMAPS).
+static inline FGLTexture fglCreateTextureMips(FGLContext* gl, uint32_t width, uint32_t height, const uint32_t* pixels) {
+    (void)gl;
+    FGLTexture t = fgl__surface(width, height, FGPU_FORMAT_XRGB8888, FGPU_SURFACE_MIPMAPS);
+    if (t && pixels) {
+        syscall_gpu_request_t r;
+        memset(&r, 0, sizeof(r));
+        r.op = SYS_GPU_WRITE_SURFACE;
+        r.handle = t;
+        r.data = pixels;
+        r.pitch = width * 4;
+        if (fgl__call(&r) != SYS_SUCCESS) { fgl__destroy(SYS_GPU_DESTROY_SURFACE, t); return 0; }
+    }
+    return t;
+}
+
+// Replaces one mip level's pixels (rows `pitch` bytes apart; level 0 is the texture itself).
+static inline int fglTextureLevelData(FGLContext* gl, FGLTexture t, uint32_t level, const uint32_t* pixels, uint32_t pitch) {
+    fglSubmit(gl);      // draws recorded so far see the old pixels
+    syscall_gpu_request_t r;
+    memset(&r, 0, sizeof(r));
+    r.op = SYS_GPU_WRITE_SURFACE;
+    r.handle = t;
+    r.offset = level;
+    r.data = pixels;
+    r.pitch = pitch;
+    return fgl__call(&r) == SYS_SUCCESS ? 0 : -1;
+}
+
+// Rebuilds levels 1.. from level 0 with a 2x2 box filter. Recorded in the command buffer, so it
+// runs after the draws recorded before it (render to a texture, then generate its mips).
+static inline void fglGenerateMipmap(FGLContext* gl, FGLTexture t) {
+    fgl__emit(gl, FGPU_OP_GENERATE_MIPMAPS, &t, sizeof(t));
+}
+
+// Binds a texture to a unit (0-15, FGL_MAX_TEXTURE_UNITS; the limit is 4 on kernels from
+// before ABI 4); flags: FGL_TEXTURE_LINEAR, FGL_TEXTURE_CLAMP, FGL_TEXTURE_MIP_NEAREST,
+// FGL_TEXTURE_MIP_LINEAR (FGL_TEXTURE_TRILINEAR).
 static inline void fglBindTexture(FGLContext* gl, uint32_t unit, FGLTexture t, uint32_t flags) {
-    if (unit >= FGPU_MAX_TEXTURE_UNITS) return;
+    if (unit >= FGPU_TEXTURE_UNITS) return;
     gl->textures[unit] = t;
     gl->texture_flags[unit] = flags;
+    gl->texture_lod[unit][0] = gl->texture_lod[unit][1] = gl->texture_lod[unit][2] = 0.0f;
     gl->textures_dirty = 1;
     if (!t) {   // unbinding must reach the GPU too
         uint32_t w[3] = { unit, 0, 0 };
@@ -750,10 +881,30 @@ static inline void fglBindTexture(FGLContext* gl, uint32_t unit, FGLTexture t, u
     }
 }
 
+// fglBindTexture with a level-of-detail adjustment for mip filters: `bias` is added to the
+// computed level (positive = blurrier), `min_lod` >= 0 never samples finer than that level
+// (0 = no limit), `max_lod` > 0 never coarser (0 = no limit). Streaming a texture one mip at a
+// time sets min_lod to the finest level loaded so far.
+static inline void fglBindTextureLod(FGLContext* gl, uint32_t unit, FGLTexture t, uint32_t flags,
+                                     float bias, float min_lod, float max_lod) {
+    fglBindTexture(gl, unit, t, flags);
+    if (unit >= FGPU_TEXTURE_UNITS) return;
+    gl->texture_lod[unit][0] = bias;
+    gl->texture_lod[unit][1] = min_lod;
+    gl->texture_lod[unit][2] = max_lod;
+}
+
 // Binds a texture to the unit of a sampler2D uniform.
 static inline void fglUniformTexture(FGLContext* gl, FGLShader* sh, int loc, FGLTexture t, uint32_t flags) {
     if (!sh || loc < 0 || (uint32_t)loc >= sh->uniform_count || sh->uniforms[loc].type != FGLSL_SAMPLER) return;
     fglBindTexture(gl, sh->uniforms[loc].reg, t, flags);
+}
+
+// Binds a read-only shader buffer to a binding declared with layout(binding = N).
+static inline void fglBindStorageBuffer(FGLContext* gl, uint32_t binding, FGLBuffer buffer) {
+    if (binding >= FGPU_MAX_STORAGE_BUFFERS) return;
+    gl->storage_buffers[binding] = buffer;
+    gl->storage_buffers_dirty = 1;
 }
 
 /* ====================================================== vertex layouts */

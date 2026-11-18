@@ -186,18 +186,33 @@ or from their name: `position`, `normal`, `color`, `uv` / `texcoord`
 (also with `a_`, `in_`, `a` or `in` prefixes) are 0, 1, 2 and 3.
 See [fgsl.md](fgsl.md#attributes).
 
+### Read-only shader buffers
+
+```c
+void fglBindStorageBuffer(FGLContext* gl, uint32_t binding, FGLBuffer buffer);
+```
+
+Bind a buffer to a shader declaration such as
+`layout(binding = 0) buffer vec4 lights[];`. Buffer contents are read-only
+from FGSL; each element is one 16-byte `vec4`, and the bound buffer size
+must be a multiple of 16 bytes. There are `FGL_MAX_STORAGE_BUFFERS`
+bindings. Negative and out-of-range shader indices return a zero vector.
+On the NVIDIA Turing backend, shaders that read storage buffers currently
+run on the CPU backend until native bounds-checked loads are implemented.
+
 ## State and drawing
 
 | Call | Effect |
 | --- | --- |
 | `fglClearColor(gl, r, g, b)` / `fglClear(gl, bits)` | Clear color and/or depth (`FGL_COLOR_BUFFER_BIT`, `FGL_DEPTH_BUFFER_BIT`). |
-| `fglEnable` / `fglDisable` | `FGL_DEPTH_TEST`, `FGL_CULL_FACE` (back faces; counter-clockwise is front), `FGL_WIREFRAME`, `FGL_BLEND`. |
+| `fglEnable` / `fglDisable` | `FGL_DEPTH_TEST`, `FGL_CULL_FACE` (back faces; counter-clockwise is front), `FGL_WIREFRAME`, `FGL_BLEND`, `FGL_SCISSOR_TEST`. |
 | `fglUseProgram(gl, p)` | Use a built-in program (and stop using a shader). |
 | `fglUseShader(gl, sh)` | Use a shader. |
 | `fglSetModel`, `fglSetView`, `fglSetProjection` | The usual three matrices. |
 | `fglSetLight(gl, direction, color, ambient)` | One directional light; `direction` is where the light travels. |
 | `fglSetMaterial(gl, specular, shininess)` | Highlight strength (0-1) and sharpness (1-128). |
 | `fglViewport(gl, x, y, w, h)` | Area of the surface to draw into (defaults to all of it). |
+| `fglScissor(gl, x, y, w, h)` | The rectangle `FGL_SCISSOR_TEST` limits draws and clears to. See [Scissor](#scissor). |
 | `fglDraw(gl, vertices, first, count)` | Triangles from consecutive vertices. |
 | `fglDrawIndexed(gl, vertices, indices, first_index, count)` | Triangles from an index buffer. |
 | `fglSubmit(gl)` | Run the recorded commands. |
@@ -208,6 +223,31 @@ See [fgsl.md](fgsl.md#attributes).
 | `fglLastPresentNs(gl)` | Monotonic time (ns) the last paced present was released. |
 | `fglSetPresentFlags(gl, flags)` | Raw `FGPU_PRESENT_*` flags for `fglPresent`. |
 | `fglReadPixels(gl, out, pitch)` | Copy the frame into your memory. |
+
+### Scissor
+
+```c
+fglEnable(gl, FGL_SCISSOR_TEST);
+fglScissor(gl, x, y, w, h);          // pixels of the render target
+```
+
+While `FGL_SCISSOR_TEST` is enabled, draws and clears (`fglClear`, color and
+depth) only touch pixels inside the rectangle. The **origin is the top-left
+pixel and y grows downward, exactly like `fglViewport`**, so a viewport and a
+scissor with the same numbers cover the same pixels (this differs from OpenGL,
+where the origin is bottom-left). The rectangle is clipped to the render
+target (negative `x`/`y` and parts beyond the target are fine); a zero width or
+height draws nothing; a negative size makes the next `fglSubmit` fail with
+`SYS_ERR_INVAL`. Until you call `fglScissor` the rectangle is the whole target.
+
+It costs nothing per pixel: the rectangle only shrinks the area the rasterizer
+visits (tiles and edge setup are clipped), so a UI that sets a scissor for every
+widget pays nothing extra for it. A clear with a scissor rectangle first
+renders the draws recorded before it, then clears the rectangle, so alternate
+long runs of draws with scissored clears rather than clearing in the middle of
+every draw sequence. `fglHasScissor()` tells whether the kernel supports it
+(`FGPU_CAP_SCISSOR` in `fglGetDeviceInfo`); the NVIDIA backend draws scissored
+work on the CPU backend for now.
 
 ### Scaled and paced present
 
@@ -309,6 +349,12 @@ FGLTexture fglCreateTexture(FGLContext* gl, uint32_t width, uint32_t height, con
 int fglTextureData(FGLContext* gl, FGLTexture t, const uint32_t* pixels, uint32_t pitch);
 void fglDestroyTexture(FGLContext* gl, FGLTexture t);
 void fglBindTexture(FGLContext* gl, uint32_t unit, FGLTexture t, uint32_t flags);
+// mipmaps
+FGLTexture fglCreateTextureMips(FGLContext* gl, uint32_t width, uint32_t height, const uint32_t* pixels);
+int fglTextureLevelData(FGLContext* gl, FGLTexture t, uint32_t level, const uint32_t* pixels, uint32_t pitch);
+void fglGenerateMipmap(FGLContext* gl, FGLTexture t);
+void fglBindTextureLod(FGLContext* gl, uint32_t unit, FGLTexture t, uint32_t flags, float bias, float min_lod, float max_lod);
+uint32_t fglMipLevels(uint32_t width, uint32_t height);
 ```
 
 Textures are ARGB8888 (`0xAARRGGBB`), rows top to bottom, up to
@@ -316,7 +362,8 @@ Textures are ARGB8888 (`0xAARRGGBB`), rows top to bottom, up to
 in 0..1. `uv = (0, 0)` is the top-left corner of the image and `(1, 1)` the
 bottom-right; `fglMakeCubeUV` maps each face upright.
 
-Each `sampler2D` uniform gets a texture unit (0-3, in declaration order).
+Each `sampler2D` uniform gets a texture unit (0-15, `FGL_MAX_TEXTURE_UNITS`, in
+declaration order; kernels from before ABI 4 had 4).
 `fglUniformTexture(gl, sh, loc, tex, flags)` binds a texture to that
 sampler's unit; `fglBindTexture` binds to a unit directly. Flags:
 
@@ -324,8 +371,44 @@ sampler's unit; `fglBindTexture` binds to a unit directly. Flags:
 | --- | --- |
 | `FGL_TEXTURE_LINEAR` | Bilinear filtering (default: nearest texel). |
 | `FGL_TEXTURE_CLAMP` | Coordinates outside 0..1 use the edge texels (default: the texture repeats). |
+| `FGL_TEXTURE_MIP_NEAREST` | Mipmapped textures: sample the nearest mip level. |
+| `FGL_TEXTURE_MIP_LINEAR` | Mipmapped textures: blend the two nearest levels. With `FGL_TEXTURE_LINEAR` this is trilinear (`FGL_TEXTURE_TRILINEAR`). |
 
 Bindings are context state, like the vertex layout.
+
+### Mipmaps
+
+`fglCreateTextureMips` makes a texture with room for the whole chain: level
+`k` is `max(1, w >> k) x max(1, h >> k)` texels, down to 1 x 1 (at most 13
+levels, `fglMipLevels(w, h)` counts them); `pixels` is level 0. Fill the other
+levels yourself with `fglTextureLevelData(gl, t, level, pixels, pitch)` (the
+pixels of that level; level 0 is the texture itself) or let
+`fglGenerateMipmap(gl, t)` build levels 1.. from level 0 with a 2x2 box filter.
+`fglGenerateMipmap` is a command: it runs after the draws recorded before it,
+so you can render into a texture and generate its mips in the same frame
+(render targets and `fglReadPixels` only see level 0).
+
+The sampler picks a level from the screen-space derivatives of the texture
+coordinate: `lod = log2(longest side of the pixel's footprint, in texels of
+level 0)`. A shader that samples a mipmapped texture with a mip flag runs on
+2x2 pixel quads (the differences between the neighbours in the quad give the
+derivatives, also for coordinates the shader computes); pixels at the edge of
+a triangle behave the same as the interior. Filtering:
+
+| Flags | Result |
+| --- | --- |
+| none, or `FGL_TEXTURE_LINEAR` | Level 0 only, as before. |
+| `FGL_TEXTURE_MIP_NEAREST` | The level nearest to `lod`; nearest texel inside it (with `FGL_TEXTURE_LINEAR`: bilinear). |
+| `FGL_TEXTURE_MIP_LINEAR` | The two levels around `lod`, blended by its fraction (with `FGL_TEXTURE_LINEAR`: trilinear). |
+
+When `lod <= 0` (the texture is magnified) level 0 is used with the `LINEAR`
+filter. A texture without a chain ignores the mip flags. Textures sampled in
+the vertex stage use level 0. `fglBindTextureLod` adds a level-of-detail
+`bias` (positive = blurrier), a `min_lod` (never finer than this level; use it
+while streaming mips in, 0 = off) and a `max_lod` (never coarser, 0 = off).
+Mipmapped textures are kept in system memory and drawn by the CPU backend (the
+NVIDIA backend does not sample them yet). `fglHasMipmaps()` reports support
+(`FGPU_CAP_MIPMAPS`).
 
 ## Blending
 
@@ -361,7 +444,8 @@ cube with one color per face (`NULL` for the default colors);
 | Surface / texture size | 4096 × 4096 |
 | Buffer size | 16 MiB |
 | Command buffer | 1 MiB per submit (FarcadeGL grows its buffer as needed) |
-| Shader program | 2048 instructions per stage, 32 temporary vec4s, 8 varyings, 64 uniform vec4s (a `mat4` uses 4), 256 constant vec4s, 4 texture units |
+| Shader program | 2048 instructions per stage, 32 temporary vec4s, 8 varyings, 64 uniform vec4s (a `mat4` uses 4), 256 constant vec4s, 16 texture units (4 before ABI 4), 4 storage-buffer bindings |
+| Mip levels | 13 (4096 × 4096 down to 1 × 1) |
 | Objects per process | 1024 surfaces (contexts and textures), 4096 buffers, 1024 shaders; shared by the threads of a program |
 
 ## Performance
@@ -388,13 +472,16 @@ times slower. Tips:
 | `fglCreateContext`, `fglDestroyContext` | [Contexts](#contexts) |
 | `fglCreateBuffer`, `fglBufferData`, `fglDestroyBuffer` | [Buffers](#buffers-and-vertex-layouts) |
 | `fglVertexLayout`, `fglVertexLayoutUV`, `fglVertexLayoutDefault` | [Buffers](#buffers-and-vertex-layouts) |
-| `fglEnable`, `fglDisable`, `fglViewport`, `fglClearColor`, `fglClear` | [State and drawing](#state-and-drawing) |
+| `fglEnable`, `fglDisable`, `fglViewport`, `fglScissor`, `fglClearColor`, `fglClear` | [State and drawing](#state-and-drawing), [Scissor](#scissor) |
 | `fglUseProgram` | [Built-in programs](#built-in-programs) |
 | `fglSetModel`, `fglSetView`, `fglSetProjection`, `fglSetLight`, `fglSetMaterial` | [State and drawing](#state-and-drawing) |
 | `fglDraw`, `fglDrawIndexed`, `fglSubmit`, `fglPresent`, `fglReadPixels` | [State and drawing](#state-and-drawing) |
 | `fglCreateShader`, `fglShaderLog`, `fglUseShader`, `fglDestroyShader` | [Shaders](#shaders) |
 | `fglUniformLocation`, `fglUniform1f` … `fglUniform4f`, `fglUniformVec3`, `fglUniformMatrix4`, `fglUniformArray`, `fglUniformTexture` | [Uniforms](#uniforms) |
+| `fglBindStorageBuffer` | [Read-only shader buffers](#read-only-shader-buffers) |
 | `fglCreateTexture`, `fglTextureData`, `fglDestroyTexture`, `fglBindTexture` | [Textures](#textures) |
+| `fglCreateTextureMips`, `fglTextureLevelData`, `fglGenerateMipmap`, `fglBindTextureLod`, `fglMipLevels` | [Mipmaps](#mipmaps) |
+| `fglHasScissor`, `fglHasMipmaps` | [Scissor](#scissor), [Mipmaps](#mipmaps) |
 | `fglMakeCube`, `fglMakeCubeUV` and the math functions | [Math](#math) |
 
 ## The FGPU interface underneath
@@ -402,13 +489,16 @@ times slower. Tips:
 `SYS_GPU` (40) takes a `syscall_gpu_request_t`. Operations: `INFO`,
 `CREATE_SURFACE`, `DESTROY_SURFACE`, `CREATE_BUFFER`, `UPLOAD_BUFFER`,
 `DESTROY_BUFFER`, `SUBMIT`, `READBACK`, `PRESENT`, `RELEASE_DISPLAY`, and
-(ABI version 2) `CREATE_PROGRAM`, `DESTROY_PROGRAM`, `WRITE_SURFACE`.
+(ABI version 2) `CREATE_PROGRAM`, `DESTROY_PROGRAM`, `WRITE_SURFACE` (ABI 4: the request's
+`offset` is the mip level). `INFO` reports `FGPU_CAP_SCISSOR`, `FGPU_CAP_MIPMAPS` and
+`FGPU_CAP_TEXTURE_UNITS16` in `caps` and, with the ABI 4 structure size, a limits block
+(`max_texture_units`, `max_mip_levels`, ...); `fglGetDeviceInfo` fills it in for older kernels too.
 
 A command buffer is a list of 32-bit words; each command starts with
 `FGPU_CMD(opcode, length_in_words)`: `BIND_TARGET`, `VIEWPORT`, `CLEAR`,
 `SET_STATE`, `SET_PROGRAM`, `SET_UNIFORMS`, `DRAW`, and (version 2)
-`SET_SHADER`, `SET_CONSTANTS`, `SET_VERTEX_LAYOUT`, `BIND_TEXTURE`. Every
-submit starts from default state.
+`SET_SHADER`, `SET_CONSTANTS`, `SET_VERTEX_LAYOUT`, `BIND_TEXTURE`, and (version 4)
+`SCISSOR`, `GENERATE_MIPMAPS`. Every submit starts from default state (scissor off).
 
 A shader program is a blob of FGPU bytecode: a header, the vertex and
 fragment instructions (five words each: opcode, destination, three

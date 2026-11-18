@@ -30,6 +30,7 @@ truth; these pages describe them as of SDK v1.1 and the kernel's
 | [FGSL shading language](fgsl.md) | `fglsl.h` | The GLSL-style language FarcadeGL shaders are written in, and its compiler |
 | [Disks and root commands](storage.md) | `storage.h` | List disks and partitions, run kernel commands as root (installer) |
 | [Playing audio](audio.md) | `audio.h` | Play, pause, seek and query `.adi` audio files |
+| [Pictures and icons](images.md) | `mosmedia.h` | Read `.img` pictures; draw raster and vector (SVG-like) pictures at any size, tinted with the theme's color |
 
 ## Reading an entry
 

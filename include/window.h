@@ -102,11 +102,14 @@ static inline uint64_t mos_window_set_flags(uint32_t id, uint32_t flags) {
 static inline uint64_t mos_window_get_info(uint32_t id,
                                            syscall_window_info_t* info);
 
+// The mode helpers below write back the flags they read, minus the focus
+// bit: that one belongs to the window manager, and the kernel refused the
+// whole request from a program when it was set (F11 in a focused window).
 static inline uint64_t mos_window_set_fullscreen(uint32_t id, bool enabled) {
     syscall_window_info_t info;
     uint64_t result = mos_window_get_info(id, &info);
     if (result != SYS_SUCCESS) return result;
-    uint32_t flags = info.flags & ~(SYSCALL_WINDOW_FULLSCREEN |
+    uint32_t flags = info.flags & ~(SYSCALL_WINDOW_FOCUSED | SYSCALL_WINDOW_FULLSCREEN |
                                     SYSCALL_WINDOW_MAXIMIZED |
                                     SYSCALL_WINDOW_MINIMIZED);
     if (enabled) flags |= SYSCALL_WINDOW_FULLSCREEN;
@@ -117,7 +120,7 @@ static inline uint64_t mos_window_minimize(uint32_t id) {
     syscall_window_info_t info;
     uint64_t result = mos_window_get_info(id, &info);
     if (result != SYS_SUCCESS) return result;
-    uint32_t flags = info.flags & ~(SYSCALL_WINDOW_FULLSCREEN |
+    uint32_t flags = info.flags & ~(SYSCALL_WINDOW_FOCUSED | SYSCALL_WINDOW_FULLSCREEN |
                                     SYSCALL_WINDOW_MAXIMIZED);
     flags |= SYSCALL_WINDOW_MINIMIZED;
     return mos_window_set_flags(id, flags);
@@ -127,7 +130,7 @@ static inline uint64_t mos_window_maximize(uint32_t id) {
     syscall_window_info_t info;
     uint64_t result = mos_window_get_info(id, &info);
     if (result != SYS_SUCCESS) return result;
-    uint32_t flags = info.flags & ~(SYSCALL_WINDOW_FULLSCREEN |
+    uint32_t flags = info.flags & ~(SYSCALL_WINDOW_FOCUSED | SYSCALL_WINDOW_FULLSCREEN |
                                     SYSCALL_WINDOW_MINIMIZED);
     flags |= SYSCALL_WINDOW_MAXIMIZED;
     return mos_window_set_flags(id, flags);
@@ -137,7 +140,7 @@ static inline uint64_t mos_window_restore(uint32_t id) {
     syscall_window_info_t info;
     uint64_t result = mos_window_get_info(id, &info);
     if (result != SYS_SUCCESS) return result;
-    uint32_t flags = info.flags & ~(SYSCALL_WINDOW_FULLSCREEN |
+    uint32_t flags = info.flags & ~(SYSCALL_WINDOW_FOCUSED | SYSCALL_WINDOW_FULLSCREEN |
                                     SYSCALL_WINDOW_MAXIMIZED |
                                     SYSCALL_WINDOW_MINIMIZED);
     return mos_window_set_flags(id, flags);
