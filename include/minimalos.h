@@ -158,6 +158,19 @@ static inline long mos_pslist(syscall_process_info_t* entries,
     );
 }
 
+// The programs running, with CPU time and memory (SYS_TASK_LIST): one
+// entry per program, kernel tasks included. Returns the number written
+// or a negative SYS_ERR_* value.
+static inline long mos_task_list(syscall_task_info_t* entries, size_t max_entries) {
+    return mos_syscall(SYS_TASK, SYS_TASK_LIST, (long)(uintptr_t)entries, (long)max_entries);
+}
+
+// Ends a user program (SYS_TASK_END). SYS_ERR_PERM for kernel tasks, the
+// window manager and the caller itself.
+static inline long mos_task_end(uint64_t pid) {
+    return mos_syscall(SYS_TASK, SYS_TASK_END, (long)pid, 0);
+}
+
 // Convenience: write a NUL-terminated string to stdout.
 static inline long mos_puts(const char* str) {
     size_t len = 0;
