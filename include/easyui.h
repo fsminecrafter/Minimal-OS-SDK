@@ -1329,7 +1329,17 @@ static void eui_wheel(int32_t delta) {
     } else if (e->type == EASYUI_SLIDER && e->enabled) eui_change(id, e->value + steps * e->step);
 }
 
-static char eui_ascii(int key, int shift) {
+/* The character a key types, in the keyboard layout the kernel uses (Shift
+ * and AltGr included); the US table below is the fallback. */
+static char eui_ascii(int key, int mods) {
+    int shift = (mods & SYSCALL_INPUT_MOD_SHIFT) != 0;
+    int altgr = (mods & (1 << 3)) != 0;              /* SYSCALL_INPUT_MOD_ALTGR */
+    if ((key >= 4 && key <= 56) || key == 100) {
+        char k = (char)mos_syscall(SYS_USB, SYS_USB_KEY_TO_ASCII, (uint64_t)key,
+                                   (uint64_t)((shift ? 0x02 : 0) | (altgr ? 0x40 : 0)));
+        if (k >= 32 && k < 127) return k;
+        if (altgr) return 0;
+    }
     static const char lower[] = "abcdefghijklmnopqrstuvwxyz1234567890";
     static const char upper[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()";
     static const char sym_lo[] = "-=[]\\#;'`,./";
@@ -1345,7 +1355,7 @@ static void eui_text_key(int id, int key, int mods) {
     int32_t len = (int32_t)strlen(e->text);
     int changed = 0;
     if (e->cursor > len) e->cursor = len;
-    char c = (mods & SYSCALL_INPUT_MOD_CTRL) ? 0 : eui_ascii(key, (mods & SYSCALL_INPUT_MOD_SHIFT) != 0);
+    char c = (mods & SYSCALL_INPUT_MOD_CTRL) ? 0 : eui_ascii(key, mods);
     if (c) {
         if (len < e->maxlength && len < EASYUI_TEXT_MAX - 1) {
             memmove(e->text + e->cursor + 1, e->text + e->cursor, (size_t)(len - e->cursor + 1));
@@ -2219,7 +2229,7 @@ static void eui_pick_key(int key, int mods) {
         return;
     }
     int32_t len = (int32_t)strlen(eui_pk.name);
-    char c = (mods & SYSCALL_INPUT_MOD_CTRL) ? 0 : eui_ascii(key, (mods & SYSCALL_INPUT_MOD_SHIFT) != 0);
+    char c = (mods & SYSCALL_INPUT_MOD_CTRL) ? 0 : eui_ascii(key, mods);
     if (key == EASYUI_KEY_BACKSPACE && len) eui_pk.name[len - 1] = '\0';
     else if (c && c != '/' && c != ':' && c != '\\' && len < 63) { eui_pk.name[len] = c; eui_pk.name[len + 1] = '\0'; }
     eui_pk.note[0] = '\0';

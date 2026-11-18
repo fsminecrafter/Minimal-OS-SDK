@@ -256,6 +256,9 @@ typedef struct {
 #define SYSCALL_INPUT_MOD_SHIFT (1u << 0)
 #define SYSCALL_INPUT_MOD_CTRL (1u << 1)
 #define SYSCALL_INPUT_MOD_ALT (1u << 2)
+// Right Alt (AltGr): the layout's third character on a key. Left Alt is
+// SYSCALL_INPUT_MOD_ALT; the two are reported separately.
+#define SYSCALL_INPUT_MOD_ALTGR (1u << 3)
 #define SYSCALL_INPUT_BTN_LEFT (1u << 0)
 #define SYSCALL_INPUT_BTN_RIGHT (1u << 1)
 #define SYSCALL_INPUT_BTN_MIDDLE (1u << 2)
