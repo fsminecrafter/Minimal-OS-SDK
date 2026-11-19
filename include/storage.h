@@ -6,6 +6,7 @@
  *
  *   mos_storage_list()    disks and partitions (SYS_STORAGE, read-only)
  *   mos_storage_status()  is an install payload loaded, which device is 0:
+ *   mos_storage_apps()    apps on the install media the installer can add
  *   mos_root_auth()       check a MOSdesk account password (SYS_ROOT)
  *   mos_root_run()        start a kernel terminal command as root
  *   mos_root_read()       collect its output; tells whether it still runs
@@ -44,6 +45,20 @@ static inline long mos_storage_status(int* install_payload, char boot_device[16]
     if (install_payload) *install_payload = (int)r.install_payload;
     if (boot_device) memcpy(boot_device, r.boot_device, 16);
     return res;
+}
+
+// Apps on the install media, "name bytes\n" per app, into out. Returns
+// how many (0 when the media has none), <0 on a kernel without the call.
+static inline long mos_storage_apps(char* out, uint32_t out_size) {
+    syscall_storage_request_t r;
+    memset(&r, 0, sizeof(r));
+    r.size = sizeof(r);
+    r.version = SYS_STORAGE_ABI_VERSION;
+    r.op = SYS_STORAGE_APPS;
+    r.capacity = out_size;
+    r.devices = (syscall_storage_device_t*)(void*)out;
+    if (out && out_size) out[0] = '\0';
+    return (long)mos_syscall1(SYS_STORAGE, (uint64_t)(uintptr_t)&r);
 }
 
 static inline uint64_t mos_root_call(syscall_root_t* r) {
