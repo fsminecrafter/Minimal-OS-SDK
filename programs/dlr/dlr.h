@@ -87,6 +87,7 @@ typedef struct {
     uint32_t ip;
     uint16_t port;
     uint8_t  needs_password;
+    uint8_t  udp;            /* 1 = reach it over dlr-over-UDP (dlr_udp.c), `port` is a UDP port */
     char     name[DLR_NAME_MAX];
 } dlr_server;
 

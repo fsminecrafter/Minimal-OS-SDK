@@ -34,7 +34,11 @@ int dlr_db_load(dlr_server* servers, int max) {
         memset(&s, 0, sizeof(s));
 
         s.ip = read_uint(&p);
-        s.port = (uint16_t)read_uint(&p);
+        {
+            uint32_t pv = read_uint(&p);          // 65536 + port means "over UDP"
+            s.udp = pv >= 65536u;
+            s.port = (uint16_t)pv;
+        }
         s.needs_password = (uint8_t)read_uint(&p);
 
         while (*p == ' ') p++;
@@ -56,7 +60,7 @@ int dlr_db_save(const dlr_server* servers, int count) {
     for (int i = 0; i < count && pos + 128 < sizeof(buf); i++) {
         append_uint(buf, sizeof(buf), &pos, servers[i].ip);
         buf[pos++] = ' ';
-        append_uint(buf, sizeof(buf), &pos, servers[i].port);
+        append_uint(buf, sizeof(buf), &pos, (uint32_t)servers[i].port + (servers[i].udp ? 65536u : 0u));
         buf[pos++] = ' ';
         append_uint(buf, sizeof(buf), &pos, servers[i].needs_password);
         buf[pos++] = ' ';
@@ -72,7 +76,7 @@ int dlr_db_save(const dlr_server* servers, int count) {
 
 int dlr_db_add(dlr_server* servers, int count, int max, const dlr_server* add) {
     for (int i = 0; i < count; i++) {
-        if (servers[i].ip == add->ip && servers[i].port == add->port) {
+        if (servers[i].ip == add->ip && servers[i].port == add->port && servers[i].udp == add->udp) {
             // Refresh name and auth flag; the server may have been
             // renamed or had a password added since the last scan.
             servers[i] = *add;

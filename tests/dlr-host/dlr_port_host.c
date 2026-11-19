@@ -166,6 +166,15 @@ int dlr_udp_broadcast(long handle, uint16_t dst_port, const void* buf, uint32_t 
     return sendto((int)handle, buf, len, 0, (struct sockaddr*)&addr, sizeof(addr)) > 0;
 }
 
+int dlr_udp_send(long handle, uint32_t ip, uint16_t dst_port, const void* buf, uint32_t len) {
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(dst_port);
+    addr.sin_addr.s_addr = htonl(ip);
+    return sendto((int)handle, buf, len, 0, (struct sockaddr*)&addr, sizeof(addr)) > 0;
+}
+
 long dlr_udp_read(long handle, void* buf, uint32_t len,
                   uint32_t* out_from_ip, uint32_t timeout_ms) {
     struct pollfd pfd = { (int)handle, POLLIN, 0 };

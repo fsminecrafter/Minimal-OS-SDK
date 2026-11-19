@@ -39,6 +39,8 @@ typedef struct {
     int      needs_password;
     int      protocol_version;
 
+    int      udp;                     /* dlr-over-UDP session: see dlr_udp.c */
+
     uint8_t* frame;                   /* DLR_MAX_FRAME scratch, heap */
     uint8_t* plain;                   /* DLR_MAX_FRAME scratch, heap */
 } dlr_session;
@@ -62,6 +64,18 @@ void dlr_session_free(dlr_session* s);
 // asks and `password` is non-NULL). Returns 1 on success.
 int  dlr_connect(dlr_session* s, uint32_t ip, uint16_t port, const char* password);
 void dlr_disconnect(dlr_session* s);
+
+// Same, choosing TCP or UDP from the server entry.
+int  dlr_connect_server(dlr_session* s, const dlr_server* srv, const char* password);
+
+/* dlr-over-UDP (dlr_udp.c). A UDP session offers the same message calls as
+ * a TCP one: dlr_send_msg takes a request, dlr_recv_msg returns what the
+ * server's TCP session would have sent, so list/search/ping/download need
+ * no changes. */
+int  dlr_udp_connect(dlr_session* s, uint32_t ip, uint16_t port, const char* password);
+int  dlr_udp_send_msg(dlr_session* s, uint8_t type, const void* body, uint32_t len);
+int  dlr_udp_recv_msg(dlr_session* s, uint8_t* out_type, uint32_t* out_len, uint32_t timeout_ms);
+int  dlr_udp_probe(uint32_t ip, uint16_t port, dlr_server* out, uint32_t timeout_ms);
 
 // Sends [type][body] sealed if a session key is in use.
 int  dlr_send_msg(dlr_session* s, uint8_t type, const void* body, uint32_t body_len);

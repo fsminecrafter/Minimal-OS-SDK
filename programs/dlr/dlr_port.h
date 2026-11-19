@@ -49,6 +49,9 @@ void dlr_tcp_close(long handle);
 long dlr_udp_open(uint16_t local_port);
 int  dlr_udp_broadcast(long handle, uint16_t dst_port, const void* buf, uint32_t len);
 
+// Sends one datagram to ip:port from a bound socket. 1 on success.
+int  dlr_udp_send(long handle, uint32_t ip, uint16_t dst_port, const void* buf, uint32_t len);
+
 // Returns the datagram length, or 0 if none arrived before the timeout.
 long dlr_udp_read(long handle, void* buf, uint32_t len,
                   uint32_t* out_from_ip, uint32_t timeout_ms);

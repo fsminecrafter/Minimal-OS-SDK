@@ -9,6 +9,8 @@ Run `dhcp` in the terminal once per boot first.
 ```
 dlr scan                       find servers on the LAN
 dlr add <ip>[:port]            register a server by address
+dlr add udp://<host>[:port]    a server reached over UDP (see tools/dlr-server)
+dlr add http://<host>[:port]   ask a website where its server is (it may redirect to UDP)
 dlr servers-tui                browse servers and download packages
 dlr list [server]              a server's packages
 dlr search <query> [server]

@@ -154,7 +154,7 @@ static int open_session(dlr_session* s, dlr_server* srv, const char* password) {
     print_ip(srv->ip);
     printf(":%u ...\n", srv->port);
 
-    if (!dlr_connect(s, srv->ip, srv->port, password)) {
+    if (!dlr_connect_server(s, srv, password)) {
         printf("dlr: connection or handshake failed\n");
         dlr_session_free(s);
         return 0;
@@ -221,26 +221,148 @@ static int cmd_servers(void) {
     return 0;
 }
 
+/* --- finding a server through its website ------------------------------- */
+
+// GET http://host:port/path over a plain TCP connection. Copies the body
+// (NUL-terminated) to `out`. Returns 1 on a 200 answer.
+static int http_get_body(uint32_t ip, uint16_t port, const char* host, const char* path,
+                         char* out, size_t cap) {
+    long sock = dlr_tcp_open(ip, port, 5000);
+    if (sock == DLR_INVALID) return 0;
+
+    char req[256];
+    size_t p = 0;
+    const char* parts[] = { "GET ", path, " HTTP/1.1\r\nHost: ", host,
+                            "\r\nConnection: close\r\nAccept: application/json\r\n\r\n" };
+    for (int i = 0; i < 5; i++)
+        for (const char* c = parts[i]; *c && p + 1 < sizeof(req); c++) req[p++] = *c;
+    if (!dlr_tcp_write(sock, req, (uint32_t)p)) { dlr_tcp_close(sock); return 0; }
+
+    static char raw[4096];
+    size_t n = 0;
+    // The server closes after answering (Connection: close), which ends the read.
+    while (n + 1 < sizeof(raw) && dlr_tcp_read_exact(sock, raw + n, 1, 1500)) n++;
+    raw[n] = '\0';
+    dlr_tcp_close(sock);
+
+    if (n < 12 || strncmp(raw, "HTTP/1.", 7) != 0 || strncmp(raw + 9, "200", 3) != 0) return 0;
+    char* body = strstr(raw, "\r\n\r\n");
+    if (!body) return 0;
+    body += 4;
+    size_t len = strlen(body);
+    if (len >= cap) len = cap - 1;
+    memcpy(out, body, len);
+    out[len] = '\0';
+    return 1;
+}
+
+// Finds `"key": "text"` or `"key": 123` at or after `from`.
+static int json_string(const char* from, const char* key, char* out, size_t cap) {
+    char pat[40];
+    size_t k = 0;
+    pat[k++] = '"';
+    for (const char* c = key; *c && k + 3 < sizeof(pat); c++) pat[k++] = *c;
+    pat[k++] = '"';
+    pat[k] = '\0';
+    const char* p = strstr(from, pat);
+    if (!p) return 0;
+    p += k;
+    while (*p == ' ' || *p == ':' || *p == '\n') p++;
+    if (*p != '"') return 0;
+    p++;
+    size_t i = 0;
+    while (*p && *p != '"' && i + 1 < cap) out[i++] = *p++;
+    out[i] = '\0';
+    return i > 0;
+}
+
+static uint32_t json_uint(const char* from, const char* key) {
+    char pat[40];
+    size_t k = 0;
+    pat[k++] = '"';
+    for (const char* c = key; *c && k + 3 < sizeof(pat); c++) pat[k++] = *c;
+    pat[k++] = '"';
+    pat[k] = '\0';
+    const char* p = strstr(from, pat);
+    if (!p) return 0;
+    p += k;
+    while (*p == ' ' || *p == ':' || *p == '\n') p++;
+    uint32_t v = 0;
+    while (*p >= '0' && *p <= '9') v = v * 10u + (uint32_t)(*p++ - '0');
+    return v;
+}
+
+// The website says where the real server is: its UDP address if it has one
+// (that is the "redirect"), otherwise the plain dlr port. 1 if `found` is set.
+static int discover_via_http(const char* host, uint16_t http_port, dlr_server* found) {
+    uint32_t ip = dlr_resolve(host);
+    if (!ip) return 0;
+
+    printf("Asking http://%s:%u/api/endpoint ...\n", host, http_port);
+    static char body[2048];
+    if (!http_get_body(ip, http_port, host, "/api/endpoint", body, sizeof(body))) return 0;
+
+    const char* udp = strstr(body, "\"udp\"");
+    if (udp) {
+        const char* v = udp + 5;
+        while (*v == ' ' || *v == ':' || *v == '\n') v++;
+        char uhost[64];
+        uint32_t uport = json_uint(udp, "port");
+        if (*v == '{' && uport && uport <= 65535 && json_string(udp, "host", uhost, sizeof(uhost))) {
+            uint32_t uip = dlr_resolve(uhost);
+            if (uip) {
+                printf("Redirected to the UDP stream at %s:%u\n", uhost, uport);
+                if (dlr_udp_probe(uip, (uint16_t)uport, found, 4000)) return 1;
+                printf("dlr: the UDP address did not answer\n");
+            }
+        }
+    }
+
+    const char* dlr = strstr(body, "\"dlr\"");
+    char dhost[64];
+    uint32_t dport = dlr ? json_uint(dlr, "port") : 0;
+    if (dlr && dport && dport <= 65535 && json_string(dlr, "host", dhost, sizeof(dhost))) {
+        uint32_t dip = dlr_resolve(dhost);
+        if (dip && dlr_probe(dip, (uint16_t)dport, found, 4000)) return 1;
+    }
+    return 0;
+}
+
+static int add_found(const dlr_server* found) {
+    load_servers();
+    g_server_count = dlr_db_add(g_servers, g_server_count, DLR_MAX_SERVERS, found);
+    dlr_db_save(g_servers, g_server_count);
+    printf("Added '%s'%s%s\n", found->name, found->udp ? " (over UDP)" : "",
+           found->needs_password ? " (password required)" : "");
+    return 0;
+}
+
+// "host", "host:port", "tls://host", "udp://host[:port]" (dlr over UDP) or
+// "http://host[:port]" (ask the website where the server is; port defaults to 80).
 static int cmd_add(const char* spec) {
-    // "<ip>", "<ip>:<port>", or "tls://<ip>[:<port>]" (tls:// = port 4342)
-    if (strncmp(spec, "https://", 8) == 0 || strncmp(spec, "http://", 7) == 0) {
-        printf("dlr: GitHub/HTTP repositories are not Deliver protocol servers; ");
-        printf("remote file downloads are not supported by this build\n");
+    if (strncmp(spec, "https://", 8) == 0) {
+        printf("dlr: https:// needs TLS, which this client does not do for the website; ");
+        printf("use http://host[:port] or udp://host[:port]\n");
         return 1;
     }
+    int is_http = strncmp(spec, "http://", 7) == 0;
+    int is_udp = strncmp(spec, "udp://", 6) == 0;
     int tls = 0;
-    if (strncmp(spec, "tls://", 6) == 0) { tls = 1; spec += 6; }
+    if (is_http) spec += 7;
+    else if (is_udp) spec += 6;
+    else if (strncmp(spec, "tls://", 6) == 0) { tls = 1; spec += 6; }
 
     char host[64];
-    uint16_t port = tls ? DLR_TLS_PORT : DLR_DEFAULT_PORT;
+    uint16_t port = tls ? DLR_TLS_PORT : (is_http ? 80 : DLR_DEFAULT_PORT);
+    int port_given = 0;
 
     size_t i = 0;
-    while (spec[i] && spec[i] != ':' && i + 1 < sizeof(host)) { host[i] = spec[i]; i++; }
+    while (spec[i] && spec[i] != ':' && spec[i] != '/' && i + 1 < sizeof(host)) { host[i] = spec[i]; i++; }
     host[i] = '\0';
     if (spec[i] == ':') {
         uint32_t v = 0;
         for (size_t j = i + 1; spec[j] >= '0' && spec[j] <= '9'; j++) v = v * 10u + (uint32_t)(spec[j] - '0');
-        if (v && v <= 65535) port = (uint16_t)v;
+        if (v && v <= 65535) { port = (uint16_t)v; port_given = 1; }
     }
     if (tls && port != DLR_TLS_PORT) {
         printf("dlr: tls:// servers use port %u\n", DLR_TLS_PORT);
@@ -253,23 +375,37 @@ static int cmd_add(const char* spec) {
         return 1;
     }
 
-    printf("Probing ");
-    print_ip(ip);
-    printf(":%u%s ...\n", port, port == DLR_TLS_PORT ? " (ktls)" : "");
-
     dlr_server found;
-    if (!dlr_probe(ip, port, &found, 4000)) {
-        printf("dlr: no Deliver server answered there\n");
-        return 1;
+    memset(&found, 0, sizeof(found));
+
+    if (is_http) {
+        if (!discover_via_http(host, port, &found)) {
+            printf("dlr: the website did not lead to a Deliver server\n");
+            return 1;
+        }
+        return add_found(&found);
     }
 
-    load_servers();
-    g_server_count = dlr_db_add(g_servers, g_server_count, DLR_MAX_SERVERS, &found);
-    dlr_db_save(g_servers, g_server_count);
+    printf("Probing ");
+    print_ip(ip);
+    printf(":%u%s%s ...\n", port, port == DLR_TLS_PORT ? " (ktls)" : "", is_udp ? " (UDP)" : "");
 
-    printf("Added '%s'%s\n", found.name,
-           found.needs_password ? " (password required)" : "");
-    return 0;
+    if (is_udp) {
+        if (!dlr_udp_probe(ip, port, &found, 4000)) {
+            printf("dlr: no Deliver server answered over UDP there\n");
+            return 1;
+        }
+        return add_found(&found);
+    }
+
+    if (dlr_probe(ip, port, &found, 4000)) return add_found(&found);
+
+    // A bare name that does not answer on the dlr port may be a website that
+    // knows a better way in (a UDP tunnel): ask it.
+    if (!port_given && !tls && discover_via_http(host, 80, &found)) return add_found(&found);
+
+    printf("dlr: no Deliver server answered there\n");
+    return 1;
 }
 
 // Both `list` and `search` get back "name|version|description\n" lines.

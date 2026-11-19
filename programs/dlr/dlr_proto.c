@@ -137,11 +137,18 @@ int dlr_connect(dlr_session* s, uint32_t ip, uint16_t port, const char* password
     return 1;
 }
 
+int dlr_connect_server(dlr_session* s, const dlr_server* srv, const char* password) {
+    return srv->udp ? dlr_udp_connect(s, srv->ip, srv->port, password)
+                    : dlr_connect(s, srv->ip, srv->port, password);
+}
+
 void dlr_disconnect(dlr_session* s) {
     if (s->sock != DLR_INVALID) {
-        dlr_tcp_close(s->sock);
+        if (s->udp) dlr_udp_close(s->sock);
+        else dlr_tcp_close(s->sock);
         s->sock = DLR_INVALID;
     }
+    s->udp = 0;
     s->encrypted = 0;
     // Wipe the key rather than leaving it in the heap block that
     // malloc will hand to the next caller.
@@ -149,6 +156,7 @@ void dlr_disconnect(dlr_session* s) {
 }
 
 int dlr_send_msg(dlr_session* s, uint8_t type, const void* body, uint32_t body_len) {
+    if (s->udp) return dlr_udp_send_msg(s, type, body, body_len);
     if (body_len + 1u + DLR_GCM_IV_LEN + DLR_GCM_TAG_LEN > DLR_MAX_FRAME) return 0;
 
     uint8_t* plain = s->plain;
@@ -169,6 +177,7 @@ int dlr_send_msg(dlr_session* s, uint8_t type, const void* body, uint32_t body_l
 }
 
 int dlr_recv_msg(dlr_session* s, uint8_t* out_type, uint32_t* out_len, uint32_t timeout_ms) {
+    if (s->udp) return dlr_udp_recv_msg(s, out_type, out_len, timeout_ms);
     long n = dlr_frame_recv(s->sock, s->frame, DLR_MAX_FRAME, timeout_ms);
     if (n < 0) return 0;
 

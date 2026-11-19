@@ -19,6 +19,8 @@ python3 dlrd.py --open          # data goes in ./data, admin window opens in you
 | API list | `GET /api/package` | JSON; `?q=text` searches |
 | API download | `GET /api/package/<name>` | the tar archive; `X-DLR-SHA256` has its checksum |
 | API details | `GET /api/package/<name>/info` | JSON including the file list |
+| API endpoint info | `GET /api/endpoint` | JSON: where the dlr, UDP and web sides live |
+| dlr over UDP | UDP 7870 | `dlr add udp://host:port`, for UDP-only tunnels such as playit.gg |
 | Admin window | `http://127.0.0.1:8081` | drag a folder in, Settings button, file listing |
 
 With a password set, `/list` and `/api/*` need it (header `X-DLR-Password: pw`, or
@@ -27,6 +29,23 @@ Basic auth with any user name). The home page stays public.
 The archive is a tar with every entry under `<name>/`, which is exactly what the
 C++ Deliver server sends and what `dlr` extracts. Downloads are checked against
 SHA-256 by the client.
+
+## Over UDP (playit.gg and friends)
+
+Some connections only get UDP through a tunnel. dlrd answers the dlr operations
+(list, search, ping, download) over UDP on `udp_port` (default 7870; UDP and TCP
+port numbers do not clash). Point a playit.gg **UDP** tunnel at `127.0.0.1:7870`,
+then in Settings put the address playit gives you into *Public UDP address*.
+
+- `dlr add udp://<playit-host>:<port>` on Minimal-OS adds it directly.
+- `dlr add http://<your-website>[:port]` asks the website (`/api/endpoint`) where the
+  server is and is **redirected to the UDP address**. So does a bare `dlr add <host>`
+  when nothing answers on the dlr port but the website on port 80 does.
+- The protocol ("DLU1") is documented in `dlrd.py`. It is stateless and the client
+  re-asks for lost chunks (tested at 20% packet loss). A cookie bound to the sender's
+  address stops spoofed requests from turning the server into a traffic amplifier.
+  A password is never sent; a proof derived from it is. Like the TCP protocol, the
+  data itself is not encrypted.
 
 ## Admin window
 

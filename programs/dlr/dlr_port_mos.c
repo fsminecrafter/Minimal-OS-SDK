@@ -191,6 +191,15 @@ int dlr_udp_broadcast(long handle, uint16_t dst_port, const void* buf, uint32_t 
     return 0;
 }
 
+int dlr_udp_send(long handle, uint32_t ip, uint16_t dst_port, const void* buf, uint32_t len) {
+    for (int attempt = 0; attempt < 20; attempt++) {
+        long rc = mos_udp_send(handle, ip, dst_port, 0, buf, len);
+        if (is_busy(rc)) { mos_sleep(DLR_RETRY_SLEEP_TICKS); continue; }
+        return rc > 0;
+    }
+    return 0;
+}
+
 long dlr_udp_read(long handle, void* buf, uint32_t len,
                   uint32_t* out_from_ip, uint32_t timeout_ms) {
     uint64_t deadline = dlr_now_ms() + timeout_ms;

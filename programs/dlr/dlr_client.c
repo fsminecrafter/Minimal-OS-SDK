@@ -64,7 +64,7 @@ int dlr_client_open(dlr_session* s, const dlr_server* srv, const char* password,
     line_buf l = { {0}, 0 };
     ln_emit(io, ln_s(ln_u(ln_s(ln_s(ln_s(&l, "Connecting to "), ip), ":"), srv->port), " ..."));
 
-    if (!dlr_connect(s, srv->ip, srv->port, password)) {
+    if (!dlr_connect_server(s, srv, password)) {
         say(io, "dlr: connection or handshake failed", 0, 0);
         dlr_session_free(s);
         return 0;

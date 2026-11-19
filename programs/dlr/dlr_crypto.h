@@ -30,6 +30,10 @@ void dlr_sha256_update(dlr_sha256_ctx* ctx, const void* data, size_t len);
 void dlr_sha256_final(dlr_sha256_ctx* ctx, uint8_t out[32]);
 void dlr_sha256(const void* data, size_t len, uint8_t out[32]);
 
+// HMAC-SHA256 (RFC 2104). Used by the UDP transport's password proof.
+void dlr_hmac_sha256(const uint8_t* key, size_t key_len, const void* msg, size_t msg_len,
+                     uint8_t out[32]);
+
 // Lowercase hex, NUL-terminated. `out` must be at least 65 bytes.
 // Deliver compares these as strings over the wire.
 void dlr_hex(const uint8_t* bytes, size_t len, char* out);

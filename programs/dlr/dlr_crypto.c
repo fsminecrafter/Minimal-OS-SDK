@@ -126,6 +126,28 @@ void dlr_sha256(const void* data, size_t len, uint8_t out[32]) {
     dlr_sha256_final(&ctx, out);
 }
 
+void dlr_hmac_sha256(const uint8_t* key, size_t key_len, const void* msg, size_t msg_len,
+                     uint8_t out[32]) {
+    uint8_t k[64], inner[32];
+    for (int i = 0; i < 64; i++) k[i] = 0;
+    if (key_len > 64) dlr_sha256(key, key_len, k);
+    else for (size_t i = 0; i < key_len; i++) k[i] = key[i];
+
+    uint8_t pad[64];
+    dlr_sha256_ctx ctx;
+    for (int i = 0; i < 64; i++) pad[i] = (uint8_t)(k[i] ^ 0x36);
+    dlr_sha256_init(&ctx);
+    dlr_sha256_update(&ctx, pad, 64);
+    dlr_sha256_update(&ctx, msg, msg_len);
+    dlr_sha256_final(&ctx, inner);
+
+    for (int i = 0; i < 64; i++) pad[i] = (uint8_t)(k[i] ^ 0x5c);
+    dlr_sha256_init(&ctx);
+    dlr_sha256_update(&ctx, pad, 64);
+    dlr_sha256_update(&ctx, inner, 32);
+    dlr_sha256_final(&ctx, out);
+}
+
 void dlr_hex(const uint8_t* bytes, size_t len, char* out) {
     static const char digits[] = "0123456789abcdef";
     for (size_t i = 0; i < len; i++) {

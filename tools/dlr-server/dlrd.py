@@ -73,6 +73,8 @@ DEFAULTS = {
     "password_hash": "",           # sha256 hex of the dlr password ("" = open)
     "dlr_port": 7870,              # native protocol, 0 = off
     "http_port": 7871,            # website + /api/package, 0 = off
+    "udp_port": 7870,              # dlr over UDP (same number as the TCP port is fine), 0 = off
+    "udp_public": "",              # host:port people reach the UDP side at (e.g. the playit.gg address)
     "https_port": 7872,            # needs cert_file + key_file, 0 = off
     "cert_file": "",
     "key_file": "",
@@ -121,7 +123,7 @@ def normalise(raw):
     cfg = dict(DEFAULTS)
     cfg.update({k: v for k, v in raw.items() if k in DEFAULTS})
     cfg["name"] = clean_name(cfg["name"])
-    for key, lo, hi in (("dlr_port", 0, 65535), ("http_port", 0, 65535), ("https_port", 0, 65535),
+    for key, lo, hi in (("dlr_port", 0, 65535), ("http_port", 0, 65535), ("https_port", 0, 65535), ("udp_port", 0, 65535),
                         ("admin_port", 0, 65535), ("workers", 0, 256), ("max_upload_mb", 1, 1 << 20),
                         ("max_connections", 4, 100000), ("chunk_size", 512, 60000)):
         try:
@@ -130,7 +132,7 @@ def normalise(raw):
             cfg[key] = DEFAULTS[key]
     for key in ("sniff_dlr_on_http", "broadcast"):
         cfg[key] = bool(cfg[key])
-    for key in ("cert_file", "key_file", "admin_host", "password_hash", "admin_password", "public_host"):
+    for key in ("cert_file", "key_file", "admin_host", "password_hash", "admin_password", "public_host", "udp_public"):
         cfg[key] = str(cfg[key] or "")
     if cfg["password_hash"] and not re.fullmatch(r"[0-9a-f]{64}", cfg["password_hash"]):
         cfg["password_hash"] = ""
@@ -741,7 +743,7 @@ def render_home(h, cfg, store):
         "<div class=step><i>1</i><div><p>Get a network address, once per boot:</p>%(c1)s</div></div>"
         "<div class=step><i>2</i><div><p>Add this server:</p>%(c2)s</div></div>"
         "<div class=step><i>3</i><div><p>See what is available, then install:</p>%(c3)s%(c4)s</div></div></div>"
-        "%(latest)s"
+        "%(latest)s%(admin)s"
         "<h2>For scripts and tools</h2><div class=card>"
         "<p style='margin-top:0'>Every package is a plain HTTP download. The checksum comes in the "
         "<code>X-DLR-SHA256</code> header.</p>%(a1)s%(a2)s%(a3)s"
@@ -750,6 +752,9 @@ def render_home(h, cfg, store):
                auth="Password" if cfg["password_hash"] else "Open", proto=PROTOCOL_VERSION, lock=lock,
                c1=cmd_box("dhcp"), c2=cmd_box(dlr_add_cmd(cfg, host)), c3=cmd_box("dlr list"),
                c4=cmd_box("dlr install " + first_raw),
+               admin=("<h2>Add packages</h2><div class=card>Open the <a href='http://127.0.0.1:%d/'>admin window</a> "
+                      "to drag a folder in, edit settings and manage files.</div>" % cfg["admin_port"])
+               if cfg["admin_port"] and bare_host(h.headers.get("Host") or "") in LOOPBACK_HOSTS else "",
                latest=("<h2>Latest packages</h2><div class=grid>%s</div>"
                        "<p><a href='/list'>Browse all packages and their files &rarr;</a></p>" % latest) if metas else "",
                a1=cmd_box("curl %s/api/package" % base),
@@ -792,7 +797,7 @@ def render_list(h, cfg, store):
         url = urllib.parse.quote(m["name"])
         cards.append(
             "<article class='card pkg' id=\"%(id)s\" data-name=\"%(idl)s\" data-size=\"%(raw)d\" data-q=\"%(q)s\">"
-            "<div class=head><h3>%(name)s</h3>%(ver)s%(tags)s<span class=sz>%(size)s</span></div>"
+            "<div class=head><h3><a href='/api/package/%(url)s' title='Download %(name)s'>%(name)s</a></h3>%(ver)s%(tags)s<span class=sz>%(size)s</span></div>"
             "<p class=d>%(desc)s</p>"
             "%(cmd)s<div class=acts><a class='btn pri' href='/api/package/%(url)s'>Download</a>"
             "<a class=btn href='/api/package/%(url)s/info'>JSON</a></div>"
@@ -838,6 +843,9 @@ class PublicHandler(BaseHTTPRequestHandler):
         self.send_header("Referrer-Policy", "no-referrer")
         if ctype.startswith("text/html"):
             self.send_header("Content-Security-Policy", PAGE_CSP)
+        udp = self.config.get()["udp_public"]
+        if udp and re.fullmatch(r"[A-Za-z0-9.\-\[\]:]{1,255}", udp):
+            self.send_header("X-DLR-UDP", udp)           # where the UDP side lives
         for k, v in (extra or {}).items():
             self.send_header(k, v)
         self.end_headers()
@@ -891,6 +899,15 @@ class PublicHandler(BaseHTTPRequestHandler):
         query = urllib.parse.parse_qs(url.query)
         store = self.store
 
+        if path == "/api/endpoint":                  # public: how to reach every transport
+            host = safe_host(self, cfg)
+            udp = cfg["udp_public"] or None
+            return self._json({"name": cfg["name"], "protocol": PROTOCOL_VERSION,
+                               "password": bool(cfg["password_hash"]),
+                               "dlr": {"host": bare_host(host), "port": cfg["dlr_port"]},
+                               "udp": ({"host": udp.rsplit(":", 1)[0], "port": int(udp.rsplit(":", 1)[1])}
+                                       if udp and re.fullmatch(r"[^:]+:\d{1,5}", udp) else None),
+                               "http": origin(self, cfg)}, head=head)
         if path == "/favicon.ico":
             return self._send(204, b"", "image/x-icon", head=head)
         if path == "/":
@@ -966,6 +983,143 @@ class PublicHandler(BaseHTTPRequestHandler):
                     break
                 self.wfile.write(block)
         log("http: sent %s (%d bytes) to %s" % (name, size, self.client_address[0]))
+
+
+
+# =============================================================================
+# dlr over UDP ("DLU1"): for networks where only UDP gets through (playit.gg)
+# =============================================================================
+# Stateless, client-driven, so loss needs no server memory: the client asks for
+# numbered chunks and re-asks for any that do not arrive.
+#
+#   datagram  = "DLU1" op(1) body
+#   HELLO  0x01 (empty)                      -> 0x81 cookie(16) flags(1: 1=password) name
+#   every other request body starts with  cookie(16) proof(16)  then:
+#   PING   0x02 echo                          -> 0x82 echo
+#   LIST   0x03 page(u16)                     -> 0x83 page(u16) pages(u16) "name|ver|desc\n"...
+#   SEARCH 0x04 page(u16) query               -> 0x83 ...  ("NONE" if nothing)
+#   INFO   0x05 name                          -> 0x85 size(u64) sha256(32) format(u8, 0=tar)
+#   GET    0x06 nlen(u8) name offset(u64) n(u8) -> n x 0x86 offset(u64) data(<=1000)
+#   errors                                    -> 0xFF text
+#
+# cookie = HMAC(server secret, client address, 5-minute window)[:16]. Nothing but
+# HELLO is answered without one, so a spoofed source address cannot make this
+# server flood a victim (a HELLO reply is tiny). proof, when a password is set,
+# is HMAC-SHA256(sha256(password), cookie || op || body)[:16]. It keeps the
+# password off the wire; like the TCP protocol it does not hide the data.
+UDP_MAGIC = b"DLU1"
+UDP_CHUNK = 1000
+UDP_PAGE = 1000
+(U_HELLO, U_PING, U_LIST, U_SEARCH, U_INFO, U_GET) = range(1, 7)
+U_ERR = 0xFF
+_UDP_SECRET = secrets.token_bytes(32)          # made before the fork, so workers share it
+
+
+def udp_cookie(ip, window):
+    return hmac.new(_UDP_SECRET, ("%s|%d" % (ip, window)).encode(), hashlib.sha256).digest()[:16]
+
+
+def udp_err(text):
+    return UDP_MAGIC + bytes([U_ERR]) + text.encode()[:200]
+
+
+def udp_pages(metas):
+    pages, cur = [], b""
+    for m in metas:
+        clean = lambda t: re.sub(r"[|\r\n\t]", " ", t)
+        line = ("%s|%s|%s\n" % (m["name"], clean(m["version"])[:31], clean(m["description"])[:159])).encode()
+        if cur and len(cur) + len(line) > UDP_PAGE:
+            pages.append(cur)
+            cur = b""
+        cur += line
+    if cur:
+        pages.append(cur)
+    return pages
+
+
+def udp_handle(data, ip, cfg, store):
+    """One request datagram in, a list of reply datagrams out."""
+    if len(data) < 5 or data[:4] != UDP_MAGIC:
+        return []
+    op, body = data[4], data[5:]
+    now = int(time.time() // 300)
+    if op == U_HELLO:
+        return [UDP_MAGIC + bytes([0x80 | U_HELLO]) + udp_cookie(ip, now)
+                + bytes([1 if cfg["password_hash"] else 0]) + cfg["name"].encode()]
+    if op not in (U_PING, U_LIST, U_SEARCH, U_INFO, U_GET) or len(body) < 32:
+        return [udp_err("bad request")]
+    cookie, proof, body = body[:16], body[16:32], body[32:]
+    if cookie != udp_cookie(ip, now) and cookie != udp_cookie(ip, now - 1):
+        return [udp_err("stale cookie")]
+    if cfg["password_hash"]:
+        if LIMITER.blocked(ip):
+            return []
+        want = hmac.new(bytes.fromhex(cfg["password_hash"]), cookie + bytes([op]) + body,
+                        hashlib.sha256).digest()[:16]
+        if not hmac.compare_digest(proof, want):
+            LIMITER.fail(ip)
+            return [udp_err("Authentication failed")]
+
+    if op == U_PING:
+        return [UDP_MAGIC + bytes([0x80 | U_PING]) + body[:64]]
+    if op in (U_LIST, U_SEARCH):
+        if len(body) < 2:
+            return [udp_err("bad request")]
+        page = struct.unpack(">H", body[:2])[0]
+        metas = store.search(body[2:130].decode("utf-8", "replace")) if op == U_SEARCH else store.list()
+        pages = udp_pages(metas) or [b"NONE" if op == U_SEARCH else b""]
+        if page >= len(pages):
+            return [udp_err("no such page")]
+        return [UDP_MAGIC + bytes([0x80 | U_LIST]) + struct.pack(">HH", page, len(pages)) + pages[page]]
+    if op == U_INFO:
+        meta = store.get(body.decode("utf-8", "replace"))
+        if meta is None:
+            return [udp_err("Package not found")]
+        return [UDP_MAGIC + bytes([0x80 | U_INFO]) + struct.pack(">Q", meta["size"])
+                + bytes.fromhex(meta["sha256"]) + b"\x00"]
+    if op == U_GET:
+        if len(body) < 1 or len(body) < 1 + body[0] + 9:
+            return [udp_err("bad request")]
+        nlen = body[0]
+        name = body[1:1 + nlen].decode("utf-8", "replace")
+        offset, count = struct.unpack(">QB", body[1 + nlen:1 + nlen + 9])
+        meta = store.get(name)
+        if meta is None:
+            return [udp_err("Package not found")]
+        try:
+            fd = os.open(store.tar_path(name), os.O_RDONLY)
+        except OSError:
+            return [udp_err("Package archive is missing")]
+        try:
+            if os.fstat(fd).st_size != meta["size"]:
+                return [udp_err("Package is being rebuilt, retry")]
+            out = []
+            for i in range(min(count, 16)):
+                at = offset + i * UDP_CHUNK
+                chunk = os.pread(fd, UDP_CHUNK, at) if at < meta["size"] else b""
+                out.append(UDP_MAGIC + bytes([0x80 | U_GET]) + struct.pack(">Q", at) + chunk)
+                if not chunk:
+                    break
+            return out
+        finally:
+            os.close(fd)
+    return []
+
+
+def udp_loop(sock, config, store):
+    while True:
+        try:
+            data, addr = sock.recvfrom(2048)
+        except OSError:
+            time.sleep(0.05)
+            continue
+        try:
+            for reply in udp_handle(data, addr[0], config.get(), store):
+                sock.sendto(reply, addr)
+        except OSError:
+            pass
+        except Exception as e:                          # a bad datagram must not kill the loop
+            log("udp: error from %s: %r" % (addr[0], e))
 
 
 # =============================================================================
@@ -1050,7 +1204,9 @@ def worker_main(listeners, data_dir, config_path):
                 continue
             threading.Thread(target=handle, args=(kind, conn, addr), daemon=True).start()
 
-    threads = [threading.Thread(target=accept_loop, args=(k, s), daemon=True) for k, s in listeners]
+    threads = [threading.Thread(target=udp_loop if k == "udp" else accept_loop,
+                                args=(s, config, store) if k == "udp" else (k, s), daemon=True)
+               for k, s in listeners]
     for t in threads:
         t.start()
     for t in threads:
@@ -1078,6 +1234,22 @@ def bind(port, what):
             s.close()
             if family == socket.AF_INET:
                 log("cannot listen on port %d for %s: %s" % (port, what, e))
+    return None
+
+
+def bind_udp(port, what):
+    for family, host in ((socket.AF_INET6, "::"), (socket.AF_INET, "0.0.0.0")):
+        try:
+            s = socket.socket(family, socket.SOCK_DGRAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if family == socket.AF_INET6:
+                s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            s.bind((host, port))
+            return s
+        except OSError as e:
+            s.close()
+            if family == socket.AF_INET:
+                log("cannot listen on UDP port %d for %s: %s" % (port, what, e))
     return None
 
 
@@ -1130,8 +1302,10 @@ code{background:var(--code);padding:.1em .35em;border-radius:5px}
 <div class=two><div><label>dlr port (TCP)</label><input type=number name=dlr_port min=0 max=65535></div>
 <div><label>Web port (HTTP)</label><input type=number name=http_port min=0 max=65535></div>
 <div><label>HTTPS port</label><input type=number name=https_port min=0 max=65535></div>
+<div><label>UDP port</label><input type=number name=udp_port min=0 max=65535></div>
 <div><label>Worker processes (0 = all cores)</label><input type=number name=workers min=0 max=256></div></div>
 <label>Public host name (shown in install commands)</label><input type=text name=public_host placeholder="xlabs.duckdns.org">
+<label>Public UDP address (host:port, e.g. from playit.gg)</label><input type=text name=udp_public placeholder="name.gl.at.ply.gg:12345">
 <label>TLS certificate file (fullchain.pem)</label><input type=text name=cert_file>
 <label>TLS key file (privkey.pem)</label><input type=text name=key_file>
 <label class=chk><input type=checkbox name=sniff_dlr_on_http> also answer dlr clients on the web ports</label>
@@ -1431,10 +1605,10 @@ class MasterApp:
     def _settings(self, body):
         cur = self.config.get()
         ch = {}
-        for key in ("name", "cert_file", "key_file", "admin_host", "public_host"):
+        for key in ("name", "cert_file", "key_file", "admin_host", "public_host", "udp_public"):
             if key in body:
                 ch[key] = str(body[key])
-        for key in ("dlr_port", "http_port", "https_port", "admin_port", "workers"):
+        for key in ("dlr_port", "http_port", "https_port", "udp_port", "admin_port", "workers"):
             if key in body:
                 ch[key] = int(body[key])
         for key in ("sniff_dlr_on_http", "broadcast"):
@@ -1510,6 +1684,8 @@ def main():
     ap.add_argument("--dlr-port", type=int, help="native protocol port (saved)")
     ap.add_argument("--http-port", type=int, help="web/API port (saved)")
     ap.add_argument("--https-port", type=int, help="HTTPS port (saved)")
+    ap.add_argument("--udp-port", type=int, help="dlr-over-UDP port, 0 disables (saved)")
+    ap.add_argument("--udp-public", help="host:port the UDP side is reachable at, e.g. a playit.gg address (saved)")
     ap.add_argument("--cert", help="TLS certificate chain (saved)")
     ap.add_argument("--key", help="TLS private key (saved)")
     ap.add_argument("--admin-port", type=int, help="admin window port, 0 disables (saved)")
@@ -1520,7 +1696,7 @@ def main():
     config = Config(os.path.join(args.data, "config.json"))
     changes = {}
     for opt, key in (("name", "name"), ("dlr_port", "dlr_port"), ("http_port", "http_port"),
-                     ("https_port", "https_port"), ("cert", "cert_file"), ("key", "key_file"),
+                     ("https_port", "https_port"), ("udp_port", "udp_port"), ("udp_public", "udp_public"), ("cert", "cert_file"), ("key", "key_file"),
                      ("admin_port", "admin_port"), ("workers", "workers")):
         if getattr(args, opt) is not None:
             changes[key] = getattr(args, opt)
@@ -1536,6 +1712,7 @@ def main():
 
     listeners = []
     for kind, port, what in (("dlr", cfg["dlr_port"], "dlr clients"),
+                             ("udp", cfg["udp_port"], "dlr over UDP"),
                              ("http", cfg["http_port"], "the website"),
                              ("https", cfg["https_port"], "HTTPS")):
         if not port:
@@ -1543,10 +1720,10 @@ def main():
         if kind == "https" and not (cfg["cert_file"] and cfg["key_file"]):
             log("HTTPS port set but cert_file/key_file are not: HTTPS is off")
             continue
-        sock = bind(port, what)
+        sock = bind_udp(port, what) if kind == "udp" else bind(port, what)
         if sock:
             listeners.append((kind, sock))
-            log("listening on %s port %d (%s)" % ("TCP", port, what))
+            log("listening on %s port %d (%s)" % ("UDP" if kind == "udp" else "TCP", port, what))
     if not listeners:
         log("nothing to listen on - fix the ports above (admin window still starts)")
 
