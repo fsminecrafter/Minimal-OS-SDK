@@ -4,9 +4,9 @@ dlrd - Deliver server for Minimal-OS, Linux/Python edition.
 
 One program, three faces:
 
-  * the native dlr protocol (default TCP 4242). The Minimal-OS `dlr` client
+  * the native dlr protocol (default TCP 7870). The Minimal-OS `dlr` client
     and Deliver's C++ client work against it unchanged.
-  * a public website (default TCP 80, optionally HTTPS on 443):
+  * a public website (default TCP 7871, optionally HTTPS on 7872):
         /                       home page
         /list                   every package, its files and details
         /api/package            JSON package list   (?q=text searches)
@@ -71,9 +71,9 @@ LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "[::1]", "::1"}
 DEFAULTS = {
     "name": "minimalos",
     "password_hash": "",           # sha256 hex of the dlr password ("" = open)
-    "dlr_port": 4242,              # native protocol, 0 = off
-    "http_port": 80,               # website + /api/package, 0 = off
-    "https_port": 0,               # needs cert_file + key_file, 0 = off
+    "dlr_port": 7870,              # native protocol, 0 = off
+    "http_port": 7871,            # website + /api/package, 0 = off
+    "https_port": 7872,            # needs cert_file + key_file, 0 = off
     "cert_file": "",
     "key_file": "",
     "sniff_dlr_on_http": False,    # also answer dlr clients on the web ports

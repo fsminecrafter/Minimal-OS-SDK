@@ -13,7 +13,7 @@ python3 dlrd.py --open          # data goes in ./data, admin window opens in you
 
 | What | Where | Notes |
 |---|---|---|
-| dlr protocol | TCP 4242 | `dlr add xlabs.duckdns.org`, `dlr list`, `dlr install <pkg>` |
+| dlr protocol | TCP 7870 | `dlr add xlabs.duckdns.org:7870`, `dlr list`, `dlr install <pkg>` |
 | Home page | `http://host/` | name, package count, how to install |
 | Package list | `http://host/list` | every package with its files, sizes, checksum |
 | API list | `GET /api/package` | JSON; `?q=text` searches |
@@ -51,13 +51,13 @@ to keep in sync.
 
 ## Putting it on xlabs.duckdns.org
 
-1. Forward TCP **80** (and **443**, **4242**) from your router to this machine.
+1. Forward TCP **7870** (dlr), **7871** (website/API) and **7872** (HTTPS) from your router to this machine.
    If you are behind CGNAT this cannot work; use a VPS instead.
-2. Ports below 1024 need a privilege. Either
-   `sudo setcap cap_net_bind_service=+ep $(readlink -f $(which python3))`, or
-   set the web port to 8080 in Settings and forward 80 -> 8080 on the router.
+2. The default ports are all above 1024, so no special privilege is needed. The
+   site is then `http://xlabs.duckdns.org:7871/` (port 80 would need
+   `setcap cap_net_bind_service` or a router rule 80 -> 7871).
 3. For HTTPS, get a certificate for the name (certbot or acme.sh, DNS-01 with the
-   DuckDNS plugin), then in Settings set the HTTPS port to 443 and the two files
+   DuckDNS plugin), then in Settings keep the HTTPS port 7872 and set the two files
    (`fullchain.pem`, `privkey.pem`). Renewed certificates are picked up
    without a restart.
 4. Keep DuckDNS pointing at your IP, e.g. a cron job calling
@@ -69,8 +69,8 @@ to keep in sync.
   the clear and the password is sent unencrypted (see `programs/dlr/dlr_proto.h`).
   This server matches it so existing clients work. For anything sensitive, use
   the HTTPS API, and set a password.
-- "Also answer dlr clients on the web ports" lets a dlr client connect to port 80
-  or 443 when only those are open. It costs web clients nothing but adds a short
+- "Also answer dlr clients on the web ports" lets a dlr client connect to a web port
+  when only those are open. It costs web clients nothing but adds a short
   wait before a silent connection is treated as dlr, so it is off by default.
 - Wrong passwords are limited to 10 a minute per address and worker.
 - Chunks are 4096 bytes because the Minimal-OS client rejects frames over 8 KiB.
