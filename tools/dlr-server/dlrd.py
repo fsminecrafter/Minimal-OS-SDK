@@ -1277,9 +1277,9 @@ label{display:block;font-size:.85rem;color:var(--mut);margin:.7rem 0 .2rem}
 table{width:100%;border-collapse:collapse;font-size:.88rem;margin-top:.5rem}td{padding:.12rem .3rem;border-top:1px solid var(--line)}td.n{text-align:right;color:var(--mut);white-space:nowrap}
 h2{font-size:1rem;margin:1.6rem 0 .3rem}#msg{min-height:1.4em;margin:.6rem 0;font-size:.9rem}.err{color:var(--bad)}.okc{color:var(--ok)}
 progress{width:100%;height:.6rem;margin-top:.6rem}
-dialog{border:1px solid var(--line);border-radius:12px;background:var(--card);color:var(--fg);padding:1.2rem 1.3rem;width:min(30rem,94vw)}
+dialog{border:1px solid var(--line);border-radius:12px;background:var(--card);color:var(--fg);padding:1.2rem 1.3rem;width:min(30rem,94vw);max-height:92vh;overflow:auto}
 dialog::backdrop{background:#0008}.two{display:grid;grid-template-columns:1fr 1fr;gap:.8rem}.chk{display:flex;gap:.5rem;align-items:center;margin-top:.8rem;color:var(--fg);font-size:.9rem}
-.chk input{width:auto}.foot{display:flex;gap:.5rem;justify-content:flex-end;margin-top:1.2rem}.note{font-size:.8rem;color:var(--mut);margin-top:.5rem}
+.chk input{width:auto}.foot{display:flex;gap:.5rem;justify-content:flex-end;margin-top:1.2rem;position:sticky;bottom:-1.2rem;background:var(--card);padding:.6rem 0}.note{font-size:.8rem;color:var(--mut);margin-top:.5rem}
 code{background:var(--code);padding:.1em .35em;border-radius:5px}
 </style>
 <header><h1 id=title>dlrd</h1><small id=meta></small><button id=openset>⚙ Settings</button></header>
@@ -1305,9 +1305,9 @@ code{background:var(--code);padding:.1em .35em;border-radius:5px}
 <div><label>UDP port</label><input type=number name=udp_port min=0 max=65535></div>
 <div><label>Worker processes (0 = all cores)</label><input type=number name=workers min=0 max=256></div></div>
 <label>Public host name (shown in install commands)</label><input type=text name=public_host placeholder="xlabs.duckdns.org">
-<label>Public UDP address (host:port, e.g. from playit.gg)</label><input type=text name=udp_public placeholder="name.gl.at.ply.gg:12345">
 <label>TLS certificate file (fullchain.pem)</label><input type=text name=cert_file>
 <label>TLS key file (privkey.pem)</label><input type=text name=key_file>
+<label>Public UDP address (host:port, e.g. from playit.gg)</label><input type=text name=udp_public placeholder="name.gl.at.ply.gg:12345">
 <label class=chk><input type=checkbox name=sniff_dlr_on_http> also answer dlr clients on the web ports</label>
 <label class=chk><input type=checkbox name=broadcast> announce on the LAN (UDP discovery)</label>
 <div class=two><div><label>Admin window port</label><input type=number name=admin_port min=0 max=65535></div>
