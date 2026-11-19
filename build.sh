@@ -2,7 +2,7 @@
 set -eu
 
 usage() {
-    echo "Usage: $0 [--slib] [--worker] [--main <source.c|source.cpp>] [--output <path>] <source.c|source.cpp|folder>"
+    echo "Usage: $0 [--slib] [--worker] [--main <source.c|source.cpp>] [--output <path>] [--icon <icon.bmp|icon.ico>] <source.c|source.cpp|folder>"
 }
 
 fail_usage() {
@@ -14,6 +14,7 @@ SLIB=0
 WORKER=0
 MAIN_SOURCE=""
 OUTPUT_PATH=""
+ICON_PATH=""
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -35,6 +36,12 @@ while [ "$#" -gt 0 ]; do
             OUTPUT_PATH=$2
             shift 2
             ;;
+        --icon)
+            # The launcher icon (mosWM shows it): bundled as icon.bmp/.ico.
+            [ "$#" -ge 2 ] || fail_usage
+            ICON_PATH=$2
+            shift 2
+            ;;
         -h|--help)
             usage
             exit 0
@@ -48,6 +55,10 @@ while [ "$#" -gt 0 ]; do
 done
 
 [ -n "${SOURCE_ROOT:-}" ] || fail_usage
+if [ -n "$ICON_PATH" ]; then
+    [ -f "$ICON_PATH" ] || { echo "Icon not found: $ICON_PATH" >&2; exit 1; }
+    ICON_PATH=$(CDPATH= cd -- "$(dirname -- "$ICON_PATH")" && pwd)/$(basename -- "$ICON_PATH")
+fi
 
 SOURCE_WAS_DIR=0
 
@@ -320,6 +331,6 @@ else
     if [ "$SOURCE_WAS_DIR" -eq 1 ] && [ -d "$SOURCE_ROOT/Resources" ]; then
         cp -R "$SOURCE_ROOT/Resources" "$BUILD_DIR/Resources"
     fi
-    "$SCRIPT_DIR/mkrun.sh" "$ELF" "$OUTPUT"
+    "$SCRIPT_DIR/mkrun.sh" "$ELF" "$OUTPUT" ${ICON_PATH:+"$ICON_PATH"}
     echo "Built $OUTPUT"
 fi
