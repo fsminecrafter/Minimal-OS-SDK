@@ -243,6 +243,23 @@ else
     SOURCES=$SOURCE_FILE
 fi
 
+# A program folder may list folders whose sources it shares, one per line, relative to it, in a file
+# named shared-sources (# comments). Their .c / .cpp files are compiled too, except main.c and *_main.c
+# (their own programs' entry points). DeliverManager shares dlr's: a file added to programs/dlr is
+# picked up without anything else to change.
+if [ "$SOURCE_WAS_DIR" -eq 1 ] && [ -f "$SOURCE_ROOT/shared-sources" ]; then
+    while IFS= read -r SHARED || [ -n "$SHARED" ]; do
+        SHARED=${SHARED%%#*}
+        SHARED=$(printf '%s' "$SHARED" | tr -d '[:space:]')
+        [ -n "$SHARED" ] || continue
+        SHARED_DIR="$SOURCE_ROOT/$SHARED"
+        [ -d "$SHARED_DIR" ] || { echo "shared-sources: no folder $SHARED_DIR" >&2; exit 1; }
+        SOURCES="$SOURCES
+$(find "$SHARED_DIR" -maxdepth 1 -type f \( -name '*.c' -o -name '*.cpp' \) \
+    ! -name 'main.c' ! -name '*_main.c' -print | sort)"
+    done < "$SOURCE_ROOT/shared-sources"
+fi
+
 [ -n "$SOURCES" ] || {
     echo "No C/C++ sources found in $SOURCE_ROOT" >&2
     exit 1
