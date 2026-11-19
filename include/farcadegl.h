@@ -53,6 +53,7 @@
 #include "string.h"
 #include "x86_64/user_syscalls.h"
 #include "fglsl.h"
+#include "fglcache.h"
 
 /* ================================================================ math */
 
@@ -405,6 +406,7 @@ static inline void fgl__bind(FGLContext* gl) {
 
 static inline void fglDestroyContext(FGLContext* gl) {
     if (!gl) return;
+    fglShaderCacheFlush();
     if (gl->desc.page_flip) {
         syscall_gpu_request_t r;
         memset(&r, 0, sizeof(r));
@@ -698,7 +700,10 @@ static inline FGLShader* fglCreateShader(FGLContext* gl, const char* vertex_src,
         strcpy(gl->shader_log, "out of memory");
         return NULL;
     }
-    if (fglsl_compile(c, vertex_src, fragment_src) != 0) {
+    // The shader cache (fglcache.h) first; the compiler when it does not
+    // have the program.
+    int cached = fglc__load(vertex_src, fragment_src, c);
+    if (!cached && fglsl_compile(c, vertex_src, fragment_src) != 0) {
         memcpy(gl->shader_log, c->error, sizeof(gl->shader_log));
         gl->shader_log[sizeof(gl->shader_log) - 1] = '\0';
         free(c);
@@ -710,7 +715,26 @@ static inline FGLShader* fglCreateShader(FGLContext* gl, const char* vertex_src,
     r.op = SYS_GPU_CREATE_PROGRAM;
     r.data = c->words;
     r.bytes = c->size;
-    if (fgl__call(&r) != SYS_SUCCESS) {
+    uint64_t made = fgl__call(&r);
+    if (made != SYS_SUCCESS && cached) {
+        // A cached program the kernel no longer takes: compile it afresh.
+        fglc__forget(vertex_src, fragment_src);
+        cached = 0;
+        if (fglsl_compile(c, vertex_src, fragment_src) != 0) {
+            memcpy(gl->shader_log, c->error, sizeof(gl->shader_log));
+            gl->shader_log[sizeof(gl->shader_log) - 1] = '\0';
+            free(c);
+            free(sh);
+            return NULL;
+        }
+        memset(&r, 0, sizeof(r));
+        r.op = SYS_GPU_CREATE_PROGRAM;
+        r.data = c->words;
+        r.bytes = c->size;
+        made = fgl__call(&r);
+    }
+    if (made == SYS_SUCCESS && !cached) fglc__store(vertex_src, fragment_src, c);
+    if (made != SYS_SUCCESS) {
         strcpy(gl->shader_log, "the GPU rejected the program (see the serial log)");
         free(c);
         free(sh);
