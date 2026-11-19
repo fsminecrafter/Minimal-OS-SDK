@@ -1,0 +1,3 @@
+# Folders whose sources DeliverManager is built with (build.sh): dlr's library, all of it but its
+# main.c and dlrconnect_main.c, so a file added there needs nothing here.
+../dlr
