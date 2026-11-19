@@ -77,6 +77,7 @@ DEFAULTS = {
     "cert_file": "",
     "key_file": "",
     "sniff_dlr_on_http": False,    # also answer dlr clients on the web ports
+    "public_host": "",             # name shown in install commands (default: the Host header)
     "workers": 0,                  # 0 = one per CPU core
     "admin_host": "127.0.0.1",
     "admin_port": 8081,            # 0 = no admin window
@@ -129,7 +130,7 @@ def normalise(raw):
             cfg[key] = DEFAULTS[key]
     for key in ("sniff_dlr_on_http", "broadcast"):
         cfg[key] = bool(cfg[key])
-    for key in ("cert_file", "key_file", "admin_host", "password_hash", "admin_password"):
+    for key in ("cert_file", "key_file", "admin_host", "password_hash", "admin_password", "public_host"):
         cfg[key] = str(cfg[key] or "")
     if cfg["password_hash"] and not re.fullmatch(r"[0-9a-f]{64}", cfg["password_hash"]):
         cfg["password_hash"] = ""
@@ -589,89 +590,230 @@ def dlr_send_package(s, store, name, chunk_size, ip):
 # public web pages and /api/package
 # =============================================================================
 CSS = """
-:root{--bg:#f6f7f9;--fg:#1b1f24;--mut:#5b6572;--card:#fff;--line:#dfe3e8;--acc:#2563eb;--code:#eef1f5}
-@media(prefers-color-scheme:dark){:root{--bg:#101318;--fg:#e6e9ee;--mut:#97a1ae;--card:#181c23;--line:#2a303a;--acc:#6ea0ff;--code:#222833}}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.5 system-ui,sans-serif}
-main{max-width:56rem;margin:0 auto;padding:1.5rem 1rem 4rem}
-nav{display:flex;gap:1.25rem;align-items:baseline;margin-bottom:1.5rem}nav b{font-size:1.2rem;margin-right:auto}
-a{color:var(--acc)}h1{font-size:1.9rem;margin:.2rem 0 .4rem}h2{font-size:1.1rem;margin:1.8rem 0 .5rem}
-.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:1rem 1.1rem;margin:.8rem 0}
-.mut{color:var(--mut)}code,pre{background:var(--code);border-radius:6px;font:14px ui-monospace,monospace}
-code{padding:.1em .35em}pre{padding:.7rem .9rem;overflow:auto}
-.stats{display:flex;gap:2rem;flex-wrap:wrap}.stats div b{display:block;font-size:1.5rem}
-summary{cursor:pointer;font-weight:600}.row{display:flex;gap:.6rem;align-items:baseline;flex-wrap:wrap}
-.tag{font-size:.8rem;padding:.05rem .5rem;border:1px solid var(--line);border-radius:99px;color:var(--mut)}
-table{width:100%;border-collapse:collapse;font-size:.92rem}td{padding:.15rem .4rem;border-top:1px solid var(--line)}
-td.n{text-align:right;white-space:nowrap;color:var(--mut)}.hash{word-break:break-all;font:12px ui-monospace,monospace;color:var(--mut)}
+:root{--bg:#f5f6f8;--fg:#14181f;--mut:#5a6473;--card:#fff;--line:#e0e4ea;--acc:#2f6bff;--acc2:#7a4dff;--on:#fff;
+--code:#eef1f6;--ok:#16a34a;--warn:#b45309;--shadow:0 1px 2px #0000000d,0 6px 20px -8px #0000001f}
+@media(prefers-color-scheme:dark){:root{--bg:#0d1016;--fg:#e8ebf1;--mut:#94a0b2;--card:#161a22;--line:#262c37;--acc:#7aa2ff;--acc2:#a78bfa;--on:#0b0e13;
+--code:#1f2530;--ok:#4ade80;--warn:#fbbf24;--shadow:0 1px 2px #0006,0 8px 24px -10px #000a}}
+*{box-sizing:border-box}html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif;-webkit-font-smoothing:antialiased}
+a{color:var(--acc);text-decoration:none}a:hover{text-decoration:underline}
+.top{position:sticky;top:0;z-index:5;background:color-mix(in srgb,var(--bg) 82%,transparent);backdrop-filter:blur(10px);border-bottom:1px solid var(--line)}
+.top div{max-width:60rem;margin:0 auto;padding:.7rem 1rem;display:flex;align-items:center;gap:1.1rem}
+.brand{display:flex;align-items:center;gap:.55rem;font-weight:700;font-size:1.05rem;color:var(--fg);margin-right:auto}
+.brand:hover{text-decoration:none}.brand svg{width:26px;height:26px}
+.top a.nav{color:var(--mut);font-size:.95rem;padding:.2rem .1rem;border-bottom:2px solid transparent}
+.top a.nav:hover,.top a.on{color:var(--fg);text-decoration:none;border-color:var(--acc)}
+main{max-width:60rem;margin:0 auto;padding:1.6rem 1rem 3rem}
+.hero{padding:2.2rem 1.4rem;border-radius:16px;color:#fff;background:linear-gradient(135deg,var(--acc),var(--acc2));box-shadow:var(--shadow);margin-bottom:1.2rem}
+.hero h1{margin:0 0 .3rem;font-size:clamp(1.7rem,5vw,2.4rem);line-height:1.15}.hero p{margin:0;opacity:.92;max-width:34rem}
+.hero .pill{display:inline-flex;align-items:center;gap:.4rem;background:#ffffff26;border-radius:99px;padding:.15rem .7rem;font-size:.82rem;margin-bottom:.9rem}
+.dot{width:.55rem;height:.55rem;border-radius:50%;background:#4ade80;box-shadow:0 0 0 3px #4ade8040}
+.grid{display:grid;gap:.8rem;grid-template-columns:repeat(auto-fit,minmax(10rem,1fr))}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:1rem 1.1rem;box-shadow:var(--shadow)}
+.stat b{display:block;font-size:1.6rem;line-height:1.2}.stat span{color:var(--mut);font-size:.88rem}
+h2{font-size:1.15rem;margin:2rem 0 .7rem}.mut{color:var(--mut)}
+.step{display:flex;gap:.8rem;align-items:flex-start;margin:.55rem 0}
+.step i{flex:none;width:1.7rem;height:1.7rem;border-radius:50%;background:var(--acc);color:var(--on);font:700 .85rem/1.7rem system-ui;text-align:center;font-style:normal;margin-top:.2rem}
+.step div{flex:1;min-width:0}.step p{margin:0 0 .3rem}
+.cmd{display:flex;align-items:center;gap:.5rem;background:var(--code);border-radius:9px;padding:.35rem .4rem .35rem .8rem;margin:.25rem 0}
+.cmd code{flex:1;min-width:0;overflow-x:auto;white-space:nowrap;font:13.5px ui-monospace,SFMono-Regular,Menlo,monospace;scrollbar-width:thin}
+button,.btn{font:inherit;font-size:.86rem;border:1px solid var(--line);background:var(--card);color:var(--fg);border-radius:8px;padding:.28rem .7rem;cursor:pointer;white-space:nowrap}
+button:hover,.btn:hover{border-color:var(--acc);text-decoration:none}
+.btn.pri{background:var(--acc);color:var(--on);border-color:var(--acc);font-weight:600}
+.tools{display:flex;gap:.6rem;flex-wrap:wrap;margin:.2rem 0 1rem}
+.tools input,.tools select{font:inherit;padding:.5rem .8rem;border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--fg)}
+.tools input{flex:1;min-width:12rem}.tools input:focus,.tools select:focus{outline:2px solid var(--acc);outline-offset:1px}
+.pkg h3{margin:0;font-size:1.15rem}.pkg .head{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap}
+.pkg .sz{margin-left:auto;color:var(--mut);font-size:.9rem}.pkg p.d{margin:.35rem 0 .6rem}
+.tag{font-size:.74rem;padding:.04rem .55rem;border:1px solid var(--line);border-radius:99px;color:var(--mut)}
+.tag.v{border-color:var(--acc);color:var(--acc)}
+.acts{display:flex;gap:.5rem;flex-wrap:wrap;align-items:center;margin-top:.5rem}
+details{margin-top:.6rem}summary{cursor:pointer;color:var(--mut);font-size:.92rem;user-select:none}
+summary:hover{color:var(--fg)}
+.tree,.tree ul{list-style:none;margin:.3rem 0 0;padding-left:1.1rem}.tree{padding-left:0;font:13px ui-monospace,monospace}
+.tree li{display:flex;gap:.6rem;padding:.08rem 0}.tree li.f span:last-child{margin-left:auto;color:var(--mut);white-space:nowrap}
+.tree summary{font:13px ui-monospace,monospace;color:var(--fg)}.tree li.f::before{content:"·";color:var(--mut)}
+.hash{display:block;margin-top:.6rem;font:11.5px ui-monospace,monospace;color:var(--mut);word-break:break-all}
+.empty{text-align:center;padding:2.5rem 1rem;color:var(--mut)}
+.note{border-left:3px solid var(--warn);padding:.5rem .9rem;background:color-mix(in srgb,var(--warn) 9%,var(--card));border-radius:0 10px 10px 0;margin:.8rem 0;font-size:.92rem}
+footer{max-width:60rem;margin:0 auto;padding:0 1rem 2rem;color:var(--mut);font-size:.85rem}
+@media(max-width:34rem){.top div{gap:.7rem}.hero{padding:1.5rem 1.1rem}}
 """
 
+ICON = ("<svg viewBox='0 0 32 32' aria-hidden='true'><rect width='32' height='32' rx='8' fill='#2f6bff'/>"
+        "<path d='M16 6l8 4.5v9L16 24l-8-4.5v-9z' fill='none' stroke='#fff' stroke-width='2' stroke-linejoin='round'/>"
+        "<path d='M8 10.5l8 4.5 8-4.5M16 15v9' fill='none' stroke='#fff' stroke-width='2' stroke-linejoin='round'/></svg>")
+FAVICON = "data:image/svg+xml," + urllib.parse.quote(ICON.replace("aria-hidden='true'", "xmlns='http://www.w3.org/2000/svg'"))
 
-def page(title, body, cfg):
+# Small enhancement script: copy buttons, search and sort on /list. Everything
+# works without it (the CSP only allows exactly this script, by hash).
+PAGE_JS = """
+(function(){
+function copy(t,b){var done=function(){var o=b.textContent;b.textContent='Copied';setTimeout(function(){b.textContent=o},1200)};
+ if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(t).then(done,function(){})}
+ else{var a=document.createElement('textarea');a.value=t;a.style.position='fixed';a.style.opacity='0';document.body.appendChild(a);a.select();
+ try{document.execCommand('copy');done()}catch(e){}document.body.removeChild(a)}}
+document.querySelectorAll('[data-copy]').forEach(function(b){b.addEventListener('click',function(){copy(b.getAttribute('data-copy'),b)})});
+var q=document.getElementById('q'),s=document.getElementById('sort'),list=document.getElementById('pkgs');if(!q||!list)return;
+var cards=[].slice.call(list.querySelectorAll('.pkg')),cnt=document.getElementById('count'),none=document.getElementById('none');
+function apply(){var t=q.value.trim().toLowerCase(),n=0;
+ cards.forEach(function(c){var ok=!t||c.getAttribute('data-q').indexOf(t)>=0;c.hidden=!ok;if(ok)n++});
+ cnt.textContent=n+' of '+cards.length;none.hidden=n>0}
+function sort(){var k=s.value;cards.sort(function(a,b){return k=='size'?b.dataset.size-a.dataset.size:a.dataset.name.localeCompare(b.dataset.name)});
+ cards.forEach(function(c){list.appendChild(c)})}
+q.addEventListener('input',apply);s.addEventListener('change',sort);apply();
+var ex=document.getElementById('expand');if(ex)ex.addEventListener('click',function(){var open=ex.getAttribute('data-o')!='1';
+ document.querySelectorAll('.pkg details').forEach(function(d){d.open=open});ex.setAttribute('data-o',open?'1':'0');ex.textContent=open?'Collapse all':'Expand all'});
+})();
+"""
+PAGE_JS_HASH = "sha256-" + base64.b64encode(hashlib.sha256(PAGE_JS.encode()).digest()).decode()
+PAGE_CSP = ("default-src 'none'; style-src 'unsafe-inline'; img-src data:; script-src '%s'; "
+            "base-uri 'none'; form-action 'none'; frame-ancestors 'none'" % PAGE_JS_HASH)
+
+
+def page(title, body, cfg, active=""):
+    def nav(href, label, key):
+        return "<a class='nav%s' href='%s'>%s</a>" % (" on" if key == active else "", href, label)
     return ("<!doctype html><html lang=en><meta charset=utf-8>"
             "<meta name=viewport content='width=device-width,initial-scale=1'>"
-            "<title>%s</title><style>%s</style><main>"
-            "<nav><b>%s</b><a href='/'>Home</a><a href='/list'>Packages</a>"
-            "<a href='/api/package'>API</a></nav>%s</main></html>"
-            % (html.escape(title), CSS, html.escape(cfg["name"]), body)).encode()
+            "<meta name=color-scheme content='light dark'><link rel=icon href=\"%s\">"
+            "<title>%s</title><style>%s</style>"
+            "<header class=top><div><a class=brand href='/'>%s<span>%s</span></a>%s%s%s</div></header>"
+            "<main>%s</main><footer>dlrd &middot; Deliver server for Minimal-OS</footer>"
+            "<script>%s</script></html>"
+            % (FAVICON, html.escape(title), CSS, ICON, html.escape(cfg["name"]),
+               nav("/", "Home", "home"), nav("/list", "Packages", "list"), nav("/api/package", "API", "api"),
+               body, PAGE_JS)).encode()
 
 
 def safe_host(handler, cfg):
-    host = (handler.headers.get("Host") or "").strip()
+    host = (cfg.get("public_host") or handler.headers.get("Host") or "").strip()
     return host if re.fullmatch(r"[A-Za-z0-9.\-\[\]:]{1,255}", host) else "this-server"
+
+
+def bare_host(host):
+    return host if host.startswith("[") else host.split(":")[0]
+
+
+def origin(handler, cfg):
+    """scheme://host[:port] as the visitor reached the site."""
+    scheme = "https" if handler.headers.get("X-Forwarded-Proto") == "https" else "http"
+    host = (handler.headers.get("Host") or "").strip()
+    host = host if re.fullmatch(r"[A-Za-z0-9.\-\[\]:]{1,255}", host) else "this-server"
+    return "%s://%s" % (scheme, host)
+
+
+def cmd_box(text):
+    t = html.escape(text, quote=True)
+    return "<div class=cmd><code>%s</code><button type=button data-copy=\"%s\">Copy</button></div>" % (t, t)
+
+
+def dlr_add_cmd(cfg, host):
+    port = cfg["dlr_port"]
+    return "dlr add %s%s" % (bare_host(host), "" if port in (0, 4242) else ":%d" % port)
 
 
 def render_home(h, cfg, store):
     metas = store.list()
     host = safe_host(h, cfg)
-    bare = host.split(":")[0] if not host.startswith("[") else host
+    base = origin(h, cfg)
     total = sum(m["size"] for m in metas)
-    lock = ("<p class=mut>This server asks for a password. Pass it to the client with "
-            "<code>--password</code>.</p>") if cfg["password_hash"] else ""
-    dlr_port = cfg["dlr_port"]
-    add = "dlr add %s%s" % (bare, "" if dlr_port in (0, 4242) else ":%d" % dlr_port)
+    first = html.escape(metas[0]["name"]) if metas else "&lt;package&gt;"
+    first_raw = metas[0]["name"] if metas else "<package>"
+    lock = ("<div class=note>This server is password protected. Add <code>--password &lt;pw&gt;</code> to "
+            "<code>dlr list</code> and <code>dlr install</code>, or send it as an "
+            "<code>X-DLR-Password</code> header to the API.</div>") if cfg["password_hash"] else ""
+    latest = ""
+    for m in sorted(metas, key=lambda m: -m["built"])[:4]:
+        latest += ("<a class=card href='/list#%s' style='color:inherit'><b>%s</b> <span class=tag>%s</span>"
+                   "<div class=mut style='font-size:.9rem'>%s</div></a>"
+                   % (html.escape(m["name"]), html.escape(m["name"]), html.escape(m["version"] or "-"),
+                      html.escape(m["description"] or human(m["size"]))))
     body = (
-        "<h1>%s</h1><p class=mut>A Deliver package server for Minimal-OS.</p>"
-        "<div class='card stats'><div><b>%d</b><span class=mut>packages</span></div>"
-        "<div><b>%s</b><span class=mut>on offer</span></div>"
-        "<div><b>%s</b><span class=mut>protocol</span></div></div>%s"
-        "<h2>Install from Minimal-OS</h2><p>Run <code>dhcp</code> once per boot, then:</p>"
-        "<pre>%s\ndlr list\ndlr install &lt;package&gt;</pre>"
-        "<p><a href='/list'>Browse all packages and their contents &rarr;</a></p>"
-        "<h2>For tools and scripts</h2><p>Every package is a plain HTTP download: "
-        "<code>GET /api/package</code> lists them as JSON, "
-        "<code>GET /api/package/&lt;name&gt;</code> returns the archive "
-        "(<code>X-DLR-SHA256</code> carries its checksum).</p>"
-        % (html.escape(cfg["name"]), len(metas), html.escape(human(total)),
-           "dlr v%d" % PROTOCOL_VERSION, lock, html.escape(add)))
-    return page(cfg["name"], body, cfg)
+        "<section class=hero><span class=pill><span class=dot></span>Online</span>"
+        "<h1>%(name)s</h1><p>Packages for Minimal-OS, delivered with dlr. Browse what is on offer, then install it "
+        "with one command.</p></section>"
+        "<div class=grid><div class='card stat'><b>%(n)d</b><span>packages</span></div>"
+        "<div class='card stat'><b>%(size)s</b><span>on offer</span></div>"
+        "<div class='card stat'><b>%(auth)s</b><span>access</span></div>"
+        "<div class='card stat'><b>dlr v%(proto)d</b><span>protocol</span></div></div>%(lock)s"
+        "<h2>Install on Minimal-OS</h2><div class=card>"
+        "<div class=step><i>1</i><div><p>Get a network address, once per boot:</p>%(c1)s</div></div>"
+        "<div class=step><i>2</i><div><p>Add this server:</p>%(c2)s</div></div>"
+        "<div class=step><i>3</i><div><p>See what is available, then install:</p>%(c3)s%(c4)s</div></div></div>"
+        "%(latest)s"
+        "<h2>For scripts and tools</h2><div class=card>"
+        "<p style='margin-top:0'>Every package is a plain HTTP download. The checksum comes in the "
+        "<code>X-DLR-SHA256</code> header.</p>%(a1)s%(a2)s%(a3)s"
+        "<p class=mut style='margin-bottom:0'><a href='/api/package'>Open the JSON list &rarr;</a></p></div>"
+        % dict(name=html.escape(cfg["name"]), n=len(metas), size=html.escape(human(total)),
+               auth="Password" if cfg["password_hash"] else "Open", proto=PROTOCOL_VERSION, lock=lock,
+               c1=cmd_box("dhcp"), c2=cmd_box(dlr_add_cmd(cfg, host)), c3=cmd_box("dlr list"),
+               c4=cmd_box("dlr install " + first_raw),
+               latest=("<h2>Latest packages</h2><div class=grid>%s</div>"
+                       "<p><a href='/list'>Browse all packages and their files &rarr;</a></p>" % latest) if metas else "",
+               a1=cmd_box("curl %s/api/package" % base),
+               a2=cmd_box("curl -O %s/api/package/%s" % (base, urllib.parse.quote(first_raw))),
+               a3=cmd_box("curl %s/api/package/%s/info" % (base, urllib.parse.quote(first_raw)))))
+    return page(cfg["name"], body, cfg, "home")
+
+
+def render_tree(files):
+    root = {}
+    for f in files:
+        node = root
+        parts = f["path"].split("/")
+        for p in parts[:-1]:
+            node = node.setdefault(p + "/", {})
+        node[parts[-1]] = f["size"]
+
+    def walk(node, depth):
+        out = []
+        for key in sorted(node, key=lambda k: (not k.endswith("/"), k.lower())):
+            val = node[key]
+            if isinstance(val, dict):
+                out.append("<li><details%s><summary>%s</summary><ul>%s</ul></details></li>"
+                           % (" open" if depth == 0 else "", html.escape(key), walk(val, depth + 1)))
+            else:
+                out.append("<li class=f><span>%s</span><span>%s</span></li>" % (html.escape(key), human(val)))
+        return "".join(out)
+    return "<ul class=tree>%s</ul>" % walk(root, 0)
 
 
 def render_list(h, cfg, store):
     metas = store.list()
     host = safe_host(h, cfg)
-    bare = host.split(":")[0] if not host.startswith("[") else host
     if not metas:
-        return page("Packages", "<h1>Packages</h1><p class=mut>Nothing published yet.</p>", cfg)
+        return page("Packages", "<h1>Packages</h1><div class='card empty'>Nothing is published yet.</div>",
+                    cfg, "list")
     cards = []
     for m in metas:
-        rows = "".join("<tr><td>%s</td><td class=n>%s</td></tr>" % (html.escape(f["path"]), html.escape(human(f["size"])))
-                       for f in m["files"])
-        compat = " ".join("<span class=tag>%s</span>" % html.escape(t)
-                          for t in (m["arch"], m["os"]) if t)
+        tags = "".join("<span class=tag>%s</span>" % html.escape(t) for t in (m["arch"], m["os"]) if t)
+        url = urllib.parse.quote(m["name"])
         cards.append(
-            "<div class=card id='%(id)s'><div class=row><b style='font-size:1.1rem'>%(name)s</b>"
-            "<span class=mut>%(ver)s</span>%(compat)s<span class='mut' style='margin-left:auto'>%(size)s</span></div>"
-            "<p>%(desc)s</p>"
-            "<p><a href='/api/package/%(url)s'>Download</a> &middot; <a href='/api/package/%(url)s/info'>JSON</a> "
-            "&middot; <code>dlr install %(name)s %(host)s</code></p>"
-            "<details><summary>%(count)d files, %(total)s unpacked</summary><table>%(rows)s</table></details>"
-            "<p class=hash>sha256 %(sha)s</p></div>"
-            % dict(id=html.escape(m["name"]), name=html.escape(m["name"]), ver=html.escape(m["version"]),
-                   compat=compat, size=html.escape(human(m["size"])), desc=html.escape(m["description"]) or
-                   "<span class=mut>No description.</span>", url=urllib.parse.quote(m["name"]),
-                   host=html.escape(bare), count=m["file_count"], total=html.escape(human(m["total_bytes"])),
-                   rows=rows, sha=m["sha256"]))
-    return page("Packages", "<h1>Packages</h1>" + "".join(cards), cfg)
+            "<article class='card pkg' id=\"%(id)s\" data-name=\"%(idl)s\" data-size=\"%(raw)d\" data-q=\"%(q)s\">"
+            "<div class=head><h3>%(name)s</h3>%(ver)s%(tags)s<span class=sz>%(size)s</span></div>"
+            "<p class=d>%(desc)s</p>"
+            "%(cmd)s<div class=acts><a class='btn pri' href='/api/package/%(url)s'>Download</a>"
+            "<a class=btn href='/api/package/%(url)s/info'>JSON</a></div>"
+            "<details><summary>%(count)d files &middot; %(total)s unpacked</summary>%(tree)s</details>"
+            "<span class=hash>sha256 %(sha)s</span></article>"
+            % dict(id=html.escape(m["name"], quote=True), idl=html.escape(m["name"].lower(), quote=True),
+                   raw=m["size"], q=html.escape((m["name"] + " " + m["description"]).lower(), quote=True),
+                   name=html.escape(m["name"]),
+                   ver=("<span class='tag v'>%s</span>" % html.escape(m["version"])) if m["version"] else "",
+                   tags=tags, size=html.escape(human(m["size"])),
+                   desc=html.escape(m["description"]) or "<span class=mut>No description.</span>",
+                   cmd=cmd_box("dlr install %s" % m["name"]), url=url, count=m["file_count"],
+                   total=html.escape(human(m["total_bytes"])), tree=render_tree(m["files"]), sha=m["sha256"]))
+    body = ("<h1 style='margin:.2rem 0 .8rem'>Packages</h1>"
+            "<div class=tools><input id=q type=search placeholder='Search packages' autocomplete=off "
+            "aria-label='Search packages'><select id=sort aria-label='Sort'><option value=name>Name</option>"
+            "<option value=size>Largest first</option></select><button id=expand type=button>Expand all</button>"
+            "<span class=mut style='align-self:center' id=count></span></div>"
+            "<div id=pkgs style='display:grid;gap:.9rem'>%s</div>"
+            "<div id=none class='card empty' hidden>No package matches your search.</div>" % "".join(cards))
+    return page("Packages", body, cfg, "list")
 
 
 class PublicHandler(BaseHTTPRequestHandler):
@@ -695,7 +837,7 @@ class PublicHandler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         if ctype.startswith("text/html"):
-            self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'")
+            self.send_header("Content-Security-Policy", PAGE_CSP)
         for k, v in (extra or {}).items():
             self.send_header(k, v)
         self.end_headers()
@@ -749,6 +891,8 @@ class PublicHandler(BaseHTTPRequestHandler):
         query = urllib.parse.parse_qs(url.query)
         store = self.store
 
+        if path == "/favicon.ico":
+            return self._send(204, b"", "image/x-icon", head=head)
         if path == "/":
             return self._send(200, render_home(self, cfg, store), head=head)
         if path == "/list":
@@ -987,6 +1131,7 @@ code{background:var(--code);padding:.1em .35em;border-radius:5px}
 <div><label>Web port (HTTP)</label><input type=number name=http_port min=0 max=65535></div>
 <div><label>HTTPS port</label><input type=number name=https_port min=0 max=65535></div>
 <div><label>Worker processes (0 = all cores)</label><input type=number name=workers min=0 max=256></div></div>
+<label>Public host name (shown in install commands)</label><input type=text name=public_host placeholder="xlabs.duckdns.org">
 <label>TLS certificate file (fullchain.pem)</label><input type=text name=cert_file>
 <label>TLS key file (privkey.pem)</label><input type=text name=key_file>
 <label class=chk><input type=checkbox name=sniff_dlr_on_http> also answer dlr clients on the web ports</label>
@@ -1286,7 +1431,7 @@ class MasterApp:
     def _settings(self, body):
         cur = self.config.get()
         ch = {}
-        for key in ("name", "cert_file", "key_file", "admin_host"):
+        for key in ("name", "cert_file", "key_file", "admin_host", "public_host"):
             if key in body:
                 ch[key] = str(body[key])
         for key in ("dlr_port", "http_port", "https_port", "admin_port", "workers"):
