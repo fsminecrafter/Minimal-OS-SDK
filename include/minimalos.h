@@ -171,6 +171,13 @@ static inline long mos_task_end(uint64_t pid) {
     return mos_syscall(SYS_TASK, SYS_TASK_END, (long)pid, 0);
 }
 
+// The graphics card: name, dedicated memory and its engines' busy time
+// since boot (SYS_TASK_GPU). Sample twice for usage. SYS_SUCCESS or an error.
+static inline long mos_task_gpu(syscall_gpu_stats_t* out) {
+    out->size = sizeof(*out);
+    return mos_syscall(SYS_TASK, SYS_TASK_GPU, (long)(uintptr_t)out, 0);
+}
+
 // Convenience: write a NUL-terminated string to stdout.
 static inline long mos_puts(const char* str) {
     size_t len = 0;
