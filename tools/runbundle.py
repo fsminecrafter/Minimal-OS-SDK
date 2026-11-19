@@ -14,12 +14,15 @@ ENTRY = struct.Struct("<64sII")
 
 
 def usage():
-    print(f"Usage: {Path(sys.argv[0]).name} <main.elf> <output-name.run>", file=sys.stderr)
+    print(f"Usage: {Path(sys.argv[0]).name} <main.elf> <output-name.run> [icon.bmp|icon.ico]", file=sys.stderr)
     raise SystemExit(2)
 
 
-def collect_entries(elf_path):
+def collect_entries(elf_path, icon_path=None):
     entries = [("main.elf", elf_path)]
+    if icon_path is not None:
+        # The launcher icon: mosWM looks for icon.bmp / icon.ico first.
+        entries.append(("icon.ico" if icon_path.suffix.lower() == ".ico" else "icon.bmp", icon_path))
     resources = elf_path.parent / "Resources"
     if resources.is_dir():
         for path in sorted(resources.rglob("*")):
@@ -35,8 +38,8 @@ def encode_name(name):
     return encoded + b"\0" * (64 - len(encoded))
 
 
-def write_bundle(elf_path, output_path):
-    entries = collect_entries(elf_path)
+def write_bundle(elf_path, output_path, icon_path=None):
+    entries = collect_entries(elf_path, icon_path)
     header_size = HEADER.size + ENTRY.size * len(entries)
     offsets = []
     offset = header_size
@@ -70,15 +73,19 @@ def write_bundle(elf_path, output_path):
 
 
 def main():
-    if len(sys.argv) != 3:
+    if len(sys.argv) not in (3, 4):
         usage()
     elf_path = Path(sys.argv[1]).resolve()
     output_path = Path(sys.argv[2]).resolve()
+    icon_path = Path(sys.argv[3]).resolve() if len(sys.argv) == 4 else None
     if not elf_path.is_file():
         print(f"ELF file not found: {elf_path}", file=sys.stderr)
         return 1
+    if icon_path is not None and not icon_path.is_file():
+        print(f"Icon not found: {icon_path}", file=sys.stderr)
+        return 1
     try:
-        write_bundle(elf_path, output_path)
+        write_bundle(elf_path, output_path, icon_path)
     except (OSError, ValueError) as error:
         print(f"Could not create {output_path}: {error}", file=sys.stderr)
         return 1

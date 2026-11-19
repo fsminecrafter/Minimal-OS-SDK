@@ -792,6 +792,23 @@ static void build_share_tab(void) {
     easyui.recallfunc(w_newpkg, ONCLICK, on_new_manifest);
 }
 
+// Repositories the Installer queued (DLR_REPOS_FILE) are added once the
+// network is up: checked every few seconds until it is, then once.
+static int g_queued_timer = -1;
+static void take_queued_repos(int timer) {
+    (void)timer;
+    syscall_net_status_t st;
+    if (mos_net_status(&st) != (long)SYS_SUCCESS || !st.has_driver || !st.configured) return;
+    if (g_queued_timer >= 0) easyui.stoptimer(g_queued_timer);
+    g_queued_timer = -1;
+    int before = g_server_count;
+    g_server_count = dlr_db_take_queued(g_servers, g_server_count, DLR_MAX_SERVERS, log_line);
+    if (g_server_count != before) {
+        fill_servers();
+        update_server_status();
+    }
+}
+
 int main(void) {
     if (!easyui.init("Deliver Manager", WIN_W, WIN_H)) {
         mos_puts("Deliver Manager needs the desktop (MOSdesk). Use 'dlr' in the terminal instead.\n");
@@ -825,6 +842,7 @@ int main(void) {
     fill_servers();
     update_server_status();
     show_tab(0);
+    g_queued_timer = easyui.settimer(3000, take_queued_repos);
 
     log_line("Welcome to Deliver Manager.");
     if (!network_ready(0)) {

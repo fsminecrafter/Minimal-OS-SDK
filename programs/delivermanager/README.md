@@ -54,8 +54,10 @@ on Minimal-OS), so the window waits while a client downloads.
 
     ./build.sh programs/delivermanager
 
-`deliver/*.c` each include one source file of `programs/dlr`, so the app is
-built from the same code without copying it. `Resources/icon.bmp` is the
+`shared-sources` names `../dlr`: build.sh compiles every source file of
+`programs/dlr` into the app too (all but `main.c` and `dlrconnect_main.c`), so
+it is built from the same code without copying it, and a file added to
+`programs/dlr` needs nothing here. `Resources/icon.bmp` is the
 desktop icon; `make_icon.py` draws it.
 
 The Minimal-OS image build (`make`) builds it into

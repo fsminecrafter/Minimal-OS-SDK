@@ -47,8 +47,17 @@ static void print_ip(uint32_t ip) {
 
 /* --- server selection --------------------------------------------------- */
 
+static void say_line(const char* line) { printf("%s\n", line); }
+
+// Also adds the repositories queued in DLR_REPOS_FILE (the Installer puts
+// the ones picked during install there), once per run.
 static void load_servers(void) {
+    static int queued_done;
     g_server_count = dlr_db_load(g_servers, DLR_MAX_SERVERS);
+    if (!queued_done) {
+        queued_done = 1;
+        g_server_count = dlr_db_take_queued(g_servers, g_server_count, DLR_MAX_SERVERS, say_line);
+    }
 }
 
 // Picks a server: by name if `wanted` is given, else the first known.

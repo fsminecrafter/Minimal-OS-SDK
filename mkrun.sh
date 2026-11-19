@@ -1,5 +1,5 @@
 #!/bin/bash
-# Usage: mkrun.sh <main.elf> <output-name.run>
+# Usage: mkrun.sh <main.elf> <output-name.run> [icon.bmp|icon.ico]
 set -euo pipefail
 
 ELF=${1:-}
@@ -14,6 +14,7 @@ if [ ! -f "$ELF" ]; then
 fi
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-python3 "$SCRIPT_DIR/tools/runbundle.py" "$ELF" "$OUT"
+ICON=${3:-}
+python3 "$SCRIPT_DIR/tools/runbundle.py" "$ELF" "$OUT" ${ICON:+"$ICON"}
 echo "Created $OUT as a single-file MINIRUN1 bundle"
 echo "Import the .run file itself into MinimaFS; do not copy it as a directory."

@@ -72,6 +72,9 @@
 /* MinimaFS layout the client owns. */
 #define DLR_CONFIG_DIR   "0:/etc/dlr"
 #define DLR_SERVERS_FILE "0:/etc/dlr/servers.txt"
+/* Servers to add when next reachable, one "host[:port]" or "tls://host"
+ * per line. The Installer writes the ones picked during install here. */
+#define DLR_REPOS_FILE   "0:/etc/dlr/repos"
 #define DLR_CACHE_DIR    "0:/var/dlr"
 /* Named for what it is on the wire, not what it might be: the archive
  * is a tar when it came from a Linux/Windows server and an .mpkg when it

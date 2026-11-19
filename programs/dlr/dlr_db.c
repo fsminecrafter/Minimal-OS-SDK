@@ -150,3 +150,83 @@ int dlr_discover(dlr_server* servers, int max, uint32_t window_ms,
     dlr_udp_close(sock);
     return count;
 }
+
+// msg = a + b + c (truncated to size).
+static void join3(char* msg, size_t size, const char* a, const char* b, const char* c) {
+    size_t n = 0;
+    const char* parts[3] = { a, b, c };
+    for (int k = 0; k < 3; k++)
+        for (const char* q = parts[k]; q && *q && n + 1 < size; q++) msg[n++] = *q;
+    msg[n] = '\0';
+}
+
+// "tls://host:port" -> host, port (tls:// = DLR_TLS_PORT unless given).
+static int parse_spec(const char* spec, char* host, size_t host_size, uint16_t* port) {
+    int tls = 0;
+    if (strncmp(spec, "tls://", 6) == 0) { tls = 1; spec += 6; }
+    *port = tls ? DLR_TLS_PORT : DLR_DEFAULT_PORT;
+    size_t i = 0;
+    while (spec[i] && spec[i] != ':' && i + 1 < host_size) { host[i] = spec[i]; i++; }
+    host[i] = '\0';
+    if (spec[i] == ':') {
+        uint32_t v = 0;
+        for (size_t j = i + 1; spec[j] >= '0' && spec[j] <= '9'; j++) v = v * 10u + (uint32_t)(spec[j] - '0');
+        if (!v || v > 65535) return 0;
+        *port = (uint16_t)v;
+    }
+    return host[0] != '\0';
+}
+
+int dlr_db_take_queued(dlr_server* servers, int count, int max,
+                       void (*say)(const char* line)) {
+    static char buf[1024];
+    static char keep[1024];
+    long n = dlr_file_slurp(DLR_REPOS_FILE, buf, sizeof(buf) - 1);
+    if (n <= 0) return count;
+    buf[n] = '\0';
+
+    size_t kept = 0;
+    int added = 0;
+    char* p = buf;
+    while (*p) {
+        char* line = p;
+        while (*p && *p != '\n') p++;
+        if (*p) *p++ = '\0';
+        size_t len = strlen(line);
+        while (len && (line[len - 1] == '\r' || line[len - 1] == ' ')) line[--len] = '\0';
+        while (*line == ' ') line++;
+        if (!*line || *line == '#') continue;
+
+        char host[64], msg[160];
+        uint16_t port;
+        dlr_server found;
+        int ok = 0;
+        if (parse_spec(line, host, sizeof(host), &port)) {
+            uint32_t ip = dlr_resolve(host);
+            ok = ip && dlr_probe(ip, port, &found, 4000);
+        } else {
+            if (say) { join3(msg, sizeof(msg), "dlr: dropping bad repository '", line, "'"); say(msg); }
+            continue;
+        }
+        if (ok) {
+            count = dlr_db_add(servers, count, max, &found);
+            added++;
+            if (say) {
+                join3(msg, sizeof(msg), "dlr: added repository ", line, " ('");
+                join3(msg, sizeof(msg), msg, found.name, "')");
+                say(msg);
+            }
+        } else {
+            if (say) { join3(msg, sizeof(msg), "dlr: repository ", line, " not reachable yet; will try again"); say(msg); }
+            size_t ln = strlen(line);
+            if (kept + ln + 2 < sizeof(keep)) {
+                memcpy(keep + kept, line, ln);
+                kept += ln;
+                keep[kept++] = '\n';
+            }
+        }
+    }
+    if (added) dlr_db_save(servers, count);
+    dlr_file_put(DLR_REPOS_FILE, keep, (uint32_t)kept);
+    return count;
+}
