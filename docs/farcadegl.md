@@ -197,8 +197,9 @@ Bind a buffer to a shader declaration such as
 from FGSL; each element is one 16-byte `vec4`, and the bound buffer size
 must be a multiple of 16 bytes. There are `FGL_MAX_STORAGE_BUFFERS`
 bindings. Negative and out-of-range shader indices return a zero vector.
-On the NVIDIA Turing backend, shaders that read storage buffers currently
-run on the CPU backend until native bounds-checked loads are implemented.
+On the NVIDIA Turing backend, a storage buffer is bound as a constant
+buffer (the first 64 KiB of it): constant and computed indices both run on
+the card, and reads past the end return zero there too.
 
 ## State and drawing
 
