@@ -178,6 +178,13 @@ static inline long mos_task_gpu(syscall_gpu_stats_t* out) {
     return mos_syscall(SYS_TASK, SYS_TASK_GPU, (long)(uintptr_t)out, 0);
 }
 
+// The processor (brand, vendor, base clock, caches, features) and, per core, its usage and the programs that
+// used it most over the last second (SYS_TASK_CPU). SYS_SUCCESS or an error (an older kernel: SYS_ERR_INVAL).
+static inline long mos_task_cpu(syscall_cpu_stats_t* out) {
+    out->size = sizeof(*out);
+    return mos_syscall(SYS_TASK, SYS_TASK_CPU, (long)(uintptr_t)out, 0);
+}
+
 // Convenience: write a NUL-terminated string to stdout.
 static inline long mos_puts(const char* str) {
     size_t len = 0;
