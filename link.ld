@@ -12,7 +12,11 @@ SECTIONS
         *(.rodata*)
     }
 
+    /* __mos_data_start .. __mos_bss_end: the program's writable data, for
+     * code that has to scan it (Mxplorer's garbage collector looks there
+     * for references to its heap). */
     .data : {
+        PROVIDE(__mos_data_start = .);
         *(.data*)
     }
 
@@ -31,6 +35,7 @@ SECTIONS
     .bss : {
         *(.bss*)
         *(COMMON)
+        PROVIDE(__mos_bss_end = .);
     }
 
     /DISCARD/ : {
