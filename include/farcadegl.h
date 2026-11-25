@@ -328,7 +328,7 @@ static inline int fglGetDeviceInfo(syscall_gpu_info_t* info) {
     info->size = SYS_GPU_INFO_SIZE_BASE;
     if (fgl__call(&r) != SYS_SUCCESS) return -1;
     info->size = sizeof(*info);
-    info->max_texture_units = FGPU_MAX_TEXTURE_UNITS;
+    info->max_texture_units = 4u;           // kernels before ABI 4 had 4 units
     info->max_varyings = FGPU_SHADER_MAX_VARYINGS;
     info->max_uniform_vec4 = FGPU_SHADER_MAX_UNIFORMS;
     info->max_storage_buffers = FGPU_MAX_STORAGE_BUFFERS;
